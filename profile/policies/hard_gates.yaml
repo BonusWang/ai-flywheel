@@ -26,6 +26,4 @@ outcome_gate:
   allow_empty_applied_rules: true
 
 write_set:
-  max_files_per_run: 8
   require_readback_verify: true
-  default_require_approval: true

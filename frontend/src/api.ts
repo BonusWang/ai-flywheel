@@ -1,4 +1,6 @@
 import type {
+  AboutPayload,
+  AuditEventRecord,
   ConnectPayload,
   KnowledgeDocSummary,
   OverviewResponse,
@@ -29,6 +31,7 @@ async function req<T>(url: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   overview: () => req<OverviewResponse>('/api/site/overview'),
+  about: () => req<AboutPayload>('/api/site/about'),
   seed: () => req<Record<string, number>>('/api/site/seed', { method: 'POST' }),
   preflight: (body: { task: string; project?: string; client?: string }) =>
     req<PreflightResponse>('/api/site/preflight', {
@@ -40,6 +43,8 @@ export const api = {
     req<{ runs: WorkflowRunRecord[]; lock: { run_id: string; acquired_at: string } | null }>(
       '/api/site/runs'
     ),
+  getRunEvents: (runId: string) =>
+    req<{ events: AuditEventRecord[] }>(`/api/site/runs/${runId}/events`),
   startRun: (body: { phase?: string; auto_approve?: boolean | null }) =>
     req<{ run: WorkflowRunRecord }>('/api/site/runs', {
       method: 'POST',

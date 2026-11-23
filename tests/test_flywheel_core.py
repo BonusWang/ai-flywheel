@@ -288,15 +288,26 @@ async def test_mcp_tools_and_fastapi_endpoints(isolated_runtime: FlywheelRuntime
     app = create_app(runtime=rt)
     with TestClient(app) as client:
         assert client.get("/health").status_code == 200
-        assert "AI Flywheel" in client.get("/llms.txt").text
+        llms_text = client.get("/llms.txt").text
+        assert "AI Flywheel" in llms_text
         ov = client.get("/api/site/overview")
         assert ov.status_code == 200
         assert ov.json()["metrics"]["sessions_total"] >= 1
 
+        about_resp = client.get("/api/site/about")
+        assert about_resp.status_code == 200
+        about_data = about_resp.json()
+        assert about_data["llms_txt"] == llms_text
+        assert len(about_data["mcp_tools"]) == 6
+        assert client.get("/api/v1/about").status_code == 200
+
         conn_resp = client.get("/api/site/connect")
         assert conn_resp.status_code == 200
-        client_ids = [c["id"] for c in conn_resp.json()["guides"]["clients"]]
+        conn_json = conn_resp.json()
+        client_ids = [c["id"] for c in conn_json["guides"]["clients"]]
         assert client_ids == ["codex", "claude-code", "claude"]
+        assert len(conn_json["mcp_tools"]) == 6
+        assert conn_json["config"]["runner"]["api"]["api_key"] == ""
 
         hook_resp = client.post(
             "/api/hooks/codex",

@@ -191,6 +191,11 @@ class ActivationEngine:
             matched_rule_ids=[r.rule_id for r in matched_rules],
             payload=receipt_payload,
         )
+        # D6 (2026-11-23): every card surfaced by a persisted preflight gets surface_count +1.
+        self.db.record_knowledge_surfaces(
+            [str(hit.get("doc_path", "")) for hit in knowledge_hits],
+            receipt_payload["created_at"],
+        )
 
         # Refresh rule records with incremented hit counts
         refreshed_rules = [self.db.get_rule(r.rule_id) or r for r in matched_rules]

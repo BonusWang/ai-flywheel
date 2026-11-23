@@ -170,6 +170,7 @@ def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
         preflight_receipt_id: str | None = None,
         origin: OutcomeOrigin = OutcomeOrigin.NATURAL,
         artifacts: list[str] | None = None,
+        used_knowledge_paths: list[str] | None = None,
     ) -> dict[str, Any]:
         """Submit structured task verification outcome with submission-time hard gate checks.
 
@@ -179,6 +180,7 @@ def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
           and non-empty evidence list whenever kind=='real' and result=='pass'.
         - status=='success' requires all required checks to have result=='pass'.
         - Every rule_id in applied_rule_ids must match one check with the same rule_id, result in {pass, fail}, and non-empty evidence. Pass [] if no rule was exercised.
+        - used_knowledge_paths lists Wiki cards actually re-read and helpful in this task (D6 card metrics).
         """
         try:
             rec = runtime.receipts.record_outcome(
@@ -194,6 +196,7 @@ def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
                     checks=checks,
                     applied_rule_ids=applied_rule_ids or [],
                     artifacts=artifacts or [],
+                    used_knowledge_paths=used_knowledge_paths or [],
                 )
             )
             return {

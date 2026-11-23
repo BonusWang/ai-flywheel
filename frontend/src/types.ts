@@ -80,6 +80,9 @@ export interface PlannedWrite {
   summary: string
   content_preview: string
   rule_payload: Record<string, unknown> | null
+  skill_route?: Record<string, unknown> | null
+  requires_approval?: boolean
+  approval_reason?: string
   source_session_keys: string[]
   approved: boolean
 }
@@ -102,9 +105,12 @@ export interface NodeExecution {
 
 export interface WorkflowRunRecord {
   run_id: string
+  batch_date?: string
+  batch_seq?: number
   trigger: string
   phase: string
   runner_mode: string
+  approval_mode?: string
   status: 'PENDING' | 'RUNNING' | 'AWAITING_APPROVAL' | 'PASS' | 'PARTIAL' | 'FAILED'
   admitted_sessions: string[]
   nodes: NodeExecution[]
@@ -114,6 +120,19 @@ export interface WorkflowRunRecord {
   lock_released: boolean
   started_at: string
   finished_at: string | null
+  created_at?: string
+  updated_at?: string
+}
+
+export interface AuditEventRecord {
+  seq: number
+  entity_type: string
+  entity_id: string
+  event_type: string
+  actor: string
+  summary: string
+  payload: Record<string, unknown>
+  created_at: string
 }
 
 export interface OverviewResponse {
@@ -158,6 +177,14 @@ export interface KnowledgeDocSummary {
   excerpt: string
 }
 
+export interface McpToolSummary {
+  name: string
+  title_zh: string
+  phase: string
+  description_zh?: string
+  description: string
+}
+
 export interface ConnectPayload {
   guides: {
     endpoints: {
@@ -180,4 +207,27 @@ export interface ConnectPayload {
   }
   config: Record<string, any>
   probed_skills: Array<{ name: string; description: string; path: string }>
+  mcp_tools?: McpToolSummary[]
+}
+
+export interface RiverSource {
+  name: string
+  kind: string
+  signal_only: boolean
+}
+
+export interface AboutPayload {
+  site: SiteProfile
+  metrics: OverviewResponse['metrics']
+  endpoints: {
+    portal_url: string
+    mcp_http_url: string
+    mcp_stdio_cmd: string
+    llms_txt_url: string
+    overview_api_url: string
+  }
+  mcp_tools: McpToolSummary[]
+  llms_txt: string
+  river_sources: RiverSource[]
+  recent_rules: RuleRecord[]
 }

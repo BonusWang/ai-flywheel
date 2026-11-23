@@ -6,6 +6,7 @@ from typing import Any
 from ai_flywheel.adapters.delivery import DeliveryAdapter
 from ai_flywheel.adapters.knowledge import KnowledgeSinkAdapter
 from ai_flywheel.adapters.sessions import SessionAdapter
+from ai_flywheel.adapters.skills import SkillWriterAdapter
 from ai_flywheel.config import FlywheelConfig, load_config, save_config
 from ai_flywheel.core.activation import ActivationEngine
 from ai_flywheel.core.hooks import ThinHookProcessor
@@ -33,6 +34,7 @@ class FlywheelRuntime:
         self.sessions = SessionAdapter(cfg, self.db)
         self.knowledge = KnowledgeSinkAdapter(cfg, self.db)
         self.delivery = DeliveryAdapter(cfg)
+        self.skill_writer = SkillWriterAdapter(cfg)
         self.broker = EventBroker()
         self.orchestrator = WorkflowOrchestrator(
             cfg=cfg,
@@ -44,13 +46,21 @@ class FlywheelRuntime:
             knowledge=self.knowledge,
             delivery=self.delivery,
             broker=self.broker,
+            skill_writer=self.skill_writer,
         )
         self.hooks = ThinHookProcessor(self)
         self.publication = PublicationLayer(cfg, self.db, self.policies, self.activation)
         self.mcp = build_mcp_server(self)
-        # Ensure initial FTS index is synced with knowledge directory (skip in fast stdio mode)
+        # Ensure initial FTS index and skill assets inventory are synced (skip in fast stdio mode)
         if not skip_fts_sync:
             self.knowledge.sync_fts_index()
+            for sk in self.activation.probe_local_skills():
+                self.db.upsert_skill_asset(
+                    skill_name=sk["name"],
+                    source_dir=str(Path(sk["path"]).parent.parent),
+                    description=sk.get("description", ""),
+                    origin="manual",
+                )
 
     @classmethod
     def create(
@@ -93,7 +103,27 @@ class FlywheelRuntime:
         current = self.cfg.model_dump(mode="json")
         for section, values in patch.items():
             if section in current and isinstance(current[section], dict) and isinstance(values, dict):
-                current[section].update(values)
+                if section == "runner":
+                    for rkey, rval in values.items():
+                        if rkey == "api" and isinstance(rval, dict) and isinstance(current["runner"].get("api"), dict):
+                            merged_api = dict(current["runner"]["api"])
+                            for ak, av in rval.items():
+                                if ak == "api_key" and (not av or av == "[REDACTED]"):
+                                    continue
+                                merged_api[ak] = av
+                            current["runner"]["api"] = merged_api
+                        elif rkey == "cli" and isinstance(rval, dict) and isinstance(current["runner"].get("cli"), dict):
+                            current["runner"]["cli"].update(rval)
+                        else:
+                            current["runner"][rkey] = rval
+                elif section == "delivery":
+                    for dkey, dval in values.items():
+                        if isinstance(dval, dict) and isinstance(current["delivery"].get(dkey), dict):
+                            current["delivery"][dkey].update(dval)
+                        else:
+                            current["delivery"][dkey] = dval
+                else:
+                    current[section].update(values)
         updated = FlywheelConfig.model_validate(current)
         updated.base_dir = self.cfg.base_dir
         updated.config_path = self.cfg.config_path
@@ -103,5 +133,18 @@ class FlywheelRuntime:
             if field_name in {"base_dir", "config_path"}:
                 continue
             setattr(self.cfg, field_name, getattr(updated, field_name))
+        for section, values in patch.items():
+            if isinstance(values, dict):
+                for k, v in values.items():
+                    if k == "api" and isinstance(v, dict) and "api_key" in v:
+                        v = {ak: ("***" if ak == "api_key" else av) for ak, av in v.items()}
+                    self.db.set_system_setting(f"{section}.{k}", section, v, updated_by="user")
+        self.db.append_audit_event(
+            entity_type="system_settings",
+            entity_id="flywheel.yaml",
+            event_type="config_updated",
+            actor="user",
+            summary=f"更新系统配置分组：{', '.join(patch.keys())}",
+        )
         self.knowledge.sync_fts_index()
         return self.cfg

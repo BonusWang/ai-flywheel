@@ -41,6 +41,26 @@ knowledge_sink:
     - "projects/"
   max_write_set: 8
 
+  # P04 schema-aware Wiki gate (D4).  When the sink root contains
+  # `.wiki-schema.md`, every write is validated against its live
+  # core/content/partition contracts, then D2 postflight (alias lint +
+  # index sync + core validator) runs.  Core files and raw/archive paths
+  # are always blocked; private credential pages may only live under
+  # `{project}/项目配置/`.
+  #
+  # Script paths are intentionally empty in this public template.  Supply
+  # them in the gitignored flywheel.yaml (or via FLYWHEEL_WIKI_* env vars).
+  # With `wiki_gate_require_scripts: true`, a Wiki-root write fails closed
+  # when the D2 script is not configured.
+  wiki_gate_enabled: true
+  wiki_gate_require_scripts: true
+  wiki_d2_postflight_script: ""
+  wiki_lint_script: ""
+  wiki_python: ""          # default: the flywheel process interpreter
+  wiki_bash: "bash"
+  wiki_gate_timeout_seconds: 300
+  wiki_gate_evidence_dir: ""   # default: <data_dir>/wiki-gate
+
 # Autonomous workflow P00-P07 execution engine
 workflow:
   schedule_enabled: false

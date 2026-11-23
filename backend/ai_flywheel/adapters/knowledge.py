@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
+import yaml
+
+from ai_flywheel.adapters.wiki_gate import WikiGate, WikiGateError, split_frontmatter
 from ai_flywheel.config import FlywheelConfig
-from ai_flywheel.storage.db import FlywheelDB
+from ai_flywheel.storage.db import FlywheelDB, build_knowledge_search_text
 from ai_flywheel.storage.fs_store import file_sha256
+
+# D4/Batch-2 (2026-11-23): default search surface = formal_active partitions
+# minus the derived `queries` partition, matching the audit's P-2 spec.
+FTS_PARTITION_IDS = {"entities", "topics", "sources", "comparisons", "synthesis", "projects"}
+EXCLUDED_STATUSES = {"archived", "deprecated", "retired", "snapshot", "placeholder", "process_data"}
+EXCLUDED_PATH_SEGMENTS = {"raw", "raw-原始素材", ".wiki-tmp", ".wiki-agent-memory"}
 
 
 class KnowledgeWriteError(ValueError):
@@ -18,12 +28,17 @@ class KnowledgeSinkAdapter:
     def __init__(self, cfg: FlywheelConfig, db: FlywheelDB) -> None:
         self.cfg = cfg
         self.db = db
+        self.wiki_gate = WikiGate(cfg)
 
     @property
     def root(self) -> Path:
         root = self.cfg.knowledge_root_path
         root.mkdir(parents=True, exist_ok=True)
         return root
+
+    @property
+    def schema_path(self) -> Path:
+        return self.root / ".wiki-schema.md"
 
     def _safe_resolve(self, relative_path: str) -> Path:
         norm = relative_path.replace("\\", "/").lstrip("/")
@@ -39,28 +54,215 @@ class KnowledgeSinkAdapter:
             )
         return target
 
-    def list_documents(self, limit: int = 100) -> list[dict[str, Any]]:
-        docs: list[dict[str, Any]] = []
+    # ---------------- schema-aware indexing surface ----------------
+
+    def _load_schema(self) -> dict[str, Any] | None:
+        if not self.schema_path.is_file():
+            return None
+        text = self.schema_path.read_text(encoding="utf-8", errors="replace")
+        fm_text, _ = split_frontmatter(text)
+        if fm_text is None:
+            raise KnowledgeWriteError(f"{self.schema_path} has no parseable frontmatter")
+        data = yaml.safe_load(fm_text)
+        if not isinstance(data, dict):
+            raise KnowledgeWriteError(f"{self.schema_path} frontmatter is not a mapping")
+        for key in ("partition_contract", "content_contract"):
+            if not isinstance(data.get(key), dict):
+                raise KnowledgeWriteError(f"{self.schema_path} is missing machine block '{key}'")
+        return data
+
+    def _partition_roots(self, schema: dict[str, Any]) -> list[Path]:
+        content = schema["content_contract"]
+        partition_contract = schema["partition_contract"]
+        profile = (content.get("scope_profiles") or {}).get("formal_active") or {}
+        declared = [str(x) for x in (profile.get("partition_ids") or [])]
+        partitions = partition_contract.get("partitions") or {}
+        roots: list[Path] = []
+        for partition_id in declared:
+            if partition_id not in FTS_PARTITION_IDS:
+                continue
+            root = str((partitions.get(partition_id) or {}).get("root") or "")
+            if root:
+                roots.append(self.root.resolve() / root)
+        return roots
+
+    @staticmethod
+    def _is_excluded_path(relative_path: str) -> bool:
+        return any(
+            segment in EXCLUDED_PATH_SEGMENTS or segment.startswith("archive-")
+            for segment in relative_path.split("/")
+        )
+
+    def _iter_candidate_files(self) -> Iterator[tuple[Path, str]]:
+        """Yield (path, relative_path) for the indexable surface.
+
+        With a schema, only formal_active partitions are walked.  Without one
+        (builtin_kb / tests), the whole root is walked as before.
+        """
         root_resolved = self.root.resolve()
-        for md in sorted(root_resolved.rglob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]:
+        schema = self._load_schema()
+        if schema is None:
+            paths = sorted(root_resolved.rglob("*.md"))
+        else:
+            paths = []
+            for partition_root in self._partition_roots(schema):
+                if partition_root.is_dir():
+                    paths.extend(sorted(partition_root.rglob("*.md")))
+        for md in paths:
             rel = md.relative_to(root_resolved).as_posix()
+            if self._is_excluded_path(rel):
+                continue
+            yield md, rel
+
+    @staticmethod
+    def _parse_page(text: str) -> dict[str, Any] | None:
+        """Parse frontmatter; None means the page must not enter default search."""
+        fm_text, body = split_frontmatter(text)
+        if fm_text is None:
+            return None
+        try:
+            fm = yaml.safe_load(fm_text)
+        except yaml.YAMLError:
+            return None
+        if not isinstance(fm, dict):
+            return None
+        status = str(fm.get("status") or "").strip().lower()
+        if status in EXCLUDED_STATUSES:
+            return None
+        page_type = str(fm.get("type") or "").strip()
+        if page_type == "redirect":
+            return None
+        sensitivity = str(fm.get("sensitivity") or "").strip().lower()
+        if sensitivity == "private_sensitive":
+            return None
+        if str(fm.get("contains_credentials")).strip().lower() in {"1", "true", "yes", "on"}:
+            return None
+        return {"frontmatter": fm, "body": body, "page_type": page_type}
+
+    @staticmethod
+    def _parse_page_lenient(text: str) -> dict[str, Any]:
+        """Non-Wiki roots keep the pre-2026-11-23 behaviour: index every Markdown file."""
+        fm_text, body = split_frontmatter(text)
+        fm: dict[str, Any] = {}
+        if fm_text is not None:
+            try:
+                loaded = yaml.safe_load(fm_text)
+                if isinstance(loaded, dict):
+                    fm = loaded
+            except yaml.YAMLError:
+                fm = {}
+        return {
+            "frontmatter": fm,
+            "body": body,
+            "page_type": str(fm.get("type") or ""),
+        }
+
+    @staticmethod
+    def _title(fm: dict[str, Any], body: str, fallback: str) -> str:
+        title = str(fm.get("title") or "").strip()
+        if title:
+            return title
+        for line in body.splitlines():
+            if line.startswith("# "):
+                return line[2:].strip()
+        return fallback
+
+    @staticmethod
+    def _tags_text(fm: dict[str, Any]) -> str:
+        tags = fm.get("tags")
+        if isinstance(tags, list):
+            return " ".join(str(tag).strip() for tag in tags if str(tag).strip())
+        if isinstance(tags, str):
+            return tags.strip()
+        return ""
+
+    def _search_documents(self, limit: int | None = None) -> tuple[list[dict[str, str]], int]:
+        schema = self._load_schema()
+        alias_map = {}
+        if schema is not None:
+            alias_map = (schema["content_contract"].get("legacy_type_aliases") or {})
+        docs: list[dict[str, str]] = []
+        skipped = 0
+        for md, rel in self._iter_candidate_files():
+            try:
+                text = md.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                skipped += 1
+                continue
+            if schema is not None:
+                parsed = self._parse_page(text)
+                if parsed is None:
+                    skipped += 1
+                    continue
+            else:
+                parsed = self._parse_page_lenient(text)
+            fm = parsed["frontmatter"]
+            body = parsed["body"]
+            page_type = parsed["page_type"]
+            if page_type in alias_map:
+                page_type = str(alias_map[page_type])
+            title = self._title(fm, body, md.stem)
+            description = str(fm.get("description") or "").strip()
+            tags_text = self._tags_text(fm)
+            body_text = body[:20000]
+            project_id = str(fm.get("project_id") or "").strip()
+            if not project_id and rel.startswith("wiki-知识库/projects-项目/"):
+                parts = rel.split("/")
+                if len(parts) > 2:
+                    project_id = parts[2]
+            tags_value = tags_text or rel.split("/")[0]
+            docs.append(
+                {
+                    "doc_path": rel,
+                    "title": title,
+                    "description": description,
+                    "body": body_text,
+                    "title_index": build_knowledge_search_text(title),
+                    "description_index": build_knowledge_search_text(description),
+                    "body_index": build_knowledge_search_text(body_text),
+                    "tags_index": build_knowledge_search_text(tags_value),
+                    "title_raw": title,
+                    "description_raw": description,
+                    "tags_raw": tags_value,
+                    "project_id": project_id,
+                    "page_type": page_type,
+                    "status": str(fm.get("status") or "").strip(),
+                }
+            )
+            if limit is not None and len(docs) >= limit:
+                break
+        return docs, skipped
+
+    # ---------------- public read surface ----------------
+
+    def list_documents(self, limit: int = 100) -> list[dict[str, Any]]:
+        root_resolved = self.root.resolve()
+        files = sorted(root_resolved.rglob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+        docs: list[dict[str, Any]] = []
+        for md in files:
+            rel = md.relative_to(root_resolved).as_posix()
+            if self._is_excluded_path(rel):
+                continue
             try:
                 text = md.read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 continue
-            title = md.stem
-            for line in text.splitlines():
-                if line.startswith("# "):
-                    title = line[2:].strip()
-                    break
+            parsed = self._parse_page(text) if self.schema_path.is_file() else None
+            if self.schema_path.is_file() and parsed is None:
+                continue
+            fm = parsed["frontmatter"] if parsed else {}
+            body = parsed["body"] if parsed else text
+            title = self._title(fm, body, md.stem)
             docs.append(
                 {
                     "doc_path": rel,
                     "title": title,
                     "size_bytes": md.stat().st_size,
-                    "excerpt": text[:280],
+                    "excerpt": body[:280],
                 }
             )
+            if len(docs) >= limit:
+                break
         return docs
 
     def read_document(self, relative_path: str) -> dict[str, Any] | None:
@@ -76,10 +278,19 @@ class KnowledgeSinkAdapter:
             "sha256": file_sha256(target),
         }
 
+    # ---------------- write path ----------------
+
     def write_document_verified(self, relative_path: str, content: str, action: str = "create") -> dict[str, Any]:
-        """Controlled atomic write with preimage/postimage SHA-256 read-back verification."""
+        """Controlled atomic write with pre-write schema gate and post-write D2 verification."""
         target = self._safe_resolve(relative_path)
-        preimage_sha = file_sha256(target) if target.exists() else "ABSENT"
+        rel = relative_path.replace("\\", "/").lstrip("/")
+        gate_result = self.wiki_gate.validate_document(rel, content)
+        if gate_result.applicable and not gate_result.ok:
+            self.wiki_gate.write_artifact(gate_result, rel, {"stage": "pre_write"})
+            raise WikiGateError(_format_gate_failure(rel, gate_result))
+
+        preimage_bytes = target.read_bytes() if target.exists() else None
+        preimage_sha = hashlib.sha256(preimage_bytes).hexdigest() if preimage_bytes is not None else "ABSENT"
 
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_suffix(target.suffix + ".tmp")
@@ -94,28 +305,69 @@ class KnowledgeSinkAdapter:
         if action == "update" and preimage_sha == postimage_sha:
             raise KnowledgeWriteError(f"Update action produced no byte change on {relative_path}")
 
+        rollback_info: dict[str, Any] | None = None
+        if gate_result.applicable:
+            self.wiki_gate.run_topic_lint(gate_result, rel)
+            if gate_result.ok:
+                self.wiki_gate.run_postflight(gate_result, rel)
+            if not gate_result.ok:
+                rollback_info = self._rollback(target, preimage_bytes)
+                rollback_info["resync"] = self.wiki_gate.resync_after_rollback(rel)
+                self.sync_fts_index()
+                self.wiki_gate.write_artifact(
+                    gate_result,
+                    rel,
+                    {"stage": "post_write", "rollback": rollback_info},
+                )
+                raise WikiGateError(_format_gate_failure(rel, gate_result, rollback_info))
+            self.wiki_gate.write_artifact(gate_result, rel, {"stage": "post_write"})
+
         self.sync_fts_index()
         return {
-            "relative_path": relative_path.replace("\\", "/").lstrip("/"),
+            "relative_path": rel,
             "absolute_path": str(target),
             "preimage_sha256": preimage_sha,
             "postimage_sha256": postimage_sha,
             "verified": True,
+            "wiki_gate": gate_result.to_dict() if gate_result.applicable else None,
         }
 
+    @staticmethod
+    def _rollback(target: Path, preimage_bytes: bytes | None) -> dict[str, Any]:
+        try:
+            if preimage_bytes is None:
+                target.unlink(missing_ok=True)
+                state = "deleted_new_file"
+            else:
+                tmp = target.with_suffix(target.suffix + ".rollback.tmp")
+                tmp.write_bytes(preimage_bytes)
+                tmp.replace(target)
+                state = "restored_preimage"
+        except OSError as exc:
+            return {"state": "rollback_failed", "error": str(exc)}
+        return {"state": state}
+
     def sync_fts_index(self) -> int:
-        docs: list[dict[str, str]] = []
-        root_resolved = self.root.resolve()
-        for md in root_resolved.rglob("*.md"):
-            try:
-                body = md.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            rel = md.relative_to(root_resolved).as_posix()
-            title = md.stem
-            for line in body.splitlines():
-                if line.startswith("# "):
-                    title = line[2:].strip()
-                    break
-            docs.append({"doc_path": rel, "title": title, "body": body[:20000], "tags": rel.split("/")[0]})
+        docs, _skipped = self._search_documents()
         return self.db.rebuild_knowledge_fts(docs)
+
+
+def _format_gate_failure(
+    relative_path: str,
+    result: Any,
+    rollback_info: dict[str, Any] | None = None,
+) -> str:
+    lines = [f"Wiki gate blocked write to '{relative_path}'."]
+    for issue in result.issues:
+        field_name = f" [{issue['field']}]" if issue.get("field") else ""
+        lines.append(f"- {issue['code']}{field_name}: {issue['message']}")
+    if result.postflight and result.postflight.get("status") in {"blocked", "fail", "error"}:
+        lines.append(f"- postflight: {result.postflight.get('status')} rc={result.postflight.get('returncode')}")
+    if rollback_info:
+        lines.append(f"- rollback: {rollback_info.get('state')}")
+        resync = rollback_info.get("resync") or {}
+        if resync:
+            lines.append(f"- index resync after rollback: {resync.get('status')}")
+    if result.artifact_path:
+        lines.append(f"- evidence: {result.artifact_path}")
+    return "\n".join(lines)

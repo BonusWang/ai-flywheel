@@ -54,11 +54,30 @@ class KnowledgeSinkConfig(BaseModel):
     )
     max_write_set: int = 8
 
+    # D4 (2026-11-23): P04 write gate for a schema-governed Markdown Wiki.
+    # The gate is contract-driven: it reads .wiki-schema.md at the sink root.
+    # Script paths stay empty by default so the public repo carries no personal
+    # absolute paths; a private flywheel.yaml (gitignored) or the env vars below
+    # supply them.  When the sink root is a Wiki and scripts are required but
+    # missing, writes fail closed instead of silently skipping index/validator.
+    wiki_gate_enabled: bool = True
+    wiki_gate_require_scripts: bool = True
+    wiki_d2_postflight_script: str = ""
+    wiki_lint_script: str = ""
+    wiki_python: str = ""
+    wiki_bash: str = "bash"
+    wiki_gate_timeout_seconds: int = 300
+    wiki_gate_evidence_dir: str = ""
+
 
 class WorkflowConfig(BaseModel):
     schedule_enabled: bool = False
     daily_cron: str = "0 20 * * *"
     weekly_exception_cron: str = "0 20 * * 5"
+    friday_weekly_enabled: bool = True
+    approval_mode: str = "always"  # smart | always | auto
+    high_write_count_threshold: int = 6
+    max_writes_per_run: int = 8
     auto_approve_writes: bool = False
     max_sessions_per_run: int = 10
     max_chars_per_run: int = 180000
@@ -75,7 +94,7 @@ class ApiRunnerConfig(BaseModel):
     base_url: str = ""
     api_key: str = ""
     model: str = ""
-    timeout_seconds: int = 120
+    timeout_seconds: int = 240
     extra_headers: dict[str, str] = Field(default_factory=dict)
 
 
@@ -96,15 +115,26 @@ class WebhookConfig(BaseModel):
     url: str = ""
 
 
+class FeishuCliConfig(BaseModel):
+    enabled: bool = False
+    command: str = "lark-cli"
+    identity: str = "bot"
+    user_id: str = ""
+    chat_id: str = ""
+    notify_on_fyi: bool = False
+
+
 class DeliveryConfig(BaseModel):
     local_portal: bool = True
     git_closure: GitClosureConfig = Field(default_factory=GitClosureConfig)
     webhook: WebhookConfig = Field(default_factory=WebhookConfig)
+    feishu_cli: FeishuCliConfig = Field(default_factory=FeishuCliConfig)
 
 
 class SafetyValvesConfig(BaseModel):
     workflow_enabled: bool = True
     cli_execution_enabled: bool = True
+    skill_write_enabled: bool = True
     auto_approve_writes: bool = False
     git_closure_enabled: bool = False
     public_export_strip_paths: bool = True
@@ -160,8 +190,29 @@ class FlywheelConfig(BaseModel):
         return self.resolve_path(self.knowledge_sink.root)
 
     @property
+    def wiki_gate_evidence_path(self) -> Path:
+        raw = self.knowledge_sink.wiki_gate_evidence_dir or (self.data_path / "wiki-gate")
+        return self.resolve_path(str(raw))
+
+    @property
+    def primary_skills_dir(self) -> Path:
+        if self.capabilities.skills_dirs:
+            return self.resolve_path(self.capabilities.skills_dirs[0])
+        return self.data_path / "skills"
+
+    @property
     def effective_auto_approve(self) -> bool:
-        return bool(self.workflow.auto_approve_writes and self.safety_valves.auto_approve_writes)
+        return bool(
+            (self.workflow.auto_approve_writes and self.safety_valves.auto_approve_writes)
+            or self.workflow.approval_mode == "auto"
+        )
+
+    @property
+    def effective_approval_mode(self) -> str:
+        if self.effective_auto_approve:
+            return "auto"
+        mode = (self.workflow.approval_mode or "always").strip().lower()
+        return mode if mode in {"smart", "always", "auto"} else "always"
 
 
 def _apply_env_valves(raw: dict[str, Any]) -> dict[str, Any]:
@@ -176,6 +227,36 @@ def _apply_env_valves(raw: dict[str, Any]) -> dict[str, Any]:
         val = os.environ.get(env_key)
         if val is not None:
             valves[field_name] = val.strip().lower() in {"1", "true", "yes", "on"}
+    return raw
+
+
+def _apply_env_knowledge_sink(raw: dict[str, Any]) -> dict[str, Any]:
+    sink = raw.setdefault("knowledge_sink", {})
+    bool_map = {
+        "FLYWHEEL_WIKI_GATE_ENABLED": "wiki_gate_enabled",
+        "FLYWHEEL_WIKI_GATE_REQUIRE_SCRIPTS": "wiki_gate_require_scripts",
+    }
+    for env_key, field_name in bool_map.items():
+        val = os.environ.get(env_key)
+        if val is not None:
+            sink[field_name] = val.strip().lower() in {"1", "true", "yes", "on"}
+    str_map = {
+        "FLYWHEEL_WIKI_D2_POSTFLIGHT": "wiki_d2_postflight_script",
+        "FLYWHEEL_WIKI_LINT_SCRIPT": "wiki_lint_script",
+        "FLYWHEEL_WIKI_PYTHON": "wiki_python",
+        "FLYWHEEL_WIKI_BASH": "wiki_bash",
+        "FLYWHEEL_WIKI_GATE_EVIDENCE_DIR": "wiki_gate_evidence_dir",
+    }
+    for env_key, field_name in str_map.items():
+        val = os.environ.get(env_key)
+        if val:
+            sink[field_name] = val
+    timeout = os.environ.get("FLYWHEEL_WIKI_GATE_TIMEOUT")
+    if timeout:
+        try:
+            sink["wiki_gate_timeout_seconds"] = int(timeout)
+        except ValueError:
+            pass
     return raw
 
 
@@ -206,6 +287,7 @@ def load_config(config_path: str | Path | None = None, base_dir: str | Path | No
             raw = loaded
 
     raw = _apply_env_valves(raw)
+    raw = _apply_env_knowledge_sink(raw)
     cfg = FlywheelConfig.model_validate(raw)
     cfg.base_dir = resolved_base
     cfg.config_path = target_path

@@ -1,39 +1,31 @@
 import React, { useEffect, useState } from 'react'
-import { ArrowUpRight, RotateCcw, Save } from 'lucide-react'
-import type { PageKey } from '../App'
+import { Save, Zap } from 'lucide-react'
 import { api } from '../api'
 import { CodeBlock, CopyButton } from '../components/CodeBlock'
-import { AsideCard, PillTabs, ReadingLayout } from '../components/PageLayout'
-import type { ConnectPayload } from '../types'
+import { PillTabs } from '../components/PageLayout'
+import type { ConnectPayload, PreflightResponse } from '../types'
 
 interface Props {
-  section: 'connect' | 'policies' | 'adapters'
-  onChangeSection: (page: PageKey) => void
+  initialTab?: 'connect' | 'storage' | 'test'
   onGlobalRefresh: () => void
 }
 
-const MCP_TOOLS: Array<[string, string]> = [
-  ['flywheel_register_session', '登记 AI 客户端会话元数据与本地日志路径'],
-  ['flywheel_preflight_activate', '开局获取反偷懒策略、个人偏好、命中规则与不可变回执 ID'],
-  ['flywheel_report_signal', '上报死循环、高危操作、复发或阻塞信号入复盘队列'],
-  ['flywheel_record_outcome', '提交分级验证回执（real/test/static/unknown），驱动规则晋升/降级'],
-  ['flywheel_ingest_session', '无本地日志文件的客户端（如 Claude Desktop）直接推送会话摘要'],
-  ['flywheel_status', '查询飞轮健康指标、活跃规则分布与最新 P00–P07 运行状态'],
-]
-
-export const ConnectPolicyPage: React.FC<Props> = ({ section, onGlobalRefresh }) => {
+export const ConnectPolicyPage: React.FC<Props> = ({
+  initialTab = 'connect',
+  onGlobalRefresh,
+}) => {
+  const [tab, setTab] = useState<'connect' | 'storage' | 'test'>(initialTab)
   const [connectData, setConnectData] = useState<ConnectPayload | null>(null)
-  const [policies, setPolicies] = useState<Record<string, any>>({})
   const [selectedClient, setSelectedClient] = useState('codex')
   const [notice, setNotice] = useState<string | null>(null)
 
-  const [antiEnabled, setAntiEnabled] = useState(true)
-  const [baselineText, setBaselineText] = useState('')
-  const [execText, setExecText] = useState('')
-  const [addressAs, setAddressAs] = useState('')
-  const [redlinesText, setRedlinesText] = useState('')
-  const [retryMax, setRetryMax] = useState(2)
+  // Test sandbox
+  const [pfPrompt, setPfPrompt] = useState('修复接口报错并做真实验证')
+  const [pfProject, setPfProject] = useState('generic')
+  const [pfResult, setPfResult] = useState<PreflightResponse | null>(null)
+  const [pfLoading, setPfLoading] = useState(false)
 
+  // Storage & model config
   const [overrideDir, setOverrideDir] = useState('')
   const [skillsDirs, setSkillsDirs] = useState('')
   const [kbType, setKbType] = useState('builtin_kb')
@@ -42,29 +34,25 @@ export const ConnectPolicyPage: React.FC<Props> = ({ section, onGlobalRefresh })
   const [apiBaseUrl, setApiBaseUrl] = useState('')
   const [apiModel, setApiModel] = useState('')
   const [apiKey, setApiKey] = useState('')
+  const [apiKeyConfigured, setApiKeyConfigured] = useState(false)
   const [cliCmd, setCliCmd] = useState('')
   const [cliArgs, setCliArgs] = useState('')
-  const [autoApprove, setAutoApprove] = useState(false)
+  const [approvalMode, setApprovalMode] = useState('smart')
+  const [fridayWeekly, setFridayWeekly] = useState(true)
   const [workflowEnabled, setWorkflowEnabled] = useState(true)
+  const [skillWriteEnabled, setSkillWriteEnabled] = useState(true)
   const [scheduleEnabled, setScheduleEnabled] = useState(false)
+  const [feishuEnabled, setFeishuEnabled] = useState(false)
+  const [feishuUserId, setFeishuUserId] = useState('')
+  const [feishuNotifyFyi, setFeishuNotifyFyi] = useState(false)
+
+  useEffect(() => {
+    setTab(initialTab)
+  }, [initialTab])
 
   const loadAll = async () => {
-    const [cRes, pRes] = await Promise.all([api.connectInfo(), api.listPolicies()])
+    const cRes = await api.connectInfo()
     setConnectData(cRes)
-    setPolicies(pRes.policies)
-
-    const al = pRes.policies.anti_laziness || {}
-    setAntiEnabled(al.enabled !== false)
-    setBaselineText((al.baseline?.rules || []).join('\n'))
-    setExecText((al.execution?.rules || []).join('\n'))
-
-    const up = pRes.policies.user_preferences || {}
-    setAddressAs(up.address_as || '')
-    setRedlinesText((up.non_negotiables || []).join('\n'))
-
-    const hg = pRes.policies.hard_gates || {}
-    setRetryMax(Number(hg.retry_breaker?.max_same_cause_retries ?? 2))
-
     const cfg = cRes.config || {}
     setOverrideDir(cfg.profile?.override_dir || '')
     setSkillsDirs((cfg.capabilities?.skills_dirs || []).join('\n'))
@@ -73,14 +61,23 @@ export const ConnectPolicyPage: React.FC<Props> = ({ section, onGlobalRefresh })
     setRunnerMode(cfg.runner?.mode || 'dry_run')
     setApiBaseUrl(cfg.runner?.api?.base_url || '')
     setApiModel(cfg.runner?.api?.model || '')
-    setApiKey(cfg.runner?.api?.api_key || '')
+    setApiKey('')
+    setApiKeyConfigured(Boolean(cfg.runner?.api?.api_key_configured))
     setCliCmd(cfg.runner?.cli?.command || '')
     setCliArgs((cfg.runner?.cli?.args || []).join(' '))
-    setAutoApprove(
-      Boolean(cfg.workflow?.auto_approve_writes && cfg.safety_valves?.auto_approve_writes)
-    )
+    const resolvedMode =
+      cfg.workflow?.approval_mode ||
+      (cfg.workflow?.auto_approve_writes && cfg.safety_valves?.auto_approve_writes
+        ? 'auto'
+        : 'always')
+    setApprovalMode(resolvedMode)
+    setFridayWeekly(cfg.workflow?.friday_weekly_enabled !== false)
     setWorkflowEnabled(cfg.safety_valves?.workflow_enabled !== false)
+    setSkillWriteEnabled(cfg.safety_valves?.skill_write_enabled !== false)
     setScheduleEnabled(Boolean(cfg.workflow?.schedule_enabled))
+    setFeishuEnabled(Boolean(cfg.delivery?.feishu_cli?.enabled))
+    setFeishuUserId(cfg.delivery?.feishu_cli?.user_id || '')
+    setFeishuNotifyFyi(Boolean(cfg.delivery?.feishu_cli?.notify_on_fyi))
   }
 
   useEffect(() => {
@@ -89,43 +86,33 @@ export const ConnectPolicyPage: React.FC<Props> = ({ section, onGlobalRefresh })
 
   const showToast = (msg: string) => {
     setNotice(msg)
-    setTimeout(() => setNotice(null), 3200)
+    setTimeout(() => setNotice(null), 3000)
   }
 
-  const savePolicies = async () => {
-    await Promise.all([
-      api.updatePolicy('anti_laziness', {
-        enabled: antiEnabled,
-        baseline: { rules: baselineText.split('\n').map((s) => s.trim()).filter(Boolean) },
-        execution: { rules: execText.split('\n').map((s) => s.trim()).filter(Boolean) },
-      }),
-      api.updatePolicy('user_preferences', {
-        address_as: addressAs.trim() || 'Developer',
-        non_negotiables: redlinesText.split('\n').map((s) => s.trim()).filter(Boolean),
-      }),
-      api.updatePolicy('hard_gates', {
-        retry_breaker: {
-          max_same_cause_retries: retryMax,
-          alert_at_attempt: retryMax + 1,
-        },
-      }),
-    ])
-    await loadAll()
-    onGlobalRefresh()
-    showToast('飞轮策略已保存并实时生效（外部 MCP 与 Preflight 立即同步）')
-  }
-
-  const resetAllPolicies = async () => {
-    await Promise.all([
-      api.resetPolicy('anti_laziness'),
-      api.resetPolicy('user_preferences'),
-      api.resetPolicy('hard_gates'),
-    ])
-    await loadAll()
-    showToast('已恢复为 profile / Home Repo 继承策略')
+  const executePreflight = async () => {
+    if (!pfPrompt.trim() || pfLoading) return
+    setPfLoading(true)
+    try {
+      const res = await api.preflight({
+        task: pfPrompt.trim(),
+        project: pfProject.trim() || 'generic',
+        client: 'portal-sandbox',
+      })
+      setPfResult(res)
+      onGlobalRefresh()
+    } finally {
+      setPfLoading(false)
+    }
   }
 
   const saveAdapters = async () => {
+    const apiPatch: Record<string, string> = {
+      base_url: apiBaseUrl.trim(),
+      model: apiModel.trim(),
+    }
+    if (apiKey.trim()) {
+      apiPatch.api_key = apiKey.trim()
+    }
     await api.updateConfig({
       profile: {
         override_dir: overrideDir.trim() || null,
@@ -139,11 +126,7 @@ export const ConnectPolicyPage: React.FC<Props> = ({ section, onGlobalRefresh })
       },
       runner: {
         mode: runnerMode,
-        api: {
-          base_url: apiBaseUrl.trim(),
-          model: apiModel.trim(),
-          api_key: apiKey.trim(),
-        },
+        api: apiPatch,
         cli: {
           command: cliCmd.trim(),
           args: cliArgs.trim() ? cliArgs.trim().split(/\s+/) : [],
@@ -151,283 +134,40 @@ export const ConnectPolicyPage: React.FC<Props> = ({ section, onGlobalRefresh })
       },
       workflow: {
         schedule_enabled: scheduleEnabled,
-        auto_approve_writes: autoApprove,
+        friday_weekly_enabled: fridayWeekly,
+        approval_mode: approvalMode,
+        auto_approve_writes: approvalMode === 'auto',
+      },
+      delivery: {
+        feishu_cli: {
+          enabled: feishuEnabled,
+          user_id: feishuUserId.trim(),
+          notify_on_fyi: feishuNotifyFyi,
+        },
       },
       safety_valves: {
         workflow_enabled: workflowEnabled,
-        auto_approve_writes: autoApprove,
+        skill_write_enabled: skillWriteEnabled,
+        auto_approve_writes: approvalMode === 'auto',
       },
     })
     await loadAll()
     onGlobalRefresh()
-    showToast('三体挂载与安全阀配置已持久化至 flywheel.yaml')
+    showToast('设置已保存')
   }
 
   const clientObj =
     connectData?.guides.clients.find((c) => c.id === selectedClient) ||
     connectData?.guides.clients[0]
+  const mcpTools = connectData?.mcp_tools || []
 
-  // ---------------- SECTION 1: AIHOT-faithful /agent Connect Page ----------------
-  if (section === 'connect') {
-    const aside = (
-      <>
-        <AsideCard title="服务接入状态">
-          <div className="space-y-2.5 text-[12.5px]">
-            <div className="flex items-center justify-between">
-              <span className="text-ink-3">MCP Streamable HTTP</span>
-              <span className="inline-flex items-center gap-1.5 text-ok-ink font-medium">
-                <span className="size-1.5 rounded-full bg-ok" />
-                正常
-              </span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span className="text-ink-3">MCP Stdio</span>
-              <code className="mono text-[11.5px] text-ink-2">flywheel mcp-stdio</code>
-            </div>
-            <div className="flex items-center justify-between">
-              <span className="text-ink-3">已探测本地 Skills</span>
-              <span className="num font-semibold text-ink">
-                {connectData?.probed_skills.length ?? 0} 个
-              </span>
-            </div>
-          </div>
-        </AsideCard>
-
-        <AsideCard title="机器可读入口" className="!bg-panel-quiet">
-          <ul className="space-y-2.5 text-[12.5px]">
-            {[
-              ['llms.txt', '/llms.txt', '给大模型读的站点说明'],
-              ['MCP Server', '/mcp', 'MCP 客户端的连接地址'],
-              ['REST API v1', '/api/v1/overview', '统一读取层 JSON 接口'],
-            ].map(([label, href, note]) => (
-              <li key={href} className="pb-2 border-b border-line-soft last:border-b-0 last:pb-0">
-                <a
-                  href={href}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="flex items-center justify-between font-medium text-ink hover:text-accent"
-                >
-                  <span>{label}</span>
-                  <ArrowUpRight className="w-3.5 h-3.5 text-ink-4" />
-                </a>
-                <div className="text-[11.5px] text-ink-4 mt-0.5">{note}</div>
-              </li>
-            ))}
-          </ul>
-        </AsideCard>
-
-        {connectData && connectData.probed_skills.length > 0 && (
-          <AsideCard title={`已探测 Skills (${connectData.probed_skills.length})`}>
-            <div className="flex flex-wrap gap-1.5 max-h-48 overflow-y-auto">
-              {connectData.probed_skills.slice(0, 24).map((sk) => (
-                <span
-                  key={sk.name}
-                  title={sk.description}
-                  className="mono text-[11px] px-2 py-0.5 rounded-[var(--radius-mark)] bg-bg-sunk border border-line-soft text-ink-2"
-                >
-                  {sk.name}
-                </span>
-              ))}
-              {connectData.probed_skills.length > 24 && (
-                <span className="text-[11px] text-ink-4">
-                  +{connectData.probed_skills.length - 24} 更多
-                </span>
-              )}
-            </div>
-          </AsideCard>
-        )}
-      </>
-    )
-
-    return (
-      <ReadingLayout aside={aside}>
-        <div>
-          <h1 className="text-[24px] font-semibold leading-[1.3] text-ink">Agent 接入</h1>
-          <p className="mt-2 text-[14.5px] text-ink-3">
-            加一个本地 MCP 地址与极薄转发 Hook，让 Codex、Claude Code 与 Claude Desktop 共享同一套反偷懒策略、先例规则与后台 P00–P07 飞轮。
-          </p>
-
-          {connectData && (
-            <>
-              {/* AIHOT signature endpoint copy bar */}
-              <div className="mt-5 flex items-center gap-2 rounded-[var(--radius-card)] border border-line bg-surface p-3">
-                <code className="mono min-w-0 flex-1 truncate text-[13px] text-ink">
-                  {connectData.guides.endpoints.mcp_http_url}
-                </code>
-                <CopyButton text={connectData.guides.endpoints.mcp_http_url} />
-              </div>
-
-              <div className="mt-6">
-                <PillTabs
-                  items={connectData.guides.clients.map((c) => ({ key: c.id, label: c.name }))}
-                  active={selectedClient}
-                  onChange={setSelectedClient}
-                />
-              </div>
-
-              {clientObj && (
-                <div className="mt-5">
-                  <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
-                    <h2 className="text-[18px] font-bold text-ink">{clientObj.name} 接入配置</h2>
-                    <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[11.5px] bg-ok-soft text-ok-ink border border-ok/25">
-                      {clientObj.loop_guarantee}
-                    </span>
-                  </div>
-                  <p className="text-[13px] text-ink-3">{clientObj.notes}</p>
-
-                  <CodeBlock title={`1. ${clientObj.mcp_label}`} code={clientObj.mcp_config} />
-                  <CodeBlock title={`2. ${clientObj.hook_label}`} code={clientObj.hook_config} />
-                </div>
-              )}
-
-              <section className="mt-8">
-                <h3 className="mb-3 text-[16px] font-bold text-ink">连上后应看到这六个工具</h3>
-                <ul className="space-y-2 text-[13.5px] leading-[1.75] text-ink-2">
-                  {MCP_TOOLS.map(([name, desc]) => (
-                    <li key={name} className="flex gap-2">
-                      <span className="mt-[10px] size-1 shrink-0 rounded-full bg-ink-4" />
-                      <span>
-                        <code className="mono rounded-[var(--radius-mark)] bg-bg-sunk px-1.5 py-0.5 text-[0.88em] text-ink">
-                          {name}
-                        </code>
-                        ：{desc}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              </section>
-            </>
-          )}
-        </div>
-      </ReadingLayout>
-    )
-  }
-
-  // ---------------- SECTION 2: Flywheel-Owned Policy Studio ----------------
-  if (section === 'policies') {
-    return (
-      <div className="mx-auto max-w-[var(--page-max-wide)] space-y-5">
-        <header className="flex flex-wrap items-end justify-between gap-3 pb-4 border-b border-line">
-          <div>
-            <h1 className="text-[24px] font-semibold leading-[1.3] text-ink">策略中心</h1>
-            <p className="text-[13px] text-ink-3 mt-1">
-              飞轮方法论设定独立于知识库托管（合并优先级：默认 <code className="mono">profile/</code> → Home Repo <code className="mono">override_dir</code> → 界面覆盖）
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            {notice && (
-              <span className="px-3 py-1 rounded-full bg-ok-soft text-ok-ink text-[12px] border border-ok/25">
-                {notice}
-              </span>
-            )}
-            <button
-              type="button"
-              onClick={resetAllPolicies}
-              className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[var(--radius-control)] border border-line bg-surface text-[12.5px] text-ink-3 hover:text-ink"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              恢复继承默认
-            </button>
-            <button
-              type="button"
-              onClick={savePolicies}
-              className="inline-flex items-center gap-1.5 h-8 px-3.5 rounded-[var(--radius-control)] bg-accent text-accent-contrast text-[12.5px] font-medium hover:bg-accent-ink"
-            >
-              <Save className="w-3.5 h-3.5" />
-              保存并实时生效
-            </button>
-          </div>
-        </header>
-
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 text-[12.5px]">
-          <section className="card p-5 space-y-3.5">
-            <div className="flex items-center justify-between pb-2.5 border-b border-line-soft">
-              <div>
-                <h2 className="text-[14.5px] font-bold text-ink">反偷懒执行契约（Anti-Laziness）</h2>
-                <span className="mono text-[11px] text-ink-4">
-                  当前来源：{policies.anti_laziness?._source || 'default'}
-                </span>
-              </div>
-              <label className="inline-flex items-center gap-2 cursor-pointer text-ink-2">
-                <input
-                  type="checkbox"
-                  checked={antiEnabled}
-                  onChange={(e) => setAntiEnabled(e.target.checked)}
-                />
-                <span>启用</span>
-              </label>
-            </div>
-            <div>
-              <label className="block text-ink-3 mb-1.5">基线规则（每条一行，所有任务注入）</label>
-              <textarea
-                rows={4}
-                value={baselineText}
-                onChange={(e) => setBaselineText(e.target.value)}
-                className="field-input mono w-full p-2.5 text-[12px] leading-relaxed"
-              />
-            </div>
-            <div>
-              <label className="block text-ink-3 mb-1.5">执行模式规则（代码/调试/部署任务追加）</label>
-              <textarea
-                rows={6}
-                value={execText}
-                onChange={(e) => setExecText(e.target.value)}
-                className="field-input mono w-full p-2.5 text-[12px] leading-relaxed"
-              />
-            </div>
-          </section>
-
-          <section className="card p-5 space-y-3.5">
-            <div className="pb-2.5 border-b border-line-soft">
-              <h2 className="text-[14.5px] font-bold text-ink">个人协作偏好与红线（不含隐私履历）</h2>
-              <span className="mono text-[11px] text-ink-4">
-                当前来源：{policies.user_preferences?._source || 'default'}
-              </span>
-            </div>
-            <div>
-              <label className="block text-ink-3 mb-1.5">AI 对你的称呼</label>
-              <input
-                value={addressAs}
-                onChange={(e) => setAddressAs(e.target.value)}
-                className="field-input w-full px-3 py-2 text-[13px]"
-              />
-            </div>
-            <div>
-              <label className="block text-ink-3 mb-1.5">不可让步的协作红线（每条一行）</label>
-              <textarea
-                rows={6}
-                value={redlinesText}
-                onChange={(e) => setRedlinesText(e.target.value)}
-                className="field-input mono w-full p-2.5 text-[12px] leading-relaxed"
-              />
-            </div>
-            <div>
-              <label className="block text-ink-3 mb-1.5">
-                死循环保护阈值（同工具同因最多重试次数，第 N+1 次触发告警）
-              </label>
-              <input
-                type="number"
-                min={1}
-                max={5}
-                value={retryMax}
-                onChange={(e) => setRetryMax(Number(e.target.value))}
-                className="field-input mono w-28 px-3 py-1.5"
-              />
-            </div>
-          </section>
-        </div>
-      </div>
-    )
-  }
-
-  // ---------------- SECTION 3: Three-Layer Adapters & Safety Valves ----------------
   return (
-    <div className="mx-auto max-w-[var(--page-max-wide)] space-y-5 text-[12.5px]">
+    <div className="mx-auto max-w-[var(--page-max-wide)] space-y-5">
       <header className="flex flex-wrap items-end justify-between gap-3 pb-4 border-b border-line">
         <div>
-          <h1 className="text-[24px] font-semibold leading-[1.3] text-ink">三体挂载与安全阀</h1>
-          <p className="text-[13px] text-ink-3 mt-1">
-            Home Repo · Wiki · 本地 CLI 全部通过被 gitignore 的 <code className="mono">flywheel.yaml</code> 指针挂载，不污染公开仓库
+          <h1 className="text-[24px] font-semibold leading-[1.3] text-ink">接入与设置</h1>
+          <p className="text-[13.5px] text-ink-3 mt-1">
+            连接你的 AI 工具、指定笔记存放目录与后台整理模型，配好一次即可长期使用。
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -436,171 +176,343 @@ export const ConnectPolicyPage: React.FC<Props> = ({ section, onGlobalRefresh })
               {notice}
             </span>
           )}
-          <button
-            type="button"
-            onClick={saveAdapters}
-            className="inline-flex items-center gap-1.5 h-8 px-3.5 rounded-[var(--radius-control)] bg-accent text-accent-contrast text-[12.5px] font-medium hover:bg-accent-ink"
-          >
-            <Save className="w-3.5 h-3.5" />
-            保存配置
-          </button>
+          {tab === 'storage' && (
+            <button
+              type="button"
+              onClick={saveAdapters}
+              className="inline-flex items-center gap-1.5 h-8 px-3.5 rounded-[var(--radius-control)] bg-accent text-accent-contrast text-[12.5px] font-medium hover:bg-accent-ink"
+            >
+              <Save className="w-3.5 h-3.5" />
+              保存设置
+            </button>
+          )}
         </div>
       </header>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <section className="card p-5 space-y-3">
-          <h2 className="text-[14.5px] font-bold text-ink">1. Home Repo & 本地 Skill 只读探测</h2>
-          <div>
-            <label className="block text-ink-3 mb-1">私有 Profile 覆盖目录</label>
-            <input
-              value={overrideDir}
-              onChange={(e) => setOverrideDir(e.target.value)}
-              placeholder="例如：E:/github/ai-home/flywheel-profile"
-              className="field-input mono w-full px-3 py-2 text-[12px]"
-            />
+      <PillTabs
+        items={[
+          { key: 'connect', label: '连接 AI 工具' },
+          { key: 'storage', label: '目录与模型' },
+          { key: 'test', label: '模拟测试' },
+        ]}
+        active={tab}
+        onChange={(k) => setTab(k as 'connect' | 'storage' | 'test')}
+      />
+
+      {/* Tab 1: Connect AI Clients */}
+      {tab === 'connect' && connectData && (
+        <div className="max-w-3xl space-y-5">
+          <div className="card p-4 flex flex-wrap items-center justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-[12px] text-ink-4">本地服务地址（MCP）</div>
+              <code className="mono text-[13.5px] font-medium text-ink">
+                {connectData.guides.endpoints.mcp_http_url}
+              </code>
+            </div>
+            <CopyButton text={connectData.guides.endpoints.mcp_http_url} label="复制地址" />
           </div>
-          <div>
-            <label className="block text-ink-3 mb-1">本地 Skills 探测目录（每行一个，只读扫描）</label>
+
+          <PillTabs
+            items={connectData.guides.clients.map((c) => ({ key: c.id, label: c.name }))}
+            active={selectedClient}
+            onChange={setSelectedClient}
+          />
+
+          {clientObj && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h2 className="text-[16px] font-bold text-ink">{clientObj.name} 配置方法</h2>
+                <span className="chip">{clientObj.loop_guarantee}</span>
+              </div>
+              <p className="text-[13px] text-ink-3">{clientObj.notes}</p>
+              <CodeBlock title={`第 1 步 · ${clientObj.mcp_label}`} code={clientObj.mcp_config} />
+              <CodeBlock title={`第 2 步 · ${clientObj.hook_label}`} code={clientObj.hook_config} />
+            </div>
+          )}
+
+          {mcpTools.length > 0 && (
+            <section className="card p-5">
+              <h3 className="text-[14.5px] font-bold text-ink mb-3">
+                连上后，AI 工具会多出这 {mcpTools.length} 个能力
+              </h3>
+              <ul className="space-y-2 text-[13px] leading-[1.7] text-ink-2">
+                {mcpTools.map((tool) => (
+                  <li key={tool.name} className="flex gap-2">
+                    <span className="mt-[9px] size-1 shrink-0 rounded-full bg-accent" />
+                    <span>
+                      <strong className="font-semibold text-ink">{tool.title_zh}</strong>（
+                      <code className="mono text-[11.5px] text-ink-3">{tool.name}</code>
+                      ）：{tool.description_zh || tool.description}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+        </div>
+      )}
+
+      {/* Tab 2: Directories, Model & Schedule */}
+      {tab === 'storage' && (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 text-[12.5px]">
+          <section className="card p-5 space-y-3">
+            <h2 className="text-[14.5px] font-bold text-ink">1. 个人配置与技能目录</h2>
+            <div>
+              <label className="block text-ink-3 mb-1">个人规矩覆盖目录（选填）</label>
+              <input
+                value={overrideDir}
+                onChange={(e) => setOverrideDir(e.target.value)}
+                placeholder="例如：/path/to/your-home-repo/flywheel-profile"
+                className="field-input mono w-full px-3 py-2 text-[12px]"
+              />
+            </div>
+            <div>
+              <label className="block text-ink-3 mb-1">本地技能目录（每行一个，只读识别）</label>
+              <textarea
+                rows={2}
+                value={skillsDirs}
+                onChange={(e) => setSkillsDirs(e.target.value)}
+                placeholder="例如：/path/to/your-home-repo/skills"
+                className="field-input mono w-full p-2.5 text-[12px]"
+              />
+            </div>
+          </section>
+
+          <section className="card p-5 space-y-3">
+            <h2 className="text-[14.5px] font-bold text-ink">2. 笔记保存位置</h2>
+            <div>
+              <label className="block text-ink-3 mb-1">保存方式</label>
+              <select
+                value={kbType}
+                onChange={(e) => setKbType(e.target.value)}
+                className="field-input w-full px-3 py-2 text-[12.5px]"
+              >
+                <option value="builtin_kb">使用自带的笔记文件夹（开箱即用）</option>
+                <option value="local_markdown_wiki">保存到我自己的本地知识库目录</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-ink-3 mb-1">笔记根目录</label>
+              <input
+                value={kbRoot}
+                onChange={(e) => setKbRoot(e.target.value)}
+                className="field-input mono w-full px-3 py-2 text-[12px]"
+              />
+            </div>
+          </section>
+
+          <section className="card p-5 space-y-3">
+            <h2 className="text-[14.5px] font-bold text-ink">3. 后台整理使用的模型</h2>
+            <div>
+              <label className="block text-ink-3 mb-1">运行方式</label>
+              <select
+                value={runnerMode}
+                onChange={(e) => setRunnerMode(e.target.value)}
+                className="field-input w-full px-3 py-2 text-[12.5px]"
+              >
+                <option value="api">调用模型 API（推荐：接本地网关或云端模型）</option>
+                <option value="cli">调用本机命令行工具</option>
+                <option value="dry_run">不调模型，仅做本地快速演练</option>
+              </select>
+            </div>
+            {runnerMode === 'api' && (
+              <div className="space-y-2.5">
+                <div>
+                  <label className="block text-ink-3 mb-1">接口地址（Base URL）</label>
+                  <input
+                    value={apiBaseUrl}
+                    onChange={(e) => setApiBaseUrl(e.target.value)}
+                    placeholder="http://127.0.0.1:3425/v1"
+                    className="field-input mono w-full px-3 py-2 text-[12px]"
+                  />
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  <div>
+                    <label className="block text-ink-3 mb-1">模型名或路由组</label>
+                    <input
+                      value={apiModel}
+                      onChange={(e) => setApiModel(e.target.value)}
+                      placeholder="group/cheap-first"
+                      className="field-input mono w-full px-3 py-2 text-[12px]"
+                    />
+                  </div>
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="text-ink-3">API 密钥</label>
+                      {apiKeyConfigured && (
+                        <span className="text-[11px] text-ok-ink font-medium">
+                          已配置 · 留空不变
+                        </span>
+                      )}
+                    </div>
+                    <input
+                      type="password"
+                      value={apiKey}
+                      onChange={(e) => setApiKey(e.target.value)}
+                      placeholder={apiKeyConfigured ? '留空即保留当前密钥' : '输入 API Key'}
+                      className="field-input mono w-full px-3 py-2 text-[12px]"
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
+            {runnerMode === 'cli' && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div>
+                  <label className="block text-ink-3 mb-1">命令名</label>
+                  <input
+                    value={cliCmd}
+                    onChange={(e) => setCliCmd(e.target.value)}
+                    placeholder="如 claude / codex"
+                    className="field-input mono w-full px-3 py-2 text-[12px]"
+                  />
+                </div>
+                <div>
+                  <label className="block text-ink-3 mb-1">参数模板</label>
+                  <input
+                    value={cliArgs}
+                    onChange={(e) => setCliArgs(e.target.value)}
+                    placeholder="-p {prompt}"
+                    className="field-input mono w-full px-3 py-2 text-[12px]"
+                  />
+                </div>
+              </div>
+            )}
+          </section>
+
+          <section className="card p-5 space-y-3">
+            <h2 className="text-[14.5px] font-bold text-ink">4. 定时、审批与飞书通知</h2>
+            <div>
+              <label className="block text-ink-3 mb-1">审批方式</label>
+              <select
+                value={approvalMode}
+                onChange={(e) => setApprovalMode(e.target.value)}
+                className="field-input w-full px-3 py-2 text-[12.5px]"
+              >
+                <option value="smart">智能审批（推荐：常规笔记与规则自动通过，仅新建/修改 Skill 或重要变更需确认）</option>
+                <option value="always">每次写入都要我手动确认</option>
+                <option value="auto">全部自动通过并落盘</option>
+              </select>
+            </div>
+            <label className="flex items-center justify-between gap-3 p-2.5 rounded-[var(--radius-control)] bg-bg-sunk/70 border border-line-soft cursor-pointer">
+              <div>
+                <div className="font-medium text-ink">每天 20:00 自动整理（周五附带周复盘）</div>
+                <div className="text-[11.5px] text-ink-4">周一至周四每日沉淀，周五自动叠加本周重复流程与技能复盘</div>
+              </div>
+              <input
+                type="checkbox"
+                checked={scheduleEnabled && fridayWeekly}
+                onChange={(e) => {
+                  setScheduleEnabled(e.target.checked)
+                  setFridayWeekly(e.target.checked)
+                }}
+                className="accent-accent"
+              />
+            </label>
+            <div className="p-2.5 rounded-[var(--radius-control)] bg-bg-sunk/70 border border-line-soft space-y-2">
+              <label className="flex items-center justify-between gap-3 cursor-pointer">
+                <div>
+                  <div className="font-medium text-ink">重要待审批通过飞书 CLI 通知我</div>
+                  <div className="text-[11.5px] text-ink-4">平时自动通过不打扰，有 Skill 变更或报错才发飞书消息</div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={feishuEnabled}
+                  onChange={(e) => setFeishuEnabled(e.target.checked)}
+                  className="accent-accent"
+                />
+              </label>
+              {feishuEnabled && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+                  <input
+                    value={feishuUserId}
+                    onChange={(e) => setFeishuUserId(e.target.value)}
+                    placeholder="飞书接收人 open_id（ou_xxx）"
+                    className="field-input mono px-2.5 py-1.5 text-[12px]"
+                  />
+                  <label className="inline-flex items-center gap-2 text-[12px] text-ink-3 cursor-pointer px-1">
+                    <input
+                      type="checkbox"
+                      checked={feishuNotifyFyi}
+                      onChange={(e) => setFeishuNotifyFyi(e.target.checked)}
+                      className="accent-accent"
+                    />
+                    <span>常规自动通过时也发简报</span>
+                  </label>
+                </div>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-4 pt-1 text-[12px] text-ink-2">
+              <label className="inline-flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={workflowEnabled}
+                  onChange={(e) => setWorkflowEnabled(e.target.checked)}
+                  className="accent-accent"
+                />
+                <span>允许后台沉淀运行</span>
+              </label>
+              <label className="inline-flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={skillWriteEnabled}
+                  onChange={(e) => setSkillWriteEnabled(e.target.checked)}
+                  className="accent-accent"
+                />
+                <span>允许批准后写入 Skill 目录</span>
+              </label>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {/* Tab 3: Self-Test Sandbox */}
+      {tab === 'test' && (
+        <div className="max-w-2xl card p-5 space-y-4">
+          <div className="flex items-center gap-2">
+            <Zap className="w-4 h-4 text-accent" />
+            <h2 className="text-[15px] font-bold text-ink">模拟一次开局提醒</h2>
+          </div>
+          <p className="text-[13px] text-ink-3">
+            输入一句你准备让 AI 做的任务，看看系统会自动给 AI 注入哪些规矩和避坑规则。
+          </p>
+          <div className="space-y-2.5">
+            <input
+              value={pfProject}
+              onChange={(e) => setPfProject(e.target.value)}
+              placeholder="项目名（选填）"
+              className="field-input w-full px-3 py-2 text-[13px]"
+            />
             <textarea
-              rows={2}
-              value={skillsDirs}
-              onChange={(e) => setSkillsDirs(e.target.value)}
-              placeholder="例如：E:/github/ai-home/skills"
-              className="field-input mono w-full p-2.5 text-[12px]"
+              rows={3}
+              value={pfPrompt}
+              onChange={(e) => setPfPrompt(e.target.value)}
+              placeholder="输入你想测试的任务描述..."
+              className="field-input w-full px-3 py-2 text-[13px]"
             />
-          </div>
-        </section>
-
-        <section className="card p-5 space-y-3">
-          <h2 className="text-[14.5px] font-bold text-ink">2. 知识库落点适配器（与策略解耦）</h2>
-          <div>
-            <label className="block text-ink-3 mb-1">落点模式</label>
-            <select
-              value={kbType}
-              onChange={(e) => setKbType(e.target.value)}
-              className="field-input w-full px-3 py-2 text-[12.5px]"
+            <button
+              type="button"
+              onClick={executePreflight}
+              disabled={pfLoading}
+              className="inline-flex items-center gap-1.5 h-9 px-4 rounded-[var(--radius-control)] bg-accent text-accent-contrast text-[13px] font-medium hover:bg-accent-ink disabled:opacity-50"
             >
-              <option value="builtin_kb">内置默认 Markdown 知识库（零配置开箱即用）</option>
-              <option value="local_markdown_wiki">挂载外部本地 Markdown / Obsidian / Wiki 目录</option>
-            </select>
+              <Zap className="w-3.5 h-3.5" />
+              {pfLoading ? '正在测试...' : '运行模拟测试'}
+            </button>
           </div>
-          <div>
-            <label className="block text-ink-3 mb-1">知识库根目录路径</label>
-            <input
-              value={kbRoot}
-              onChange={(e) => setKbRoot(e.target.value)}
-              className="field-input mono w-full px-3 py-2 text-[12px]"
-            />
-          </div>
-        </section>
-
-        <section className="card p-5 space-y-3">
-          <h2 className="text-[14.5px] font-bold text-ink">3. 后台执行大脑（OpenAI 兼容 API / 本地 CLI / Dry-run）</h2>
-          <div>
-            <label className="block text-ink-3 mb-1">执行模式</label>
-            <select
-              value={runnerMode}
-              onChange={(e) => setRunnerMode(e.target.value)}
-              className="field-input w-full px-3 py-2 text-[12.5px]"
-            >
-              <option value="api">OpenAI 兼容 API（可直连本地 Magpie 网关 / DeepSeek / Ollama）</option>
-              <option value="cli">可配置本地 CLI 子进程模式（复用本机订阅额度）</option>
-              <option value="dry_run">Dry-run 零成本本地启发式模式</option>
-            </select>
-          </div>
-          {runnerMode === 'api' && (
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-              <div>
-                <label className="block text-ink-3 mb-1">Base URL</label>
-                <input
-                  value={apiBaseUrl}
-                  onChange={(e) => setApiBaseUrl(e.target.value)}
-                  placeholder="http://127.0.0.1:3425/v1"
-                  className="field-input mono w-full px-2.5 py-1.5 text-[12px]"
-                />
+          {pfResult && (
+            <div className="pt-3 border-t border-line-soft space-y-2">
+              <div className="text-[12px] text-ink-4">
+                匹配模式：<strong className="text-ink">{pfResult.anti_laziness_mode}</strong> · 命中规则{' '}
+                <strong className="num text-ink">{pfResult.matched_rules.length}</strong> 条
               </div>
-              <div>
-                <label className="block text-ink-3 mb-1">Model / 路由组</label>
-                <input
-                  value={apiModel}
-                  onChange={(e) => setApiModel(e.target.value)}
-                  placeholder="group/cheap-first"
-                  className="field-input mono w-full px-2.5 py-1.5 text-[12px]"
-                />
-              </div>
-              <div>
-                <label className="block text-ink-3 mb-1">API Key</label>
-                <input
-                  type="password"
-                  value={apiKey}
-                  onChange={(e) => setApiKey(e.target.value)}
-                  placeholder="magpie / sk-..."
-                  className="field-input mono w-full px-2.5 py-1.5 text-[12px]"
-                />
-              </div>
+              <pre className="mono text-[12px] leading-[1.65] bg-bg-sunk border border-line-soft rounded-[var(--radius-control)] p-3.5 whitespace-pre-wrap max-h-80 overflow-y-auto text-ink-2">
+                {pfResult.compact_context}
+              </pre>
             </div>
           )}
-          {runnerMode === 'cli' && (
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-              <div>
-                <label className="block text-ink-3 mb-1">CLI 可执行命令/路径</label>
-                <input
-                  value={cliCmd}
-                  onChange={(e) => setCliCmd(e.target.value)}
-                  placeholder="如 claude / codex"
-                  className="field-input mono w-full px-3 py-2 text-[12px]"
-                />
-              </div>
-              <div>
-                <label className="block text-ink-3 mb-1">参数模板（支持 {'{prompt}'}）</label>
-                <input
-                  value={cliArgs}
-                  onChange={(e) => setCliArgs(e.target.value)}
-                  placeholder="-p {prompt}"
-                  className="field-input mono w-full px-3 py-2 text-[12px]"
-                />
-              </div>
-            </div>
-          )}
-        </section>
-
-        <section className="card p-5 space-y-3">
-          <h2 className="text-[14.5px] font-bold text-ink">4. 定时调度与安全阀（Safety Valves）</h2>
-          <label className="flex items-center justify-between p-3 rounded-[var(--radius-control)] bg-bg-sunk/70 border border-line-soft cursor-pointer">
-            <div>
-              <div className="font-medium text-ink">启用每日 20:00 自动定时运转（schedule_enabled）</div>
-              <div className="text-[11.5px] text-ink-4">到点自主跑 P00–P03，默认停在画布等你审批放行</div>
-            </div>
-            <input
-              type="checkbox"
-              checked={scheduleEnabled}
-              onChange={(e) => setScheduleEnabled(e.target.checked)}
-            />
-          </label>
-          <label className="flex items-center justify-between p-3 rounded-[var(--radius-control)] bg-bg-sunk/70 border border-line-soft cursor-pointer">
-            <div>
-              <div className="font-medium text-ink">允许执行后台工作流（WORKFLOW_ENABLED）</div>
-              <div className="text-[11.5px] text-ink-4">关闭时阻断所有 P00–P07 触发</div>
-            </div>
-            <input
-              type="checkbox"
-              checked={workflowEnabled}
-              onChange={(e) => setWorkflowEnabled(e.target.checked)}
-            />
-          </label>
-          <label className="flex items-center justify-between p-3 rounded-[var(--radius-control)] bg-bg-sunk/70 border border-line-soft cursor-pointer">
-            <div>
-              <div className="font-medium text-ink">无人值守全自动写入（AUTO_APPROVE_WRITES）</div>
-              <div className="text-[11.5px] text-ink-4">默认关闭（P03 后审核放行）；开启后直通 P04–P07</div>
-            </div>
-            <input
-              type="checkbox"
-              checked={autoApprove}
-              onChange={(e) => setAutoApprove(e.target.checked)}
-            />
-          </label>
-        </section>
-      </div>
+        </div>
+      )}
     </div>
   )
 }

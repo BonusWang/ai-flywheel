@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from ai_flywheel.config import FlywheelConfig
 from ai_flywheel.core.activation import ActivationEngine
 from ai_flywheel.core.receipts import ReceiptService
+from ai_flywheel.storage.db import build_knowledge_search_text
 from ai_flywheel.models import (
     CheckResult,
     CreateRuleRequest,
@@ -69,22 +70,27 @@ def seed_demo_data(
                 "同一工具遇到相同报错原因最多重试 2 次；第 3 次必须停止盲目重试，改为检查解释器、环境路径或换专用工具。\n",
                 encoding="utf-8",
             )
-        db.rebuild_knowledge_fts(
-            [
-                {
-                    "doc_path": "lessons/2026-11-verify-before-claim.md",
-                    "title": "真实验证优先于静态判断",
-                    "body": sample_doc.read_text(encoding="utf-8"),
-                    "tags": "verification anti-laziness mcp",
-                },
-                {
-                    "doc_path": "lessons/2026-11-retry-loop-breaker.md",
-                    "title": "同工具同因重试上限与换路原则",
-                    "body": sample_doc_2.read_text(encoding="utf-8"),
-                    "tags": "debugging retry-breaker shell",
-                },
-            ]
-        )
+        seed_docs = [
+            {
+                "doc_path": "lessons/2026-11-verify-before-claim.md",
+                "title": "真实验证优先于静态判断",
+                "body": sample_doc.read_text(encoding="utf-8"),
+                "tags": "verification anti-laziness mcp",
+            },
+            {
+                "doc_path": "lessons/2026-11-retry-loop-breaker.md",
+                "title": "同工具同因重试上限与换路原则",
+                "body": sample_doc_2.read_text(encoding="utf-8"),
+                "tags": "debugging retry-breaker shell",
+            },
+        ]
+        for doc in seed_docs:
+            doc["title_index"] = build_knowledge_search_text(doc["title"])
+            doc["body_index"] = build_knowledge_search_text(doc["body"])
+            doc["tags_index"] = build_knowledge_search_text(doc["tags"])
+            doc["title_raw"] = doc["title"]
+            doc["tags_raw"] = doc["tags"]
+        db.rebuild_knowledge_fts(seed_docs)
 
     # 2. Sample sessions from Codex, Claude Code, and Claude Desktop
     now = datetime.now(timezone.utc)

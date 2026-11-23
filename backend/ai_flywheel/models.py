@@ -224,6 +224,8 @@ class RecordOutcomeRequest(BaseModel):
     checks: list[OutcomeCheck] = Field(default_factory=list)
     applied_rule_ids: list[str] = Field(default_factory=list)
     artifacts: list[str] = Field(default_factory=list)
+    # D6 (2026-11-23): Wiki knowledge cards actually re-read and helpful in this task.
+    used_knowledge_paths: list[str] = Field(default_factory=list)
 
 
 class OutcomeRecord(BaseModel):
@@ -238,6 +240,7 @@ class OutcomeRecord(BaseModel):
     checks: list[OutcomeCheck]
     applied_rule_ids: list[str]
     artifacts: list[str]
+    used_knowledge_paths: list[str] = Field(default_factory=list)
     revalidation_effects: list[dict[str, Any]] = Field(default_factory=list)
     created_at: str = Field(default_factory=utc_now_iso)
 
@@ -250,6 +253,9 @@ class PlannedWrite(BaseModel):
     summary: str
     content_preview: str = ""
     rule_payload: dict[str, Any] | None = None
+    skill_route: dict[str, Any] | None = None
+    requires_approval: bool = False
+    approval_reason: str = ""
     source_session_keys: list[str] = Field(default_factory=list)
     approved: bool = True
 
@@ -272,9 +278,12 @@ class NodeExecution(BaseModel):
 
 class WorkflowRunRecord(BaseModel):
     run_id: str
+    batch_date: str = ""
+    batch_seq: int = 1
     trigger: str = "manual"  # manual | scheduled | api | seed
-    phase: str = "daily"  # daily | weekly_exception
+    phase: str = "daily"  # daily | weekly | both
     runner_mode: str = "dry_run"
+    approval_mode: str = "always"
     status: RunStatus = RunStatus.PENDING
     admitted_sessions: list[str] = Field(default_factory=list)
     nodes: list[NodeExecution] = Field(default_factory=list)
@@ -282,5 +291,8 @@ class WorkflowRunRecord(BaseModel):
     digest_markdown: str = ""
     error: str | None = None
     lock_released: bool = False
+    version: int = 1
     started_at: str = Field(default_factory=utc_now_iso)
     finished_at: str | None = None
+    created_at: str = Field(default_factory=utc_now_iso)
+    updated_at: str = Field(default_factory=utc_now_iso)

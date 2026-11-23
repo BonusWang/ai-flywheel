@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from ai_flywheel.core.connect_templates import build_client_connect_guides
 from ai_flywheel.core.orchestrator import WorkflowLockError
+from ai_flywheel.core.publication import MCP_TOOL_CATALOG
 from ai_flywheel.core.receipts import OutcomeGateError
 from ai_flywheel.models import (
     CreateRuleRequest,
@@ -81,7 +82,7 @@ def create_app(
             scheduler = BackgroundScheduler()
             try:
                 scheduler.add_job(
-                    lambda: rt.orchestrator.start_run(trigger="scheduled", phase="daily"),
+                    lambda: rt.orchestrator.start_run(trigger="scheduled", phase="auto"),
                     CronTrigger.from_crontab(rt.cfg.workflow.daily_cron),
                     id="daily_flywheel",
                     replace_existing=True,
@@ -132,6 +133,10 @@ def create_app(
     def api_v1_overview() -> dict[str, Any]:
         return rt.publication.get_overview(public_mode=True)
 
+    @app.get("/api/v1/about")
+    def api_v1_about() -> dict[str, Any]:
+        return rt.publication.get_about_payload(public_mode=True)
+
     @app.get("/api/v1/public-snapshot")
     def api_v1_public_snapshot() -> dict[str, Any]:
         return rt.publication.export_public_snapshot()
@@ -172,18 +177,32 @@ def create_app(
     def site_overview() -> dict[str, Any]:
         return rt.publication.get_overview(public_mode=False)
 
+    @app.get("/api/site/about")
+    def site_about() -> dict[str, Any]:
+        return rt.publication.get_about_payload(public_mode=False)
+
+    def _safe_config_dump() -> dict[str, Any]:
+        dumped = rt.cfg.model_dump(mode="json")
+        api_cfg = dumped.get("runner", {}).get("api")
+        if isinstance(api_cfg, dict):
+            has_key = bool(api_cfg.get("api_key"))
+            api_cfg["api_key"] = ""
+            api_cfg["api_key_configured"] = has_key
+        return dumped
+
     @app.get("/api/site/connect")
     def site_connect() -> dict[str, Any]:
         return {
             "guides": build_client_connect_guides(rt.cfg),
-            "config": rt.cfg.model_dump(mode="json"),
+            "config": _safe_config_dump(),
             "probed_skills": rt.activation.probe_local_skills(),
+            "mcp_tools": MCP_TOOL_CATALOG,
         }
 
     @app.put("/api/site/config")
     def site_update_config(patch: dict[str, Any]) -> dict[str, Any]:
-        updated = rt.update_runtime_config(patch)
-        return {"status": "saved", "config": updated.model_dump(mode="json")}
+        rt.update_runtime_config(patch)
+        return {"status": "saved", "config": _safe_config_dump()}
 
     @app.post("/api/site/seed")
     def site_seed() -> dict[str, Any]:
@@ -277,7 +296,21 @@ def create_app(
         run = rt.db.get_workflow_run(run_id)
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
-        return {"run": run.model_dump(mode="json")}
+        return {
+            "run": run.model_dump(mode="json"),
+            "events": rt.db.list_audit_events(entity_type="workflow_run", entity_id=run_id, limit=50),
+        }
+
+    @app.get("/api/site/runs/{run_id}/events")
+    def site_run_events(run_id: str) -> dict[str, Any]:
+        return {"events": rt.db.list_audit_events(entity_type="workflow_run", entity_id=run_id, limit=50)}
+
+    @app.get("/api/site/settings")
+    def site_list_settings() -> dict[str, Any]:
+        return {
+            "settings": rt.db.list_system_settings(),
+            "skills": rt.db.list_skill_assets(),
+        }
 
     @app.post("/api/site/runs")
     def site_start_run(body: RunTriggerBody) -> dict[str, Any]:

@@ -175,6 +175,13 @@
     border: 1px solid var(--line);
     border-radius: var(--radius-card);
   }
+  .well {
+    background: var(--bg-sunk);
+    border: 1px solid var(--line-soft);
+  }
+  .animate-fade-up {
+    animation: flywheel-fade-up 340ms var(--ease-out-quart) both;
+  }
   .chip {
     display: inline-flex;
     align-items: center;
@@ -197,5 +204,16 @@
   .field-input:focus {
     outline: none;
     border-color: var(--accent);
+  }
+}
+
+@keyframes flywheel-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }

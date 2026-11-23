@@ -83,6 +83,7 @@ class ReceiptService:
 
         session_key = req.session_key or (f"{req.client}:{req.session_id}" if req.session_id else f"{req.client}:adhoc")
         outcome_id = f"out-{uuid.uuid4().hex[:12]}"
+        used_knowledge_paths = [p for p in dict.fromkeys(req.used_knowledge_paths) if p]
         payload = {
             "outcome_id": outcome_id,
             "session_key": session_key,
@@ -96,6 +97,7 @@ class ReceiptService:
             "checks": [c.model_dump(mode="json") for c in req.checks],
             "applied_rule_ids": req.applied_rule_ids,
             "artifacts": req.artifacts,
+            "used_knowledge_paths": used_knowledge_paths,
             "created_at": utc_now_iso(),
         }
         _, receipt_hash = self.fs_store.write_receipt("outcomes", outcome_id, payload)
@@ -112,11 +114,26 @@ class ReceiptService:
             checks=req.checks,
             applied_rule_ids=req.applied_rule_ids,
             artifacts=req.artifacts,
+            used_knowledge_paths=used_knowledge_paths,
             created_at=payload["created_at"],
         )
         effects = self.activation.revalidate_from_outcome(record)
         record.revalidation_effects = effects
         self.db.save_outcome(record)
+
+        # D6 (2026-11-23): helped_count for cards the agent re-read and used.
+        # cited_count only when the card also appeared in this task's preflight
+        # receipt, so a citation without prior surfacing is still distinguishable.
+        if used_knowledge_paths:
+            preflight_pointers = set(
+                self.db.get_preflight_knowledge_pointers(req.preflight_receipt_id or "")
+            )
+            cited_paths = [p for p in used_knowledge_paths if p in preflight_pointers]
+            self.db.record_knowledge_usage(
+                used_knowledge_paths,
+                payload["created_at"],
+                cited_paths=cited_paths,
+            )
 
         # Any failed rule check also enqueues a retro item for root-cause review
         for chk in req.checks:

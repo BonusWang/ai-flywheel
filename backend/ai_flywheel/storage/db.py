@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -151,11 +155,294 @@ CREATE TABLE IF NOT EXISTS retry_counters (
 
 CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
     doc_path UNINDEXED,
-    title,
-    body,
-    tags
+    title_index,
+    description_index,
+    body UNINDEXED,
+    body_index,
+    tags_index,
+    project_id UNINDEXED,
+    page_type UNINDEXED,
+    status UNINDEXED,
+    title_raw UNINDEXED,
+    description_raw UNINDEXED,
+    tags_raw UNINDEXED,
+    tokenize='unicode61'
 );
+
+CREATE TABLE IF NOT EXISTS knowledge_card_metrics (
+    doc_path TEXT PRIMARY KEY,
+    surface_count INTEGER NOT NULL DEFAULT 0,
+    cited_count INTEGER NOT NULL DEFAULT 0,
+    helped_count INTEGER NOT NULL DEFAULT 0,
+    last_surfaced_at TEXT,
+    last_helped_at TEXT,
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+
+-- ---------------- v2 Normalized Governance, Pipeline, Decision & Asset Tables ----------------
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    applied_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS system_settings (
+    key TEXT PRIMARY KEY,
+    category TEXT NOT NULL DEFAULT 'general',
+    value_json TEXT NOT NULL,
+    updated_by TEXT NOT NULL DEFAULT 'system',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_events (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    actor TEXT NOT NULL DEFAULT 'system',
+    summary TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS workflow_nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
+    step_order INTEGER NOT NULL DEFAULT 0,
+    node_id TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    duration_ms INTEGER,
+    summary TEXT NOT NULL DEFAULT '',
+    checks_json TEXT NOT NULL DEFAULT '[]',
+    artifacts_json TEXT NOT NULL DEFAULT '[]',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    receipt_hash TEXT,
+    error TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(run_id, node_id)
+);
+
+CREATE TABLE IF NOT EXISTS run_sessions (
+    run_id TEXT NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
+    session_key TEXT NOT NULL,
+    admitted_chars INTEGER NOT NULL DEFAULT 0,
+    disposition TEXT NOT NULL DEFAULT 'admitted',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, session_key)
+);
+
+CREATE TABLE IF NOT EXISTS planned_writes (
+    write_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
+    seq_no INTEGER NOT NULL DEFAULT 0,
+    target_kind TEXT NOT NULL,
+    action TEXT NOT NULL,
+    relative_path TEXT,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    content_preview TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    skill_route_json TEXT NOT NULL DEFAULT '{}',
+    requires_approval INTEGER NOT NULL DEFAULT 0,
+    approval_reason TEXT NOT NULL DEFAULT '',
+    decision_status TEXT NOT NULL DEFAULT 'pending',
+    approved INTEGER NOT NULL DEFAULT 1,
+    result_sha256 TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    decided_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS decision_cards (
+    card_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
+    kind TEXT NOT NULL DEFAULT 'ask',
+    state TEXT NOT NULL DEFAULT 'open',
+    title TEXT NOT NULL,
+    body_markdown TEXT NOT NULL DEFAULT '',
+    options_json TEXT NOT NULL DEFAULT '[]',
+    selected_option TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    decided_at TEXT,
+    closed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS card_deliveries (
+    delivery_id TEXT PRIMARY KEY,
+    card_id TEXT NOT NULL REFERENCES decision_cards(card_id) ON DELETE CASCADE,
+    channel TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    external_ref TEXT,
+    tries INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(card_id, channel)
+);
+
+CREATE TABLE IF NOT EXISTS skill_assets (
+    skill_name TEXT PRIMARY KEY,
+    source_dir TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    origin TEXT NOT NULL DEFAULT 'manual',
+    sha256 TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1,
+    last_run_id TEXT,
+    backup_path TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Secondary query indexes
+CREATE INDEX IF NOT EXISTS idx_sessions_status_updated ON sessions(status, priority, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_client_project ON sessions(client, project);
+CREATE INDEX IF NOT EXISTS idx_rules_status_hits ON rules(status, hit_count DESC);
+CREATE INDEX IF NOT EXISTS idx_preflight_client_created ON preflight_receipts(client, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_outcomes_session_created ON outcomes(session_key, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_retro_status_session ON retro_queue(status, session_key);
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_started ON workflow_runs(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_workflow_nodes_run ON workflow_nodes(run_id, step_order);
+CREATE INDEX IF NOT EXISTS idx_planned_writes_run ON planned_writes(run_id, seq_no);
+CREATE INDEX IF NOT EXISTS idx_planned_writes_status ON planned_writes(decision_status, target_kind);
+CREATE INDEX IF NOT EXISTS idx_decision_cards_state ON decision_cards(state, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_card_deliveries_status ON card_deliveries(status, channel);
+CREATE INDEX IF NOT EXISTS idx_audit_events_entity ON audit_events(entity_type, entity_id, seq DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_events_created ON audit_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_system_settings_cat ON system_settings(category);
 """
+
+KNOWLEDGE_FTS_COLUMNS = (
+    "doc_path",
+    "title_index",
+    "description_index",
+    "body",
+    "body_index",
+    "tags_index",
+    "project_id",
+    "page_type",
+    "status",
+    "title_raw",
+    "description_raw",
+    "tags_raw",
+)
+
+_KNOWLEDGE_FTS_SQL = """
+CREATE VIRTUAL TABLE knowledge_fts USING fts5(
+    doc_path UNINDEXED,
+    title_index,
+    description_index,
+    body UNINDEXED,
+    body_index,
+    tags_index,
+    project_id UNINDEXED,
+    page_type UNINDEXED,
+    status UNINDEXED,
+    title_raw UNINDEXED,
+    description_raw UNINDEXED,
+    tags_raw UNINDEXED,
+    tokenize='unicode61'
+)
+"""
+
+_CJK_RUN = re.compile(r"[㐀-䶿一-鿿豈-﫿]+")
+_ASCII_TERM = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-/]{1,}")
+
+
+@dataclass(frozen=True)
+class KnowledgeQueryTerms:
+    match_terms: list[str]
+    overlap_terms: list[str]
+    like_terms: list[str]
+
+
+def cjk_bigrams(text: str) -> list[str]:
+    """Overlapping CJK bigrams (single-character runs kept as-is)."""
+    out: list[str] = []
+    for run in _CJK_RUN.findall(text):
+        if len(run) == 1:
+            out.append(run)
+        else:
+            out.extend(run[index : index + 2] for index in range(len(run) - 1))
+    return out
+
+
+def build_knowledge_search_text(*parts: str) -> str:
+    """Expand CJK runs into space-separated bigrams while keeping ASCII tokens intact."""
+    segments: list[str] = []
+    for text in parts:
+        if not text:
+            continue
+        cursor = 0
+        pieces: list[str] = []
+        for match in _CJK_RUN.finditer(text):
+            pieces.append(text[cursor : match.start()])
+            pieces.append(" " + " ".join(cjk_bigrams(match.group(0))) + " ")
+            cursor = match.end()
+        pieces.append(text[cursor:])
+        segments.append("".join(pieces))
+    return "\n".join(segments)
+
+
+def _knowledge_query_terms(query: str) -> KnowledgeQueryTerms:
+    seen: list[str] = []
+    like_terms: list[str] = []
+    for run in _CJK_RUN.findall(query):
+        terms = cjk_bigrams(run)
+        for term in terms:
+            if len(term) < 2:
+                if term not in like_terms:
+                    like_terms.append(term)
+                continue
+            if term not in seen:
+                seen.append(term)
+    for match in _ASCII_TERM.finditer(query):
+        term = match.group(0).casefold()
+        if term not in seen:
+            seen.append(term)
+    return KnowledgeQueryTerms(
+        match_terms=seen,
+        overlap_terms=list(dict.fromkeys(seen + like_terms)),
+        like_terms=like_terms,
+    )
+
+
+def _knowledge_snippet(body: str, terms: list[str], width: int = 60) -> str:
+    if not body:
+        return ""
+    folded = body.casefold()
+    best = -1
+    best_term = ""
+    for term in terms:
+        if not term:
+            continue
+        position = folded.find(term.casefold())
+        if position >= 0 and (best < 0 or position < best):
+            best = position
+            best_term = term
+    if best < 0:
+        return body[: width * 2].replace("\n", " ")
+    start = max(0, best - width)
+    end = min(len(body), best + len(best_term) + width)
+    snippet = body[start:end].replace("\n", " ")
+    relative = best - start
+    return (
+        snippet[:relative]
+        + "["
+        + snippet[relative : relative + len(best_term)]
+        + "]"
+        + snippet[relative + len(best_term) :]
+    )
 
 
 class FlywheelDB:
@@ -178,8 +465,190 @@ class FlywheelDB:
             conn.close()
 
     def _init_schema(self) -> None:
+        preexisting = self.db_path.exists() and self.db_path.stat().st_size > 0
         with self.connect() as conn:
             conn.executescript(SCHEMA_SQL)
+            self._migrate_knowledge_fts(conn)
+            self._migrate_to_v2(conn, preexisting=preexisting)
+
+    @staticmethod
+    def _to_shanghai_date(iso_str: str | None) -> str:
+        if not iso_str:
+            return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        try:
+            dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+            return dt.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        except Exception:
+            return iso_str[:10]
+
+    @staticmethod
+    def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+        return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+    def _ensure_column(self, conn: sqlite3.Connection, table: str, col: str, ddl: str) -> None:
+        if col not in self._table_columns(conn, table):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+
+    def _migrate_to_v2(self, conn: sqlite3.Connection, *, preexisting: bool) -> None:
+        applied = conn.execute(
+            "SELECT version FROM schema_migrations WHERE version = 2"
+        ).fetchone()
+        if applied:
+            return
+
+        # Auto-backup existing v1 database before running schema upgrades
+        if preexisting and self.db_path.exists():
+            backup = self.db_path.with_name(f"{self.db_path.name}.bak-v1")
+            if not backup.exists():
+                try:
+                    shutil.copy2(self.db_path, backup)
+                except OSError:
+                    pass
+
+        now = utc_now_iso()
+        # Universal created_at & updated_at audit columns + batch/optimistic-lock columns
+        self._ensure_column(conn, "workflow_runs", "batch_date", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "workflow_runs", "batch_seq", "INTEGER NOT NULL DEFAULT 1")
+        self._ensure_column(conn, "workflow_runs", "approval_mode", "TEXT NOT NULL DEFAULT 'always'")
+        self._ensure_column(conn, "workflow_runs", "version", "INTEGER NOT NULL DEFAULT 1")
+        self._ensure_column(conn, "workflow_runs", "created_at", f"TEXT NOT NULL DEFAULT '{now}'")
+        self._ensure_column(conn, "workflow_runs", "updated_at", f"TEXT NOT NULL DEFAULT '{now}'")
+        self._ensure_column(conn, "policy_overrides", "created_at", f"TEXT NOT NULL DEFAULT '{now}'")
+        self._ensure_column(conn, "workflow_lock", "expires_at", "TEXT")
+        self._ensure_column(conn, "workflow_lock", "created_at", f"TEXT NOT NULL DEFAULT '{now}'")
+        self._ensure_column(conn, "workflow_lock", "updated_at", f"TEXT NOT NULL DEFAULT '{now}'")
+        self._ensure_column(conn, "retry_counters", "created_at", f"TEXT NOT NULL DEFAULT '{now}'")
+        self._ensure_column(conn, "preflight_receipts", "updated_at", f"TEXT NOT NULL DEFAULT '{now}'")
+        self._ensure_column(conn, "outcomes", "updated_at", f"TEXT NOT NULL DEFAULT '{now}'")
+        self._ensure_column(conn, "retro_queue", "linked_run_id", "TEXT")
+        self._ensure_column(conn, "knowledge_card_metrics", "created_at", f"TEXT NOT NULL DEFAULT '{now}'")
+        self._ensure_column(conn, "knowledge_card_metrics", "updated_at", f"TEXT NOT NULL DEFAULT '{now}'")
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_workflow_runs_batch ON workflow_runs(batch_date DESC, batch_seq DESC)"
+        )
+
+        # Backfill existing workflow_runs rows into normalized child tables
+        rows = conn.execute("SELECT * FROM workflow_runs ORDER BY started_at ASC").fetchall()
+        date_counts: dict[str, int] = {}
+        for row in rows:
+            run_id = row["run_id"]
+            bdate = row["batch_date"] or self._to_shanghai_date(row["started_at"])
+            seq = date_counts.get(bdate, 0) + 1
+            date_counts[bdate] = seq
+            created = row["started_at"] or now
+            updated = row["finished_at"] or row["started_at"] or now
+            conn.execute(
+                """
+                UPDATE workflow_runs
+                SET batch_date = ?, batch_seq = ?, created_at = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (bdate, seq, created, updated, run_id),
+            )
+            # Backfill child tables if empty for this run
+            existing_nodes = conn.execute(
+                "SELECT COUNT(1) AS c FROM workflow_nodes WHERE run_id = ?", (run_id,)
+            ).fetchone()["c"]
+            if existing_nodes == 0:
+                try:
+                    nodes_data = json.loads(row["nodes_json"] or "[]")
+                    for idx, n in enumerate(nodes_data):
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO workflow_nodes (
+                                run_id, step_order, node_id, name, actor, status, duration_ms,
+                                summary, checks_json, artifacts_json, payload_json, receipt_hash,
+                                error, started_at, finished_at, created_at, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                run_id,
+                                idx,
+                                n.get("node_id", f"P0{idx}"),
+                                n.get("name", ""),
+                                n.get("actor", ""),
+                                n.get("status", "PENDING"),
+                                n.get("duration_ms"),
+                                n.get("summary", ""),
+                                json.dumps(n.get("internal_checks", []), ensure_ascii=False),
+                                json.dumps(n.get("artifacts", []), ensure_ascii=False),
+                                json.dumps(n.get("payload", {}), ensure_ascii=False),
+                                n.get("receipt_hash"),
+                                n.get("error"),
+                                n.get("started_at"),
+                                n.get("finished_at"),
+                                created,
+                                updated,
+                            ),
+                        )
+                except Exception:
+                    pass
+                try:
+                    for sk in json.loads(row["admitted_sessions_json"] or "[]"):
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO run_sessions (
+                                run_id, session_key, admitted_chars, disposition, created_at, updated_at
+                            ) VALUES (?, ?, 0, 'admitted', ?, ?)
+                            """,
+                            (run_id, str(sk), created, updated),
+                        )
+                except Exception:
+                    pass
+                try:
+                    for w_idx, w in enumerate(json.loads(row["planned_writes_json"] or "[]")):
+                        wid = f"{run_id}:w{w_idx}"
+                        d_status = (
+                            "written"
+                            if row["status"] == "PASS" and w.get("approved", True)
+                            else "rejected"
+                            if row["status"] == "PARTIAL"
+                            else "pending"
+                        )
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO planned_writes (
+                                write_id, run_id, seq_no, target_kind, action, relative_path,
+                                title, summary, content_preview, payload_json, skill_route_json,
+                                requires_approval, approval_reason, decision_status, approved,
+                                version, created_at, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                            """,
+                            (
+                                wid,
+                                run_id,
+                                w_idx,
+                                w.get("target_kind", "knowledge_doc"),
+                                w.get("action", "create"),
+                                w.get("relative_path"),
+                                w.get("title", ""),
+                                w.get("summary", ""),
+                                w.get("content_preview", ""),
+                                json.dumps(w.get("rule_payload") or {}, ensure_ascii=False),
+                                json.dumps(w.get("skill_route") or {}, ensure_ascii=False),
+                                1 if w.get("requires_approval") else 0,
+                                w.get("approval_reason", ""),
+                                d_status,
+                                1 if w.get("approved", True) else 0,
+                                created,
+                                updated,
+                            ),
+                        )
+                except Exception:
+                    pass
+
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_migrations (version, name, applied_at) VALUES (2, 'v2_normalized_audit_and_decisions', ?)",
+            (now,),
+        )
+
+    def _migrate_knowledge_fts(self, conn: sqlite3.Connection) -> None:
+        """Rebuild the FTS table when its column contract changed (pre-2026-11-23 layouts)."""
+        columns = tuple(row["name"] for row in conn.execute("PRAGMA table_info(knowledge_fts)").fetchall())
+        if columns != KNOWLEDGE_FTS_COLUMNS:
+            conn.execute("DROP TABLE IF EXISTS knowledge_fts")
+            conn.execute(_KNOWLEDGE_FTS_SQL)
 
     # ---------------- Sessions ----------------
     def upsert_session(self, record: SessionRecord) -> SessionRecord:
@@ -556,29 +1025,42 @@ class FlywheelDB:
             new_count = (int(row["count"]) + 1) if row else 1
             conn.execute(
                 """
-                INSERT INTO retry_counters (counter_key, count, updated_at)
-                VALUES (?, ?, ?)
+                INSERT INTO retry_counters (counter_key, count, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(counter_key) DO UPDATE SET count = excluded.count, updated_at = excluded.updated_at
                 """,
-                (counter_key, new_count, now),
+                (counter_key, new_count, now, now),
             )
             return new_count
 
     # ---------------- Workflow Runs & Lock ----------------
-    def acquire_workflow_lock(self, run_id: str) -> bool:
+    def acquire_workflow_lock(self, run_id: str, ttl_seconds: int = 3600) -> bool:
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        expires = (now_dt + timedelta(seconds=ttl_seconds)).isoformat()
         with self.connect() as conn:
-            existing = conn.execute("SELECT run_id FROM workflow_lock WHERE lock_id = 1").fetchone()
+            existing = conn.execute(
+                "SELECT run_id, expires_at FROM workflow_lock WHERE lock_id = 1"
+            ).fetchone()
             if existing:
-                return False
+                if existing["expires_at"] and existing["expires_at"] < now:
+                    conn.execute("DELETE FROM workflow_lock WHERE lock_id = 1")
+                else:
+                    return False
             conn.execute(
-                "INSERT INTO workflow_lock (lock_id, run_id, acquired_at) VALUES (1, ?, ?)",
-                (run_id, utc_now_iso()),
+                """
+                INSERT INTO workflow_lock (lock_id, run_id, acquired_at, expires_at, created_at, updated_at)
+                VALUES (1, ?, ?, ?, ?, ?)
+                """,
+                (run_id, now, expires, now, now),
             )
             return True
 
     def get_workflow_lock(self) -> dict[str, Any] | None:
         with self.connect() as conn:
-            row = conn.execute("SELECT run_id, acquired_at FROM workflow_lock WHERE lock_id = 1").fetchone()
+            row = conn.execute(
+                "SELECT run_id, acquired_at, expires_at FROM workflow_lock WHERE lock_id = 1"
+            ).fetchone()
             return dict(row) if row else None
 
     def release_workflow_lock(self, run_id: str | None = None) -> bool:
@@ -590,15 +1072,42 @@ class FlywheelDB:
             return cur.rowcount > 0
 
     def save_workflow_run(self, run: WorkflowRunRecord) -> WorkflowRunRecord:
+        now = utc_now_iso()
+        bdate = run.batch_date or self._to_shanghai_date(run.started_at)
         with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT batch_seq, version, created_at FROM workflow_runs WHERE run_id = ?",
+                (run.run_id,),
+            ).fetchone()
+            if existing:
+                bseq = int(existing["batch_seq"] or 1)
+                ver = int(existing["version"] or 1) + 1
+                created_at = existing["created_at"] or run.started_at or now
+            else:
+                max_seq_row = conn.execute(
+                    "SELECT COALESCE(MAX(batch_seq), 0) AS m FROM workflow_runs WHERE batch_date = ?",
+                    (bdate,),
+                ).fetchone()
+                bseq = int(max_seq_row["m"]) + 1
+                ver = 1
+                created_at = run.created_at or run.started_at or now
+            run.batch_date = bdate
+            run.batch_seq = bseq
+            run.version = ver
+            run.created_at = created_at
+            run.updated_at = now
+
             conn.execute(
                 """
                 INSERT INTO workflow_runs (
-                    run_id, trigger_source, phase, runner_mode, status,
-                    admitted_sessions_json, nodes_json, planned_writes_json,
-                    digest_markdown, error, lock_released, started_at, finished_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    run_id, batch_date, batch_seq, trigger_source, phase, runner_mode,
+                    approval_mode, status, admitted_sessions_json, nodes_json, planned_writes_json,
+                    digest_markdown, error, lock_released, version, started_at, finished_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
+                    batch_date = excluded.batch_date,
+                    approval_mode = excluded.approval_mode,
                     status = excluded.status,
                     admitted_sessions_json = excluded.admitted_sessions_json,
                     nodes_json = excluded.nodes_json,
@@ -606,13 +1115,18 @@ class FlywheelDB:
                     digest_markdown = excluded.digest_markdown,
                     error = excluded.error,
                     lock_released = excluded.lock_released,
-                    finished_at = excluded.finished_at
+                    version = excluded.version,
+                    finished_at = excluded.finished_at,
+                    updated_at = excluded.updated_at
                 """,
                 (
                     run.run_id,
+                    bdate,
+                    bseq,
                     run.trigger,
                     run.phase,
                     run.runner_mode,
+                    run.approval_mode,
                     run.status.value,
                     json.dumps(run.admitted_sessions, ensure_ascii=False),
                     json.dumps([n.model_dump(mode="json") for n in run.nodes], ensure_ascii=False),
@@ -620,18 +1134,126 @@ class FlywheelDB:
                     run.digest_markdown,
                     run.error,
                     1 if run.lock_released else 0,
+                    ver,
                     run.started_at,
                     run.finished_at,
+                    created_at,
+                    now,
                 ),
             )
+
+            # Sync normalized child tables atomically inside the same transaction
+            for idx, node in enumerate(run.nodes):
+                conn.execute(
+                    """
+                    INSERT INTO workflow_nodes (
+                        run_id, step_order, node_id, name, actor, status, duration_ms,
+                        summary, checks_json, artifacts_json, payload_json, receipt_hash,
+                        error, started_at, finished_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(run_id, node_id) DO UPDATE SET
+                        status = excluded.status,
+                        duration_ms = excluded.duration_ms,
+                        summary = excluded.summary,
+                        checks_json = excluded.checks_json,
+                        artifacts_json = excluded.artifacts_json,
+                        payload_json = excluded.payload_json,
+                        receipt_hash = excluded.receipt_hash,
+                        error = excluded.error,
+                        started_at = excluded.started_at,
+                        finished_at = excluded.finished_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        run.run_id,
+                        idx,
+                        node.node_id,
+                        node.name,
+                        node.actor,
+                        node.status.value,
+                        node.duration_ms,
+                        node.summary,
+                        json.dumps(node.internal_checks, ensure_ascii=False),
+                        json.dumps(node.artifacts, ensure_ascii=False),
+                        json.dumps(node.payload, ensure_ascii=False),
+                        node.receipt_hash,
+                        node.error,
+                        node.started_at,
+                        node.finished_at,
+                        created_at,
+                        now,
+                    ),
+                )
+
+            for sk in run.admitted_sessions:
+                conn.execute(
+                    """
+                    INSERT INTO run_sessions (
+                        run_id, session_key, admitted_chars, disposition, created_at, updated_at
+                    ) VALUES (?, ?, 0, 'admitted', ?, ?)
+                    ON CONFLICT(run_id, session_key) DO UPDATE SET updated_at = excluded.updated_at
+                    """,
+                    (run.run_id, sk, created_at, now),
+                )
+
+            for w_idx, w in enumerate(run.planned_writes):
+                wid = f"{run.run_id}:w{w_idx}"
+                if run.status == RunStatus.PASS:
+                    d_status = "written" if w.approved else "rejected"
+                elif run.status == RunStatus.PARTIAL:
+                    d_status = "rejected"
+                elif run.status == RunStatus.FAILED:
+                    d_status = "failed"
+                elif run.status == RunStatus.AWAITING_APPROVAL:
+                    d_status = "pending"
+                else:
+                    d_status = "auto_approved" if not w.requires_approval else "pending"
+                conn.execute(
+                    """
+                    INSERT INTO planned_writes (
+                        write_id, run_id, seq_no, target_kind, action, relative_path,
+                        title, summary, content_preview, payload_json, skill_route_json,
+                        requires_approval, approval_reason, decision_status, approved,
+                        version, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    ON CONFLICT(write_id) DO UPDATE SET
+                        decision_status = excluded.decision_status,
+                        approved = excluded.approved,
+                        version = planned_writes.version + 1,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        wid,
+                        run.run_id,
+                        w_idx,
+                        w.target_kind,
+                        w.action,
+                        w.relative_path,
+                        w.title,
+                        w.summary,
+                        w.content_preview,
+                        json.dumps(w.rule_payload or {}, ensure_ascii=False),
+                        json.dumps(w.skill_route or {}, ensure_ascii=False),
+                        1 if w.requires_approval else 0,
+                        w.approval_reason,
+                        d_status,
+                        1 if w.approved else 0,
+                        created_at,
+                        now,
+                    ),
+                )
         return run
 
     def _row_to_run(self, row: sqlite3.Row) -> WorkflowRunRecord:
+        keys = set(row.keys())
         return WorkflowRunRecord(
             run_id=row["run_id"],
+            batch_date=row["batch_date"] if "batch_date" in keys and row["batch_date"] else self._to_shanghai_date(row["started_at"]),
+            batch_seq=int(row["batch_seq"]) if "batch_seq" in keys and row["batch_seq"] else 1,
             trigger=row["trigger_source"],
             phase=row["phase"],
             runner_mode=row["runner_mode"],
+            approval_mode=row["approval_mode"] if "approval_mode" in keys and row["approval_mode"] else "always",
             status=RunStatus(row["status"]),
             admitted_sessions=json.loads(row["admitted_sessions_json"]),
             nodes=[NodeExecution.model_validate(n) for n in json.loads(row["nodes_json"])],
@@ -639,8 +1261,11 @@ class FlywheelDB:
             digest_markdown=row["digest_markdown"],
             error=row["error"],
             lock_released=bool(row["lock_released"]),
+            version=int(row["version"]) if "version" in keys and row["version"] else 1,
             started_at=row["started_at"],
             finished_at=row["finished_at"],
+            created_at=row["created_at"] if "created_at" in keys and row["created_at"] else row["started_at"],
+            updated_at=row["updated_at"] if "updated_at" in keys and row["updated_at"] else (row["finished_at"] or row["started_at"]),
         )
 
     def get_workflow_run(self, run_id: str) -> WorkflowRunRecord | None:
@@ -662,17 +1287,243 @@ class FlywheelDB:
             return {r["policy_id"]: json.loads(r["content_json"]) for r in rows}
 
     def save_policy_override(self, policy_id: str, content: dict[str, Any]) -> None:
+        now = utc_now_iso()
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO policy_overrides (policy_id, content_json, updated_at)
-                VALUES (?, ?, ?)
+                INSERT INTO policy_overrides (policy_id, content_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(policy_id) DO UPDATE SET
                     content_json = excluded.content_json,
                     updated_at = excluded.updated_at
                 """,
-                (policy_id, json.dumps(content, ensure_ascii=False), utc_now_iso()),
+                (policy_id, json.dumps(content, ensure_ascii=False), now, now),
             )
+
+    # ---------------- v2 Audit Events, Decision Cards, Deliveries, Skill Assets, System Settings ----------------
+    def append_audit_event(
+        self,
+        *,
+        entity_type: str,
+        entity_id: str,
+        event_type: str,
+        actor: str = "system",
+        summary: str = "",
+        payload: dict[str, Any] | None = None,
+    ) -> int:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO audit_events (entity_type, entity_id, event_type, actor, summary, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entity_type,
+                    entity_id,
+                    event_type,
+                    actor,
+                    summary,
+                    json.dumps(payload or {}, ensure_ascii=False),
+                    now,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def list_audit_events(
+        self,
+        *,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            if entity_type and entity_id:
+                rows = conn.execute(
+                    "SELECT * FROM audit_events WHERE entity_type = ? AND entity_id = ? ORDER BY seq DESC LIMIT ?",
+                    (entity_type, entity_id, limit),
+                ).fetchall()
+            elif entity_type:
+                rows = conn.execute(
+                    "SELECT * FROM audit_events WHERE entity_type = ? ORDER BY seq DESC LIMIT ?",
+                    (entity_type, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM audit_events ORDER BY seq DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                d = dict(r)
+                d["payload"] = json.loads(d.pop("payload_json", "{}") or "{}")
+                out.append(d)
+            return out
+
+    def save_decision_card(
+        self,
+        *,
+        card_id: str,
+        run_id: str,
+        kind: str,
+        state: str,
+        title: str,
+        body_markdown: str,
+        options: list[str] | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now_iso()
+        closed_at = now if state == "closed" else None
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO decision_cards (
+                    card_id, run_id, kind, state, title, body_markdown, options_json,
+                    version, created_at, updated_at, closed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                ON CONFLICT(card_id) DO UPDATE SET
+                    state = excluded.state,
+                    title = excluded.title,
+                    body_markdown = excluded.body_markdown,
+                    options_json = excluded.options_json,
+                    version = decision_cards.version + 1,
+                    updated_at = excluded.updated_at,
+                    closed_at = COALESCE(excluded.closed_at, decision_cards.closed_at)
+                """,
+                (
+                    card_id,
+                    run_id,
+                    kind,
+                    state,
+                    title,
+                    body_markdown,
+                    json.dumps(options or [], ensure_ascii=False),
+                    now,
+                    now,
+                    closed_at,
+                ),
+            )
+            row = conn.execute("SELECT * FROM decision_cards WHERE card_id = ?", (card_id,)).fetchone()
+            return dict(row) if row else {}
+
+    def update_decision_card_state(
+        self,
+        run_id: str,
+        *,
+        state: str,
+        selected_option: str | None = None,
+    ) -> None:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE decision_cards
+                SET state = ?,
+                    selected_option = COALESCE(?, selected_option),
+                    decided_at = CASE WHEN ? IN ('decided', 'done', 'closed') AND decided_at IS NULL THEN ? ELSE decided_at END,
+                    closed_at = CASE WHEN ? IN ('done', 'closed') THEN ? ELSE closed_at END,
+                    version = version + 1,
+                    updated_at = ?
+                WHERE run_id = ? AND kind = 'ask'
+                """,
+                (state, selected_option, state, now, state, now, now, run_id),
+            )
+
+    def record_card_delivery(
+        self,
+        *,
+        delivery_id: str,
+        card_id: str,
+        channel: str,
+        status: str,
+        external_ref: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO card_deliveries (
+                    delivery_id, card_id, channel, status, external_ref, tries, last_error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+                ON CONFLICT(card_id, channel) DO UPDATE SET
+                    status = excluded.status,
+                    external_ref = COALESCE(excluded.external_ref, card_deliveries.external_ref),
+                    tries = card_deliveries.tries + 1,
+                    last_error = excluded.last_error,
+                    updated_at = excluded.updated_at
+                """,
+                (delivery_id, card_id, channel, status, external_ref, last_error, now, now),
+            )
+
+    def upsert_skill_asset(
+        self,
+        *,
+        skill_name: str,
+        source_dir: str,
+        description: str,
+        origin: str = "manual",
+        sha256: str = "",
+        last_run_id: str | None = None,
+        backup_path: str | None = None,
+    ) -> None:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO skill_assets (
+                    skill_name, source_dir, description, origin, sha256, version,
+                    last_run_id, backup_path, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                ON CONFLICT(skill_name) DO UPDATE SET
+                    source_dir = excluded.source_dir,
+                    description = excluded.description,
+                    origin = CASE WHEN excluded.origin != 'manual' THEN excluded.origin ELSE skill_assets.origin END,
+                    sha256 = CASE WHEN excluded.sha256 != '' THEN excluded.sha256 ELSE skill_assets.sha256 END,
+                    version = CASE WHEN excluded.sha256 != '' AND excluded.sha256 != skill_assets.sha256 THEN skill_assets.version + 1 ELSE skill_assets.version END,
+                    last_run_id = COALESCE(excluded.last_run_id, skill_assets.last_run_id),
+                    backup_path = COALESCE(excluded.backup_path, skill_assets.backup_path),
+                    updated_at = excluded.updated_at
+                """,
+                (skill_name, source_dir, description, origin, sha256, last_run_id, backup_path, now, now),
+            )
+
+    def list_skill_assets(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM skill_assets ORDER BY updated_at DESC, skill_name ASC").fetchall()
+            return [dict(r) for r in rows]
+
+    def set_system_setting(
+        self,
+        key: str,
+        category: str,
+        value: Any,
+        *,
+        updated_by: str = "user",
+    ) -> None:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO system_settings (key, category, value_json, updated_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    category = excluded.category,
+                    value_json = excluded.value_json,
+                    updated_by = excluded.updated_by,
+                    updated_at = excluded.updated_at
+                """,
+                (key, category, json.dumps(value, ensure_ascii=False), updated_by, now, now),
+            )
+
+    def list_system_settings(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM system_settings ORDER BY category, key").fetchall()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                d = dict(r)
+                d["value"] = json.loads(d.pop("value_json", "null"))
+                out.append(d)
+            return out
 
     def delete_policy_override(self, policy_id: str) -> None:
         with self.connect() as conn:
@@ -683,28 +1534,188 @@ class FlywheelDB:
         with self.connect() as conn:
             conn.execute("DELETE FROM knowledge_fts")
             conn.executemany(
-                "INSERT INTO knowledge_fts (doc_path, title, body, tags) VALUES (?, ?, ?, ?)",
-                [(d["doc_path"], d["title"], d["body"], d.get("tags", "")) for d in docs],
+                """
+                INSERT INTO knowledge_fts (
+                    doc_path, title_index, description_index, body, body_index,
+                    tags_index, project_id, page_type, status,
+                    title_raw, description_raw, tags_raw
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        d["doc_path"],
+                        d.get("title_index", d.get("title", "")),
+                        d.get("description_index", d.get("description", "")),
+                        d.get("body", ""),
+                        d.get("body_index", d.get("search_text", "")),
+                        d.get("tags_index", d.get("tags", "")),
+                        d.get("project_id", ""),
+                        d.get("page_type", ""),
+                        d.get("status", ""),
+                        d.get("title_raw", d.get("title", "")),
+                        d.get("description_raw", d.get("description", "")),
+                        d.get("tags_raw", d.get("tags", "")),
+                    )
+                    for d in docs
+                ],
             )
         return len(docs)
 
     def search_knowledge_fts(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        tokens = [t for t in "".join(ch if ch.isalnum() else " " for ch in query).split() if len(t) >= 2]
-        if not tokens:
+        """Chinese-capable search over formal Wiki cards.
+
+        FTS5's unicode61 tokenizer treats a whole CJK run as one token, so the
+        title/description/tags/body index columns store space-separated CJK
+        bigrams while the ``*_raw`` columns keep the original text for display.
+        Metadata carries a higher BM25 weight than body text.
+        """
+        term_plan = _knowledge_query_terms(query)
+        if not term_plan.match_terms and not term_plan.like_terms:
             return []
-        fts_query = " OR ".join(f'"{t}"' for t in tokens[:8])
+
+        match_terms = term_plan.match_terms[:16]
+        fts_query = " OR ".join('"' + term.replace('"', "") + '"' for term in match_terms)
+        rows: list[sqlite3.Row] = []
         with self.connect() as conn:
-            try:
-                rows = conn.execute(
+            if match_terms:
+                try:
+                    rows = conn.execute(
+                        """
+                        SELECT doc_path, title_raw AS title, description_raw AS description,
+                               body, tags_raw AS tags, project_id, page_type, status,
+                               bm25(knowledge_fts,
+                                    0.0, 8.0, 5.0, 0.0, 1.0, 4.0,
+                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0) AS score
+                        FROM knowledge_fts
+                        WHERE knowledge_fts MATCH ?
+                        ORDER BY score
+                        LIMIT ?
+                        """,
+                        (fts_query, max(limit * 6, 24)),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    rows = []
+            if len(rows) < limit and term_plan.like_terms:
+                rows = list(rows) + self._search_knowledge_like(conn, term_plan.like_terms, limit * 6)
+
+        required_overlap = 2 if len(term_plan.overlap_terms) >= 4 else 1
+        scored: list[tuple[int, float, dict[str, Any]]] = []
+        for row in rows:
+            item = dict(row)
+            haystack = "\n".join(
+                str(item.get(key) or "") for key in ("title", "description", "body")
+            ).casefold()
+            overlap = sum(1 for term in term_plan.overlap_terms if term in haystack)
+            if overlap < required_overlap:
+                continue
+            scored.append((overlap, float(item.pop("score", 0.0) or 0.0), item))
+        scored.sort(key=lambda entry: (entry[0], -entry[1]), reverse=True)
+
+        results: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for _, __, item in scored:
+            path = str(item.get("doc_path", ""))
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            body = str(item.pop("body", "") or "")
+            item["snippet"] = _knowledge_snippet(body, term_plan.overlap_terms)
+            results.append(item)
+            if len(results) >= limit:
+                break
+        return results
+
+    def _search_knowledge_like(
+        self, conn: sqlite3.Connection, terms: list[str], limit: int
+    ) -> list[sqlite3.Row]:
+        clauses = []
+        params: list[Any] = []
+        for term in terms[:4]:
+            clauses.append("(title_raw LIKE ? OR description_raw LIKE ? OR body LIKE ?)")
+            pattern = f"%{term}%"
+            params.extend([pattern, pattern, pattern])
+        if not clauses:
+            return []
+        try:
+            return conn.execute(
+                f"""
+                SELECT doc_path, title_raw AS title, description_raw AS description,
+                       body, tags_raw AS tags, project_id, page_type, status, 0.0 AS score
+                FROM knowledge_fts
+                WHERE {' OR '.join(clauses)}
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+
+    # ---------------- Knowledge card metrics (D6) ----------------
+    def record_knowledge_surfaces(self, doc_paths: list[str], at: str) -> None:
+        paths = [p for p in dict.fromkeys(doc_paths) if p]
+        if not paths:
+            return
+        with self.connect() as conn:
+            for path in paths:
+                conn.execute(
                     """
-                    SELECT doc_path, title, snippet(knowledge_fts, 2, '[', ']', '...', 24) AS snippet
-                    FROM knowledge_fts
-                    WHERE knowledge_fts MATCH ?
-                    ORDER BY rank
-                    LIMIT ?
+                    INSERT INTO knowledge_card_metrics (doc_path, surface_count, last_surfaced_at)
+                    VALUES (?, 1, ?)
+                    ON CONFLICT(doc_path) DO UPDATE SET
+                        surface_count = knowledge_card_metrics.surface_count + 1,
+                        last_surfaced_at = excluded.last_surfaced_at
                     """,
-                    (fts_query, limit),
-                ).fetchall()
-                return [dict(r) for r in rows]
-            except sqlite3.OperationalError:
-                return []
+                    (path, at),
+                )
+
+    def record_knowledge_usage(
+        self, doc_paths: list[str], at: str, *, cited_paths: list[str] | None = None
+    ) -> None:
+        paths = [p for p in dict.fromkeys(doc_paths) if p]
+        if not paths:
+            return
+        cited = {p for p in (cited_paths or []) if p}
+        with self.connect() as conn:
+            for path in paths:
+                conn.execute(
+                    """
+                    INSERT INTO knowledge_card_metrics (doc_path, helped_count, cited_count, last_helped_at)
+                    VALUES (?, 1, ?, ?)
+                    ON CONFLICT(doc_path) DO UPDATE SET
+                        helped_count = knowledge_card_metrics.helped_count + 1,
+                        cited_count = knowledge_card_metrics.cited_count + excluded.cited_count,
+                        last_helped_at = excluded.last_helped_at
+                    """,
+                    (path, 1 if path in cited else 0, at),
+                )
+
+    def get_preflight_knowledge_pointers(self, receipt_id: str) -> list[str]:
+        if not receipt_id:
+            return []
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM preflight_receipts WHERE receipt_id = ?",
+                (receipt_id,),
+            ).fetchone()
+        if not row:
+            return []
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            return []
+        pointers = payload.get("knowledge_pointers") or []
+        return [str(p) for p in pointers]
+
+    def get_knowledge_card_metrics(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT doc_path, surface_count, cited_count, helped_count,
+                       last_surfaced_at, last_helped_at
+                FROM knowledge_card_metrics
+                ORDER BY helped_count DESC, surface_count DESC, doc_path
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
