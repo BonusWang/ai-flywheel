@@ -9,6 +9,7 @@ from ai_flywheel.adapters.sessions import SessionAdapter
 from ai_flywheel.adapters.skills import SkillWriterAdapter
 from ai_flywheel.config import FlywheelConfig, load_config, save_config
 from ai_flywheel.core.activation import ActivationEngine
+from ai_flywheel.core.core_card import rebuild_core_card
 from ai_flywheel.core.hooks import ThinHookProcessor
 from ai_flywheel.core.orchestrator import EventBroker, WorkflowOrchestrator
 from ai_flywheel.core.policies import PolicyEngine
@@ -51,7 +52,7 @@ class FlywheelRuntime:
         self.hooks = ThinHookProcessor(self)
         self.publication = PublicationLayer(cfg, self.db, self.policies, self.activation)
         self.mcp = build_mcp_server(self)
-        # Ensure initial FTS index and skill assets inventory are synced (skip in fast stdio mode)
+        # Ensure initial FTS index, skill assets inventory, and derived core card are synced (skip in fast stdio mode)
         if not skip_fts_sync:
             self.knowledge.sync_fts_index()
             for sk in self.activation.probe_local_skills():
@@ -61,6 +62,10 @@ class FlywheelRuntime:
                     description=sk.get("description", ""),
                     origin="manual",
                 )
+            self.refresh_core_card()
+
+    def refresh_core_card(self) -> dict[str, Any]:
+        return rebuild_core_card(self.cfg, self.db)
 
     @classmethod
     def create(

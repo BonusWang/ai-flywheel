@@ -720,6 +720,38 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
                                   </div>
                                 </div>
                               )}
+                              {activeNode.node_id === 'P05_SETTLE' &&
+                                activeNode.payload &&
+                                typeof activeNode.payload === 'object' &&
+                                (activeNode.payload as any).dream && (
+                                  <div className="mt-2 p-3 rounded-[var(--radius-control)] bg-bg-sunk/70 border border-line-soft space-y-1.5">
+                                    <div className="text-[12px] font-semibold text-ink">
+                                      周五蒸馏与减法摘要（{(activeNode.payload as any).dream.period_key}）
+                                    </div>
+                                    <div className="flex flex-wrap gap-2 text-[11.5px] text-ink-3 num">
+                                      <span>
+                                        自动休眠规则：{((activeNode.payload as any).dream.auto_dormant_rules || []).length} 条
+                                      </span>
+                                      <span>·</span>
+                                      <span>
+                                        过期需复核经验卡：{((activeNode.payload as any).dream.expired_cards || []).length} 篇
+                                      </span>
+                                      <span>·</span>
+                                      <span>
+                                        待收敛分歧：{(activeNode.payload as any).dream.open_dissents_count ?? 0} 条
+                                      </span>
+                                    </div>
+                                    {((activeNode.payload as any).dream.proposals || []).length > 0 && (
+                                      <ul className="list-disc pl-4 space-y-0.5 text-[12px] text-ink-2">
+                                        {((activeNode.payload as any).dream.proposals as string[]).map(
+                                          (p, pIdx) => (
+                                            <li key={pIdx}>{p}</li>
+                                          )
+                                        )}
+                                      </ul>
+                                    )}
+                                  </div>
+                                )}
                             </>
                           ) : null}
                         </div>

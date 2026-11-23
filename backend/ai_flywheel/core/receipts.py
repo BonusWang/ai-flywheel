@@ -4,6 +4,7 @@ import uuid
 
 from ai_flywheel.core.activation import ActivationEngine
 from ai_flywheel.core.policies import PolicyEngine
+from ai_flywheel.core.privacy import shanghai_today_ymd
 from ai_flywheel.models import (
     CheckResult,
     OutcomeRecord,
@@ -84,6 +85,7 @@ class ReceiptService:
         session_key = req.session_key or (f"{req.client}:{req.session_id}" if req.session_id else f"{req.client}:adhoc")
         outcome_id = f"out-{uuid.uuid4().hex[:12]}"
         used_knowledge_paths = [p for p in dict.fromkeys(req.used_knowledge_paths) if p]
+        used_skills = [s.strip() for s in dict.fromkeys(req.used_skills) if s and s.strip()]
         payload = {
             "outcome_id": outcome_id,
             "session_key": session_key,
@@ -96,6 +98,7 @@ class ReceiptService:
             "summary": redact_text(req.summary),
             "checks": [c.model_dump(mode="json") for c in req.checks],
             "applied_rule_ids": req.applied_rule_ids,
+            "used_skills": used_skills,
             "artifacts": req.artifacts,
             "used_knowledge_paths": used_knowledge_paths,
             "created_at": utc_now_iso(),
@@ -113,6 +116,7 @@ class ReceiptService:
             summary=redact_text(req.summary),
             checks=req.checks,
             applied_rule_ids=req.applied_rule_ids,
+            used_skills=used_skills,
             artifacts=req.artifacts,
             used_knowledge_paths=used_knowledge_paths,
             created_at=payload["created_at"],
@@ -120,6 +124,14 @@ class ReceiptService:
         effects = self.activation.revalidate_from_outcome(record)
         record.revalidation_effects = effects
         self.db.save_outcome(record)
+
+        # v3: Attribute Skill invocation & pass/fail outcomes (anti-Skill-theater)
+        if used_skills:
+            self.db.record_skill_usage(
+                used_skills,
+                passed=(req.status == OutcomeStatus.SUCCESS),
+                at=payload["created_at"],
+            )
 
         # D6 (2026-11-23): helped_count for cards the agent re-read and used.
         # cited_count only when the card also appeared in this task's preflight
@@ -134,10 +146,28 @@ class ReceiptService:
                 payload["created_at"],
                 cited_paths=cited_paths,
             )
+            # v3: Auto-renew experience card freshness when verified by at least one real PASS check
+            has_real_pass = any(
+                c.kind == VerificationKind.REAL and c.result == CheckResult.PASS
+                for c in req.checks
+            )
+            if has_real_pass:
+                self.db.refresh_knowledge_freshness(used_knowledge_paths, shanghai_today_ymd())
 
-        # Any failed rule check also enqueues a retro item for root-cause review
+        # Any failed rule check also enqueues a retro item AND records traceable counter-evidence dissent
         for chk in req.checks:
             if chk.result == CheckResult.FAIL and chk.rule_id:
+                claim_text = redact_text(
+                    chk.note or req.summary or f"验证项 {chk.name} 未通过"
+                )
+                self.db.add_dissent_record(
+                    target_type="rule",
+                    target_id=chk.rule_id,
+                    counter_claim=claim_text,
+                    condition_scope=f"check={chk.name}",
+                    evidence_pointer=outcome_id,
+                    session_key=session_key,
+                )
                 self.report_signal(
                     ReportSignalRequest(
                         session_key=session_key,

@@ -29,15 +29,70 @@ export interface RuleRecord {
   forbidden_routes: string[]
   applicable_skills: string[]
   source_pointers: string[]
-  status: 'unverified_active' | 'verified_active' | 'needs_revision' | 'retired'
+  status: 'unverified_active' | 'verified_active' | 'needs_revision' | 'dormant' | 'retired'
   version: number
   origin_session_key: string | null
   hit_count: number
   natural_pass_count: number
   recurrence_count: number
   revalidation_history: Array<Record<string, unknown>>
+  last_hit_at?: string | null
+  dormant_at?: string | null
+  root_cause_key?: string | null
   created_at: string
   updated_at: string
+}
+
+export interface MistakeObservation {
+  obs_id: string
+  root_cause_key: string
+  severity_grade: 'red_silent' | 'yellow_caught' | 'green_minor'
+  title: string
+  phenomenon: string
+  truth: string
+  thinking_root_cause: string
+  caught_by: 'user' | 'tool' | 'self'
+  occurrence_count: number
+  session_keys: string[]
+  promoted_rule_id: string | null
+  status: 'observing' | 'promoted' | 'archived'
+  created_at: string
+  updated_at: string
+}
+
+export interface DissentRecord {
+  dissent_id: string
+  target_type: 'rule' | 'knowledge_doc' | 'skill'
+  target_id: string
+  counter_claim: string
+  condition_scope: string
+  evidence_pointer: string
+  session_key: string
+  status: 'open' | 'merged' | 'dismissed'
+  created_at: string
+  updated_at: string
+}
+
+export interface GrowthMetricsLive {
+  red_count: number
+  yellow_count: number
+  green_count: number
+  total_mistakes: number
+  observing_pool_count: number
+  repeat_mistake_rate: number
+  self_catch_rate: number
+  active_rule_count: number
+  dormant_rule_count: number
+  open_dissent_count: number
+  expired_card_count: number
+  stale_skill_count: number
+  sample_sufficient: boolean
+}
+
+export interface GrowthMetricsPayload {
+  live: GrowthMetricsLive
+  latest_snapshot: Record<string, any> | null
+  history: Array<Record<string, any>>
 }
 
 export interface RetroItem {

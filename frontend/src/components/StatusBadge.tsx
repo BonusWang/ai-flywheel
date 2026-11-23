@@ -19,10 +19,20 @@ const STATUS_STYLES: Record<string, string> = {
   FAILED: 'bg-hot-soft text-hot border-hot/30',
   needs_revision: 'bg-hot-soft text-hot border-hot/30',
   high: 'bg-hot-soft text-hot border-hot/30',
+  red_silent: 'bg-hot-soft text-hot border-hot/35',
+
+  yellow_caught: 'bg-amber-soft text-amber-ink border-amber/35',
+  observing: 'bg-amber-soft text-amber-ink border-amber/30',
+  needs_recheck: 'bg-amber-soft text-amber-ink border-amber/35',
+
+  green_minor: 'bg-ok-soft text-ok-ink border-ok/25',
+  promoted: 'bg-ok-soft text-ok-ink border-ok/25',
 
   PENDING: 'bg-bg-sunk text-ink-4 border-line',
   SKIPPED: 'bg-bg-sunk text-ink-4 border-line',
+  dormant: 'bg-bg-sunk text-ink-3 border-line-strong',
   retired: 'bg-bg-sunk text-ink-4 border-line',
+  archived: 'bg-bg-sunk text-ink-4 border-line',
   dismissed: 'bg-bg-sunk text-ink-4 border-line',
 }
 
@@ -30,7 +40,15 @@ const LABELS: Record<string, string> = {
   unverified_active: '试运行',
   verified_active: '已生效',
   needs_revision: '需修改',
+  dormant: '已休眠',
   retired: '已停用',
+  red_silent: '🔴 沉默错误',
+  yellow_caught: '🟡 自查拦截',
+  green_minor: '🟢 轻微',
+  observing: '观察中',
+  promoted: '已升级规则',
+  archived: '已归档',
+  needs_recheck: '待复核',
   AWAITING_APPROVAL: '待审批',
   PASS: '已通过',
   FAILED: '已失败',

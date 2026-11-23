@@ -54,6 +54,18 @@ class RetroStatusBody(BaseModel):
     status: RetroStatus
 
 
+class DissentCreateBody(BaseModel):
+    target_type: str = "rule"
+    target_id: str
+    counter_claim: str
+    condition_scope: str = ""
+    evidence_pointer: str = ""
+
+
+class DissentStatusBody(BaseModel):
+    status: str
+
+
 def create_app(
     runtime: FlywheelRuntime | None = None,
     *,
@@ -250,14 +262,20 @@ def create_app(
         rec = rt.register_session(req)
         return {"session": rec.model_dump(mode="json")}
 
-    # ---- Rules & Retro Queue ----
+    # ---- Rules, Mistake Observation Pool, Dissents & Growth Ledger ----
     @app.get("/api/site/rules")
     def site_list_rules(status: str | None = None) -> dict[str, Any]:
-        return {"rules": [r.model_dump(mode="json") for r in rt.db.list_rules(status=status)]}
+        rules = rt.db.list_rules(status=status)
+        dissents_map = rt.db.get_open_dissents_by_targets([r.rule_id for r in rules])
+        return {
+            "rules": [r.model_dump(mode="json") for r in rules],
+            "dissents_by_rule": dissents_map,
+        }
 
     @app.post("/api/site/rules")
     def site_create_rule(req: CreateRuleRequest) -> dict[str, Any]:
         rule = rt.activation.register_rule(req)
+        rt.refresh_core_card()
         return {"rule": rule.model_dump(mode="json")}
 
     @app.post("/api/site/rules/{rule_id}/transition")
@@ -265,7 +283,98 @@ def create_app(
         rule = rt.activation.transition_rule_status(rule_id, body.status, note=body.note)
         if not rule:
             raise HTTPException(status_code=404, detail="Rule not found")
+        rt.refresh_core_card()
         return {"rule": rule.model_dump(mode="json")}
+
+    @app.get("/api/site/observations")
+    def site_list_observations(
+        status: str | None = None,
+        severity_grade: str | None = None,
+    ) -> dict[str, Any]:
+        items = rt.db.list_mistake_observations(status=status, severity_grade=severity_grade, limit=120)
+        return {"observations": items}
+
+    @app.post("/api/site/observations/{obs_id}/promote")
+    def site_promote_observation(obs_id: str) -> dict[str, Any]:
+        obs = rt.db.get_mistake_observation(obs_id)
+        if not obs:
+            raise HTTPException(status_code=404, detail="Observation not found")
+        import re as _re
+
+        tokens = _re.findall(r"[a-zA-Z0-9_-]{3,}|[\u4e00-\u9fff]{2,6}", obs["title"])
+        triggers = list(dict.fromkeys(tokens))[:5] or ["review"]
+        sess_keys = obs.get("session_keys") or []
+        req = CreateRuleRequest(
+            title=f"避坑规则：{obs['title'][:36]}",
+            domain="engineering",
+            projects=["generic"],
+            triggers=triggers,
+            checklist=[
+                obs.get("truth") or "执行前核对前置条件并真实验证",
+                "保留真实运行证据并提交结构化回执",
+            ],
+            forbidden_routes=[obs.get("thinking_root_cause") or "跳过前置核查直接盲改"],
+            source_pointers=sess_keys[:3],
+            origin_session_key=sess_keys[0] if sess_keys else None,
+        )
+        rule = rt.activation.register_rule(req, root_cause_key=obs["root_cause_key"])
+        updated = rt.db.update_mistake_observation_status(obs_id, "promoted", promoted_rule_id=rule.rule_id)
+        rt.db.append_audit_event(
+            entity_type="mistake_observation",
+            entity_id=obs_id,
+            event_type="manual_promoted",
+            actor="user",
+            summary=f"手动将错题「{obs['title']}」升级为试运行规则 {rule.rule_id}",
+            payload={"rule_id": rule.rule_id},
+        )
+        rt.refresh_core_card()
+        return {"observation": updated, "rule": rule.model_dump(mode="json")}
+
+    @app.post("/api/site/observations/{obs_id}/archive")
+    def site_archive_observation(obs_id: str) -> dict[str, Any]:
+        updated = rt.db.update_mistake_observation_status(obs_id, "archived")
+        if not updated:
+            raise HTTPException(status_code=404, detail="Observation not found")
+        rt.refresh_core_card()
+        return {"observation": updated}
+
+    @app.get("/api/site/dissents")
+    def site_list_dissents(target_id: str | None = None, status: str | None = None) -> dict[str, Any]:
+        return {"dissents": rt.db.list_dissent_records(target_id=target_id, status=status, limit=120)}
+
+    @app.post("/api/site/dissents")
+    def site_create_dissent(body: DissentCreateBody) -> dict[str, Any]:
+        if not body.counter_claim.strip():
+            raise HTTPException(status_code=422, detail="counter_claim is required")
+        rec = rt.db.add_dissent_record(
+            target_type=body.target_type,
+            target_id=body.target_id,
+            counter_claim=body.counter_claim,
+            condition_scope=body.condition_scope,
+            evidence_pointer=body.evidence_pointer or "manual-portal",
+        )
+        rt.refresh_core_card()
+        return {"dissent": rec}
+
+    @app.post("/api/site/dissents/{dissent_id}/status")
+    def site_update_dissent(dissent_id: str, body: DissentStatusBody) -> dict[str, Any]:
+        updated = rt.db.update_dissent_status(dissent_id, body.status)
+        if not updated:
+            raise HTTPException(status_code=404, detail="Dissent not found or invalid status")
+        rt.refresh_core_card()
+        return {"dissent": updated}
+
+    @app.get("/api/site/growth-metrics")
+    def site_growth_metrics() -> dict[str, Any]:
+        return {
+            "live": rt.db.compute_live_growth_metrics(),
+            "latest_snapshot": rt.db.get_latest_metrics_snapshot(),
+            "history": rt.db.list_metrics_snapshots(limit=12),
+        }
+
+    @app.get("/api/site/core-card")
+    def site_core_card() -> dict[str, Any]:
+        return rt.refresh_core_card()
 
     @app.get("/api/site/retro")
     def site_list_retro(status: str | None = None) -> dict[str, Any]:

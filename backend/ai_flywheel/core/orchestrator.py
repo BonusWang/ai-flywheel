@@ -14,6 +14,8 @@ from ai_flywheel.adapters.sessions import SessionAdapter
 from ai_flywheel.adapters.skills import SkillWriterAdapter
 from ai_flywheel.config import FlywheelConfig
 from ai_flywheel.core.activation import ActivationEngine
+from ai_flywheel.core.core_card import rebuild_core_card
+from ai_flywheel.core.dream import run_dream_consolidation
 from ai_flywheel.core.policies import PolicyEngine
 from ai_flywheel.models import (
     CreateRuleRequest,
@@ -315,6 +317,23 @@ class WorkflowOrchestrator:
                 raise RuntimeError("Simulated P00 failure")
             policies = self.policies.list_policies()
             scan_report = self.sessions.reconcile_scan_sources()
+            open_retro_keys = {
+                r.session_key for r in self.db.list_retro_items(status=RetroStatus.OPEN.value, limit=200)
+            }
+            triage_report = (
+                self.sessions.sweep_pending_triage(open_retro_keys)
+                if not session_keys
+                else {"checked": 0, "admitted": 0, "skipped": 0, "reasons": {}}
+            )
+            if triage_report["skipped"] > 0:
+                self.db.append_audit_event(
+                    entity_type="workflow_run",
+                    entity_id=run.run_id,
+                    event_type="triage_skipped",
+                    actor="triage_gate",
+                    summary=f"规则初筛自动跳过 {triage_report['skipped']} 条临时/碎片会话",
+                    payload=triage_report,
+                )
             pending = self.db.list_sessions(status=SessionStatus.PENDING.value, limit=50)
             if session_keys:
                 selected_sessions = [s for s in self.db.list_sessions(limit=200) if s.session_key in set(session_keys)]
@@ -327,14 +346,19 @@ class WorkflowOrchestrator:
                 t0,
                 summary=(
                     f"策略核验通过（{len(policies)} 项），扫盘新登记 {scan_report['newly_registered']} 条，"
-                    f"待审查会话 {len(selected_sessions)} 条"
+                    f"初筛跳过 {triage_report['skipped']} 条临时/噪音会话，待审查 {len(selected_sessions)} 条"
                 ),
                 internal_checks=[
                     {"name": "飞轮内置策略完整性校验", "status": "PASS"},
                     {"name": "会话目录扫盘对账", "status": "PASS", "detail": scan_report},
+                    {"name": "规则初筛（过滤子代理/空会话/低信号闲聊）", "status": "PASS", "detail": triage_report},
                     {"name": "P0/P1/P2 优先级排序", "status": "PASS"},
                 ],
-                payload={"scan_report": scan_report, "candidate_count": len(selected_sessions)},
+                payload={
+                    "scan_report": scan_report,
+                    "triage_report": triage_report,
+                    "candidate_count": len(selected_sessions),
+                },
             )
 
             # ---------------- P01 BEGIN ----------------
@@ -380,6 +404,55 @@ class WorkflowOrchestrator:
                 existing_skills=existing_skills,
                 phase=resolved_phase,
             )
+
+            # v3: Persist extracted mistakes into Mistake Observation Pool & evaluate two-track promotion
+            persisted_mistakes: list[dict[str, Any]] = []
+            eligible_promotions: list[dict[str, Any]] = []
+            seen_promo_keys: set[str] = set()
+            for raw_m in review_findings.get("mistakes") or []:
+                if not isinstance(raw_m, dict) or not raw_m.get("root_cause_key"):
+                    continue
+                obs, _created = self.db.upsert_mistake_observation(
+                    root_cause_key=str(raw_m["root_cause_key"]),
+                    title=str(raw_m.get("title") or raw_m["root_cause_key"]),
+                    severity_grade=str(raw_m.get("severity_grade") or "yellow_caught"),
+                    phenomenon=str(raw_m.get("phenomenon") or ""),
+                    truth=str(raw_m.get("truth") or ""),
+                    thinking_root_cause=str(raw_m.get("thinking_root_cause") or ""),
+                    caught_by=str(raw_m.get("caught_by") or "self"),
+                    session_key=str(raw_m.get("session_key") or ""),
+                )
+                persisted_mistakes.append(obs)
+                if (
+                    obs["status"] == "observing"
+                    and (
+                        obs["severity_grade"] == "red_silent"
+                        or (obs["severity_grade"] == "yellow_caught" and int(obs["occurrence_count"]) >= 3)
+                    )
+                    and obs["root_cause_key"] not in seen_promo_keys
+                ):
+                    seen_promo_keys.add(obs["root_cause_key"])
+                    eligible_promotions.append(obs)
+
+            # v3: Persist extracted dissents / counter-evidence without overwriting existing rules
+            persisted_dissents: list[dict[str, Any]] = []
+            for raw_d in review_findings.get("dissents") or []:
+                if not isinstance(raw_d, dict) or not raw_d.get("target_id") or not raw_d.get("counter_claim"):
+                    continue
+                d_rec = self.db.add_dissent_record(
+                    target_type=str(raw_d.get("target_type") or "rule"),
+                    target_id=str(raw_d["target_id"]),
+                    counter_claim=str(raw_d["counter_claim"]),
+                    condition_scope=str(raw_d.get("condition_scope") or ""),
+                    evidence_pointer=str(raw_d.get("evidence_pointer") or ""),
+                    session_key=str(raw_d.get("session_key") or ""),
+                )
+                persisted_dissents.append(d_rec)
+
+            review_findings["eligible_promotions"] = eligible_promotions
+            review_findings["persisted_mistake_count"] = len(persisted_mistakes)
+            review_findings["persisted_dissent_count"] = len(persisted_dissents)
+
             wf_candidates = len(review_findings.get("repeated_workflows", []))
             self._finish_node(
                 run,
@@ -387,10 +460,20 @@ class WorkflowOrchestrator:
                 t0,
                 summary=(
                     f"完成 {review_findings.get('sessions_reviewed', 0)} 段对话回顾"
-                    f"（发现 {wf_candidates} 处可复用流程候选，关联 {len(open_retros)} 条问题线索）"
+                    f"（入池错题 {len(persisted_mistakes)} 条、可晋升 {len(eligible_promotions)} 条、"
+                    f"分歧 {len(persisted_dissents)} 条、流程候选 {wf_candidates} 处）"
                 ),
                 internal_checks=[
                     {"name": "对话事实回顾", "status": "PASS"},
+                    {
+                        "name": "错题观察池双轨准入与分歧保留",
+                        "status": "PASS",
+                        "detail": {
+                            "mistakes": len(persisted_mistakes),
+                            "eligible_promotions": len(eligible_promotions),
+                            "dissents": len(persisted_dissents),
+                        },
+                    },
                     {"name": "重复流程与 Skill 线索扫描", "status": "PASS", "detail": {"candidates": wf_candidates}},
                     {"name": "问题线索关联", "status": "PASS", "detail": {"open_retros": len(open_retros)}},
                 ],
@@ -620,8 +703,14 @@ class WorkflowOrchestrator:
                     write_receipts.append(res)
                 elif item.target_kind == "flywheel_rule":
                     normalized_payload = normalize_rule_payload(item)
+                    obs_id = normalized_payload.pop("obs_id", None)
+                    root_cause_key = normalized_payload.pop("root_cause_key", None)
                     req = CreateRuleRequest.model_validate(normalized_payload)
-                    rule = self.activation.register_rule(req)
+                    rule = self.activation.register_rule(req, root_cause_key=root_cause_key)
+                    if obs_id:
+                        self.db.update_mistake_observation_status(
+                            str(obs_id), "promoted", promoted_rule_id=rule.rule_id
+                        )
                     created_rules.append(rule.rule_id)
                     write_receipts.append({"rule_id": rule.rule_id, "title": rule.title, "status": rule.status.value})
                 elif item.target_kind == "skill_improvement":
@@ -668,19 +757,47 @@ class WorkflowOrchestrator:
             t0 = self._begin_node(run, "P05_SETTLE")
             if simulate_fail_node == "P05_SETTLE":
                 raise RuntimeError("Simulated P05 failure")
+            p02_node = self._get_node(run, "P02_REVIEW")
+            p02_findings = (p02_node.payload or {}).get("findings", []) if isinstance(p02_node.payload, dict) else []
+            not_worthy_keys = {
+                str(f.get("session_key"))
+                for f in p02_findings
+                if isinstance(f, dict) and f.get("worthy") is False and f.get("session_key")
+            }
             for sk in run.admitted_sessions:
-                self.db.update_session_status(sk, SessionStatus.PROCESSED)
+                if sk in not_worthy_keys:
+                    self.db.update_session_status(sk, SessionStatus.ARCHIVED)
+                else:
+                    self.db.update_session_status(sk, SessionStatus.PROCESSED)
+            dream_report: dict[str, Any] | None = None
+            if run.phase in {"both", "weekly"}:
+                dream_report = run_dream_consolidation(self.cfg, self.db, run_id=run.run_id)
+            core_card_info = rebuild_core_card(self.cfg, self.db)
+            dream_note = (
+                f"，周五蒸馏自动休眠 {len(dream_report['auto_dormant_rules'])} 条零命中规则、"
+                f"标记 {len(dream_report['expired_cards'])} 篇过期经验卡"
+                if dream_report
+                else ""
+            )
             self._finish_node(
                 run,
                 "P05_SETTLE",
                 t0,
-                summary=f"幂等结算 {len(run.admitted_sessions)} 个会话为 processed，激活规则索引已刷新（保留锁待交付）",
+                summary=(
+                    f"幂等结算 {len(run.admitted_sessions)} 个会话为 processed，"
+                    f"核心索引卡已刷新（{core_card_info['lines']} 行）{dream_note}"
+                ),
                 internal_checks=[
                     {"name": "会话队列幂等回写", "status": "PASS"},
-                    {"name": "规则激活索引刷新", "status": "PASS"},
+                    {"name": "核心索引卡 FLYWHEEL-CORE.md 刷新", "status": "PASS", "detail": {"lines": core_card_info["lines"], "bytes": core_card_info["bytes"]}},
                     {"name": "P05 保留独占锁至 P07 终态校验", "status": "PASS"},
                 ],
-                payload={"settled_sessions": run.admitted_sessions, "created_rules": created_rules},
+                payload={
+                    "settled_sessions": run.admitted_sessions,
+                    "created_rules": created_rules,
+                    "core_card": {"path": core_card_info["path"], "lines": core_card_info["lines"]},
+                    "dream": dream_report,
+                },
             )
 
             # ---------------- P06 REPORT ----------------
@@ -695,9 +812,21 @@ class WorkflowOrchestrator:
                 f"- **沉淀笔记**：{', '.join(f'`{p}`' for p in written_paths) if written_paths else '无新增'}",
                 f"- **新增避坑规则**：{', '.join(f'`{r}`' for r in created_rules) if created_rules else '无新增'}",
                 f"- **新建 / 优化 Skill**：{', '.join(f'`{s}`' for s in written_skills) if written_skills else '无新增'}",
-                "",
-                "### 各环节结果",
+                f"- **核心索引卡**：已同步至 `data/FLYWHEEL-CORE.md`（{core_card_info['lines']} 行）",
             ]
+            if dream_report:
+                digest_lines.extend(
+                    [
+                        "",
+                        f"### 周五蒸馏与减法摘要（{dream_report['period_key']}）",
+                        f"- **自动休眠零命中规则**：{len(dream_report['auto_dormant_rules'])} 条",
+                        f"- **超期需复核经验卡**：{len(dream_report['expired_cards'])} 篇",
+                        f"- **待收敛分歧/反例**：{dream_report['open_dissents_count']} 条",
+                    ]
+                )
+                for prop in dream_report.get("proposals", []):
+                    digest_lines.append(f"- {prop}")
+            digest_lines.extend(["", "### 各环节结果"])
             for n in run.nodes:
                 if n.node_id in {"P06_REPORT", "P07_DELIVER"}:
                     continue

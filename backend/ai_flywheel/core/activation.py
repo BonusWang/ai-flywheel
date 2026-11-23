@@ -9,6 +9,7 @@ import yaml
 
 from ai_flywheel.config import FlywheelConfig
 from ai_flywheel.core.policies import PolicyEngine
+from ai_flywheel.core.privacy import sanitize_and_check_secrets
 from ai_flywheel.models import (
     CreateRuleRequest,
     OutcomeOrigin,
@@ -139,6 +140,18 @@ class ActivationEngine:
             self.db.increment_rule_hit(rule.rule_id)
         suggested_skills = self.suggest_skills(req.task, matched_rules)
         knowledge_hits = self.db.search_knowledge_fts(req.task, limit=4)
+        open_dissents = self.db.get_open_dissents_by_targets([r.rule_id for r in matched_rules])
+        freshness_map = self.db.get_knowledge_freshness_map([str(h.get("doc_path", "")) for h in knowledge_hits])
+
+        # Enrich knowledge hits with freshness status & demote expired cards behind fresh ones
+        for hit in knowledge_hits:
+            finfo = freshness_map.get(str(hit.get("doc_path", ""))) or {}
+            hit["freshness_tier"] = finfo.get("freshness_tier", "evolving")
+            hit["valid_until"] = finfo.get("valid_until")
+            hit["is_expired"] = bool(finfo.get("is_expired", False))
+            if hit["is_expired"]:
+                hit["freshness_warning"] = "⚠️ [已过复核期，执行前请先核实]"
+        knowledge_hits.sort(key=lambda h: 1 if h.get("is_expired") else 0)
 
         compact_lines: list[str] = []
         if policy_card:
@@ -154,14 +167,19 @@ class ActivationEngine:
                     compact_lines.append("  必查: " + " | ".join(r.checklist[:3]))
                 if r.forbidden_routes:
                     compact_lines.append("  禁用路线: " + " | ".join(r.forbidden_routes[:2]))
+                for dis in (open_dissents.get(r.rule_id) or [])[:2]:
+                    scope = f"（条件: {dis['condition_scope']}）" if dis.get("condition_scope") else ""
+                    compact_lines.append(f"  ⚠️ 已知分歧/例外: {dis['counter_claim'][:120]}{scope}")
         if suggested_skills:
             compact_lines.append(
                 "[推荐 Skill] " + ", ".join(s["name"] for s in suggested_skills)
             )
         if knowledge_hits:
-            compact_lines.append(
-                "[关联知识指针] " + ", ".join(h["doc_path"] for h in knowledge_hits)
-            )
+            formatted_hits = [
+                f"{h['doc_path']} ⚠️[已过复核期，执行前请先核实]" if h.get("is_expired") else h["doc_path"]
+                for h in knowledge_hits
+            ]
+            compact_lines.append("[关联知识指针] " + ", ".join(formatted_hits))
 
         receipt_id = f"pf-{uuid.uuid4().hex[:12]}"
         task_fp = canonical_hash({"task": req.task, "project": req.project})
@@ -211,21 +229,28 @@ class ActivationEngine:
             compact_context="\n".join(compact_lines),
         )
 
-    def register_rule(self, req: CreateRuleRequest) -> RuleRecord:
+    def register_rule(self, req: CreateRuleRequest, *, root_cause_key: str | None = None) -> RuleRecord:
+        safe_title = sanitize_and_check_secrets(req.title, context="rule:title")
+        safe_checklist = [sanitize_and_check_secrets(c, context="rule:checklist") for c in req.checklist]
+        safe_forbidden = [sanitize_and_check_secrets(f, context="rule:forbidden") for f in req.forbidden_routes]
+
         rid = req.rule_id or f"rule-{uuid.uuid4().hex[:8]}"
         existing = self.db.get_rule(rid)
         if existing:
-            existing.title = req.title
+            existing.title = safe_title
             existing.domain = req.domain
             existing.projects = req.projects or existing.projects
             existing.triggers = req.triggers or existing.triggers
-            existing.checklist = req.checklist or existing.checklist
-            existing.forbidden_routes = req.forbidden_routes or existing.forbidden_routes
+            existing.checklist = safe_checklist or existing.checklist
+            existing.forbidden_routes = safe_forbidden or existing.forbidden_routes
             existing.applicable_skills = req.applicable_skills or existing.applicable_skills
             existing.source_pointers = req.source_pointers or existing.source_pointers
+            if root_cause_key:
+                existing.root_cause_key = root_cause_key
             existing.version += 1
-            if existing.status == RuleStatus.NEEDS_REVISION:
+            if existing.status in {RuleStatus.NEEDS_REVISION, RuleStatus.DORMANT}:
                 existing.status = RuleStatus.UNVERIFIED_ACTIVE
+                existing.dormant_at = None
                 existing.revalidation_history.append(
                     {
                         "at": utc_now_iso(),
@@ -237,17 +262,18 @@ class ActivationEngine:
 
         rule = RuleRecord(
             rule_id=rid,
-            title=req.title,
+            title=safe_title,
             domain=req.domain,
             projects=req.projects or ["generic"],
             triggers=req.triggers,
-            checklist=req.checklist,
-            forbidden_routes=req.forbidden_routes,
+            checklist=safe_checklist,
+            forbidden_routes=safe_forbidden,
             applicable_skills=req.applicable_skills,
             source_pointers=req.source_pointers,
             status=RuleStatus.UNVERIFIED_ACTIVE,
             version=1,
             origin_session_key=req.origin_session_key,
+            root_cause_key=root_cause_key,
             revalidation_history=[
                 {
                     "at": utc_now_iso(),
@@ -356,6 +382,10 @@ class ActivationEngine:
             return None
         prev = rule.status.value
         rule.status = new_status
+        if new_status in {RuleStatus.UNVERIFIED_ACTIVE, RuleStatus.VERIFIED_ACTIVE}:
+            rule.dormant_at = None
+        elif new_status == RuleStatus.DORMANT:
+            rule.dormant_at = utc_now_iso()
         if new_status == RuleStatus.UNVERIFIED_ACTIVE and prev == RuleStatus.NEEDS_REVISION.value:
             rule.version += 1
         rule.revalidation_history.append(

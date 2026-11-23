@@ -4,12 +4,14 @@ import json
 import re
 import shutil
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from ai_flywheel.core.privacy import compute_valid_until, shanghai_today_ymd
 from ai_flywheel.models import (
     NodeExecution,
     OutcomeCheck,
@@ -300,6 +302,62 @@ CREATE TABLE IF NOT EXISTS skill_assets (
     version INTEGER NOT NULL DEFAULT 1,
     last_run_id TEXT,
     backup_path TEXT,
+    invoke_count INTEGER NOT NULL DEFAULT 0,
+    verified_pass_count INTEGER NOT NULL DEFAULT 0,
+    fail_count INTEGER NOT NULL DEFAULT 0,
+    last_used_at TEXT,
+    health_state TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- ---------------- v3 True Flywheel: Mistakes, Dissents & Growth Ledger ----------------
+CREATE TABLE IF NOT EXISTS mistake_observations (
+    obs_id TEXT PRIMARY KEY,
+    root_cause_key TEXT NOT NULL UNIQUE,
+    severity_grade TEXT NOT NULL DEFAULT 'yellow_caught',
+    title TEXT NOT NULL,
+    phenomenon TEXT NOT NULL DEFAULT '',
+    truth TEXT NOT NULL DEFAULT '',
+    thinking_root_cause TEXT NOT NULL DEFAULT '',
+    caught_by TEXT NOT NULL DEFAULT 'self',
+    occurrence_count INTEGER NOT NULL DEFAULT 1,
+    session_keys_json TEXT NOT NULL DEFAULT '[]',
+    promoted_rule_id TEXT,
+    status TEXT NOT NULL DEFAULT 'observing',
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dissent_records (
+    dissent_id TEXT PRIMARY KEY,
+    target_type TEXT NOT NULL DEFAULT 'rule',
+    target_id TEXT NOT NULL,
+    counter_claim TEXT NOT NULL,
+    condition_scope TEXT NOT NULL DEFAULT '',
+    evidence_pointer TEXT NOT NULL DEFAULT '',
+    session_key TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'open',
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS flywheel_metrics_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    period_key TEXT NOT NULL UNIQUE,
+    red_count INTEGER NOT NULL DEFAULT 0,
+    yellow_count INTEGER NOT NULL DEFAULT 0,
+    green_count INTEGER NOT NULL DEFAULT 0,
+    repeat_mistake_rate REAL NOT NULL DEFAULT 0.0,
+    self_catch_rate REAL NOT NULL DEFAULT 0.0,
+    active_rule_count INTEGER NOT NULL DEFAULT 0,
+    dormant_rule_count INTEGER NOT NULL DEFAULT 0,
+    open_dissent_count INTEGER NOT NULL DEFAULT 0,
+    expired_card_count INTEGER NOT NULL DEFAULT 0,
+    stale_skill_count INTEGER NOT NULL DEFAULT 0,
+    sample_sufficient INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -320,6 +378,9 @@ CREATE INDEX IF NOT EXISTS idx_card_deliveries_status ON card_deliveries(status,
 CREATE INDEX IF NOT EXISTS idx_audit_events_entity ON audit_events(entity_type, entity_id, seq DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_events_created ON audit_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_system_settings_cat ON system_settings(category);
+CREATE INDEX IF NOT EXISTS idx_mistake_obs_status_count ON mistake_observations(status, occurrence_count DESC, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dissent_target_status ON dissent_records(target_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_metrics_snapshots_period ON flywheel_metrics_snapshots(period_key DESC);
 """
 
 KNOWLEDGE_FTS_COLUMNS = (
@@ -470,6 +531,7 @@ class FlywheelDB:
             conn.executescript(SCHEMA_SQL)
             self._migrate_knowledge_fts(conn)
             self._migrate_to_v2(conn, preexisting=preexisting)
+            self._migrate_to_v3(conn, preexisting=preexisting)
 
     @staticmethod
     def _to_shanghai_date(iso_str: str | None) -> str:
@@ -643,6 +705,52 @@ class FlywheelDB:
             (now,),
         )
 
+    def _migrate_to_v3(self, conn: sqlite3.Connection, *, preexisting: bool) -> None:
+        applied = conn.execute(
+            "SELECT version FROM schema_migrations WHERE version = 3"
+        ).fetchone()
+        if applied:
+            return
+
+        # Auto-backup existing v2 database before running v3 schema upgrades
+        if preexisting and self.db_path.exists():
+            backup = self.db_path.with_name(f"{self.db_path.name}.bak-v2")
+            if not backup.exists():
+                try:
+                    shutil.copy2(self.db_path, backup)
+                except OSError:
+                    pass
+
+        now = utc_now_iso()
+        # Rules lifecycle & dormancy metadata
+        self._ensure_column(conn, "rules", "last_hit_at", "TEXT")
+        self._ensure_column(conn, "rules", "dormant_at", "TEXT")
+        self._ensure_column(conn, "rules", "root_cause_key", "TEXT")
+        # Skill usage & health tracking (anti-Skill-theater)
+        self._ensure_column(conn, "skill_assets", "invoke_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "skill_assets", "verified_pass_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "skill_assets", "fail_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "skill_assets", "last_used_at", "TEXT")
+        self._ensure_column(conn, "skill_assets", "health_state", "TEXT NOT NULL DEFAULT 'active'")
+        # Knowledge card freshness governance
+        self._ensure_column(conn, "knowledge_card_metrics", "freshness_tier", "TEXT NOT NULL DEFAULT 'evolving'")
+        self._ensure_column(conn, "knowledge_card_metrics", "last_verified_at", "TEXT")
+        self._ensure_column(conn, "knowledge_card_metrics", "valid_until", "TEXT")
+        self._ensure_column(conn, "knowledge_card_metrics", "freshness_state", "TEXT NOT NULL DEFAULT 'fresh'")
+        # Outcome skill attribution
+        self._ensure_column(conn, "outcomes", "used_skills_json", "TEXT NOT NULL DEFAULT '[]'")
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rules_root_cause ON rules(root_cause_key)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_knowledge_freshness ON knowledge_card_metrics(freshness_state, valid_until)"
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_migrations (version, name, applied_at) VALUES (3, 'v3_true_flywheel_evolution', ?)",
+            (now,),
+        )
+
     def _migrate_knowledge_fts(self, conn: sqlite3.Connection) -> None:
         """Rebuild the FTS table when its column contract changed (pre-2026-11-23 layouts)."""
         columns = tuple(row["name"] for row in conn.execute("PRAGMA table_info(knowledge_fts)").fetchall())
@@ -758,8 +866,9 @@ class FlywheelDB:
                     rule_id, title, domain, projects_json, triggers_json, checklist_json,
                     forbidden_routes_json, applicable_skills_json, source_pointers_json,
                     status, version, origin_session_key, hit_count, natural_pass_count,
-                    recurrence_count, revalidation_history_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    recurrence_count, revalidation_history_json, last_hit_at, dormant_at,
+                    root_cause_key, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(rule_id) DO UPDATE SET
                     title = excluded.title,
                     domain = excluded.domain,
@@ -775,6 +884,9 @@ class FlywheelDB:
                     natural_pass_count = excluded.natural_pass_count,
                     recurrence_count = excluded.recurrence_count,
                     revalidation_history_json = excluded.revalidation_history_json,
+                    last_hit_at = COALESCE(excluded.last_hit_at, rules.last_hit_at),
+                    dormant_at = excluded.dormant_at,
+                    root_cause_key = COALESCE(excluded.root_cause_key, rules.root_cause_key),
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -794,6 +906,9 @@ class FlywheelDB:
                     rule.natural_pass_count,
                     rule.recurrence_count,
                     json.dumps(rule.revalidation_history, ensure_ascii=False),
+                    rule.last_hit_at,
+                    rule.dormant_at,
+                    rule.root_cause_key,
                     rule.created_at,
                     now,
                 ),
@@ -801,6 +916,7 @@ class FlywheelDB:
         return self.get_rule(rule.rule_id)  # type: ignore[return-value]
 
     def _row_to_rule(self, row: sqlite3.Row) -> RuleRecord:
+        keys = set(row.keys())
         return RuleRecord(
             rule_id=row["rule_id"],
             title=row["title"],
@@ -818,6 +934,9 @@ class FlywheelDB:
             natural_pass_count=row["natural_pass_count"],
             recurrence_count=row["recurrence_count"],
             revalidation_history=json.loads(row["revalidation_history_json"]),
+            last_hit_at=row["last_hit_at"] if "last_hit_at" in keys else None,
+            dormant_at=row["dormant_at"] if "dormant_at" in keys else None,
+            root_cause_key=row["root_cause_key"] if "root_cause_key" in keys else None,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -839,10 +958,11 @@ class FlywheelDB:
             return [self._row_to_rule(r) for r in rows]
 
     def increment_rule_hit(self, rule_id: str) -> None:
+        now = utc_now_iso()
         with self.connect() as conn:
             conn.execute(
-                "UPDATE rules SET hit_count = hit_count + 1, updated_at = ? WHERE rule_id = ?",
-                (utc_now_iso(), rule_id),
+                "UPDATE rules SET hit_count = hit_count + 1, last_hit_at = ?, updated_at = ? WHERE rule_id = ?",
+                (now, now, rule_id),
             )
 
     # ---------------- Preflight & Outcomes ----------------
@@ -888,14 +1008,15 @@ class FlywheelDB:
             return int(row["cnt"]) if row else 0
 
     def save_outcome(self, record: OutcomeRecord) -> OutcomeRecord:
+        now = utc_now_iso()
         with self.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO outcomes (
                     outcome_id, receipt_hash, session_key, client, preflight_receipt_id,
                     origin, status, summary, checks_json, applied_rule_ids_json,
-                    artifacts_json, revalidation_effects_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    artifacts_json, revalidation_effects_json, used_skills_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.outcome_id,
@@ -910,7 +1031,9 @@ class FlywheelDB:
                     json.dumps(record.applied_rule_ids, ensure_ascii=False),
                     json.dumps(record.artifacts, ensure_ascii=False),
                     json.dumps(record.revalidation_effects, ensure_ascii=False),
+                    json.dumps(record.used_skills, ensure_ascii=False),
                     record.created_at,
+                    now,
                 ),
             )
         return record
@@ -923,6 +1046,8 @@ class FlywheelDB:
             ).fetchall()
             out: list[OutcomeRecord] = []
             for r in rows:
+                keys = set(r.keys())
+                used_skills = json.loads(r["used_skills_json"]) if "used_skills_json" in keys and r["used_skills_json"] else []
                 out.append(
                     OutcomeRecord(
                         outcome_id=r["outcome_id"],
@@ -935,6 +1060,7 @@ class FlywheelDB:
                         summary=r["summary"],
                         checks=[OutcomeCheck.model_validate(c) for c in json.loads(r["checks_json"])],
                         applied_rule_ids=json.loads(r["applied_rule_ids_json"]),
+                        used_skills=used_skills,
                         artifacts=json.loads(r["artifacts_json"]),
                         revalidation_effects=json.loads(r["revalidation_effects_json"]),
                         created_at=r["created_at"],
@@ -1650,7 +1776,7 @@ class FlywheelDB:
         except sqlite3.OperationalError:
             return []
 
-    # ---------------- Knowledge card metrics (D6) ----------------
+    # ---------------- Knowledge card metrics (D6 + v3 freshness) ----------------
     def record_knowledge_surfaces(self, doc_paths: list[str], at: str) -> None:
         paths = [p for p in dict.fromkeys(doc_paths) if p]
         if not paths:
@@ -1659,13 +1785,14 @@ class FlywheelDB:
             for path in paths:
                 conn.execute(
                     """
-                    INSERT INTO knowledge_card_metrics (doc_path, surface_count, last_surfaced_at)
-                    VALUES (?, 1, ?)
+                    INSERT INTO knowledge_card_metrics (doc_path, surface_count, last_surfaced_at, created_at, updated_at)
+                    VALUES (?, 1, ?, ?, ?)
                     ON CONFLICT(doc_path) DO UPDATE SET
                         surface_count = knowledge_card_metrics.surface_count + 1,
-                        last_surfaced_at = excluded.last_surfaced_at
+                        last_surfaced_at = excluded.last_surfaced_at,
+                        updated_at = excluded.updated_at
                     """,
-                    (path, at),
+                    (path, at, at, at),
                 )
 
     def record_knowledge_usage(
@@ -1679,15 +1806,140 @@ class FlywheelDB:
             for path in paths:
                 conn.execute(
                     """
-                    INSERT INTO knowledge_card_metrics (doc_path, helped_count, cited_count, last_helped_at)
-                    VALUES (?, 1, ?, ?)
+                    INSERT INTO knowledge_card_metrics (doc_path, helped_count, cited_count, last_helped_at, created_at, updated_at)
+                    VALUES (?, 1, ?, ?, ?, ?)
                     ON CONFLICT(doc_path) DO UPDATE SET
                         helped_count = knowledge_card_metrics.helped_count + 1,
                         cited_count = knowledge_card_metrics.cited_count + excluded.cited_count,
-                        last_helped_at = excluded.last_helped_at
+                        last_helped_at = excluded.last_helped_at,
+                        updated_at = excluded.updated_at
                     """,
-                    (path, 1 if path in cited else 0, at),
+                    (path, 1 if path in cited else 0, at, at, at),
                 )
+
+    def upsert_knowledge_freshness(
+        self,
+        doc_path: str,
+        *,
+        freshness_tier: str = "evolving",
+        last_verified_at: str | None = None,
+        valid_until: str | None = None,
+        freshness_state: str = "fresh",
+    ) -> None:
+        if not doc_path:
+            return
+        now = utc_now_iso()
+        tier = freshness_tier if freshness_tier in {"volatile", "evolving", "evergreen"} else "evolving"
+        verified = last_verified_at or shanghai_today_ymd()
+        until = valid_until or compute_valid_until(tier, verified)
+        state = freshness_state if freshness_state in {"fresh", "needs_recheck", "superseded", "archived"} else "fresh"
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO knowledge_card_metrics (
+                    doc_path, freshness_tier, last_verified_at, valid_until, freshness_state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(doc_path) DO UPDATE SET
+                    freshness_tier = excluded.freshness_tier,
+                    last_verified_at = COALESCE(excluded.last_verified_at, knowledge_card_metrics.last_verified_at),
+                    valid_until = COALESCE(excluded.valid_until, knowledge_card_metrics.valid_until),
+                    freshness_state = excluded.freshness_state,
+                    updated_at = excluded.updated_at
+                """,
+                (doc_path, tier, verified, until, state, now, now),
+            )
+
+    def refresh_knowledge_freshness(self, doc_paths: list[str], verified_date_ymd: str) -> list[str]:
+        """Auto-renew last_verified_at & valid_until when real verification passes."""
+        paths = [p for p in dict.fromkeys(doc_paths) if p]
+        if not paths:
+            return []
+        now = utc_now_iso()
+        refreshed: list[str] = []
+        with self.connect() as conn:
+            for path in paths:
+                row = conn.execute(
+                    "SELECT freshness_tier FROM knowledge_card_metrics WHERE doc_path = ?",
+                    (path,),
+                ).fetchone()
+                tier = (row["freshness_tier"] if row and row["freshness_tier"] else "evolving")
+                new_until = compute_valid_until(tier, verified_date_ymd)
+                conn.execute(
+                    """
+                    INSERT INTO knowledge_card_metrics (
+                        doc_path, freshness_tier, last_verified_at, valid_until, freshness_state, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'fresh', ?, ?)
+                    ON CONFLICT(doc_path) DO UPDATE SET
+                        last_verified_at = excluded.last_verified_at,
+                        valid_until = excluded.valid_until,
+                        freshness_state = 'fresh',
+                        updated_at = excluded.updated_at
+                    """,
+                    (path, tier, verified_date_ymd, new_until, now, now),
+                )
+                refreshed.append(path)
+        return refreshed
+
+    def mark_expired_knowledge_cards(self, today_ymd: str) -> list[dict[str, Any]]:
+        """Mark fresh cards past valid_until as needs_recheck and return all cards currently needing recheck."""
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE knowledge_card_metrics
+                SET freshness_state = 'needs_recheck', updated_at = ?
+                WHERE valid_until IS NOT NULL AND valid_until != ''
+                  AND valid_until < ?
+                  AND freshness_state = 'fresh'
+                """,
+                (now, today_ymd),
+            )
+            rows = conn.execute(
+                """
+                SELECT doc_path, freshness_tier, last_verified_at, valid_until, freshness_state,
+                       surface_count, helped_count
+                FROM knowledge_card_metrics
+                WHERE freshness_state = 'needs_recheck'
+                   OR (valid_until IS NOT NULL AND valid_until != '' AND valid_until < ? AND freshness_state != 'archived')
+                ORDER BY valid_until ASC
+                """,
+                (today_ymd,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_knowledge_freshness_map(self, doc_paths: list[str] | None = None) -> dict[str, dict[str, Any]]:
+        today_ymd = shanghai_today_ymd()
+        with self.connect() as conn:
+            if doc_paths:
+                placeholders = ",".join("?" for _ in doc_paths)
+                rows = conn.execute(
+                    f"""
+                    SELECT doc_path, freshness_tier, last_verified_at, valid_until, freshness_state,
+                           surface_count, helped_count
+                    FROM knowledge_card_metrics
+                    WHERE doc_path IN ({placeholders})
+                    """,
+                    tuple(doc_paths),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT doc_path, freshness_tier, last_verified_at, valid_until, freshness_state,
+                           surface_count, helped_count
+                    FROM knowledge_card_metrics
+                    """
+                ).fetchall()
+        out: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            item = dict(r)
+            valid_until = item.get("valid_until") or ""
+            is_expired = bool(
+                item.get("freshness_state") == "needs_recheck"
+                or (valid_until and valid_until < today_ymd and item.get("freshness_state") not in {"archived", "superseded"})
+            )
+            item["is_expired"] = is_expired
+            out[item["doc_path"]] = item
+        return out
 
     def get_preflight_knowledge_pointers(self, receipt_id: str) -> list[str]:
         if not receipt_id:
@@ -1711,7 +1963,8 @@ class FlywheelDB:
             rows = conn.execute(
                 """
                 SELECT doc_path, surface_count, cited_count, helped_count,
-                       last_surfaced_at, last_helped_at
+                       last_surfaced_at, last_helped_at,
+                       freshness_tier, last_verified_at, valid_until, freshness_state
                 FROM knowledge_card_metrics
                 ORDER BY helped_count DESC, surface_count DESC, doc_path
                 LIMIT ?
@@ -1719,3 +1972,510 @@ class FlywheelDB:
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    # ---------------- v3 Mistake Observation Pool ----------------
+    def upsert_mistake_observation(
+        self,
+        *,
+        root_cause_key: str,
+        title: str,
+        severity_grade: str = "yellow_caught",
+        phenomenon: str = "",
+        truth: str = "",
+        thinking_root_cause: str = "",
+        caught_by: str = "self",
+        session_key: str = "",
+    ) -> tuple[dict[str, Any], bool]:
+        key = re.sub(r"[^a-z0-9\-_]+", "-", root_cause_key.strip().lower()).strip("-") or f"obs-{uuid.uuid4().hex[:8]}"
+        grade = severity_grade if severity_grade in {"red_silent", "yellow_caught", "green_minor"} else "yellow_caught"
+        catcher = caught_by if caught_by in {"user", "tool", "self"} else "self"
+        now = utc_now_iso()
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM mistake_observations WHERE root_cause_key = ?",
+                (key,),
+            ).fetchone()
+            if existing:
+                sessions = json.loads(existing["session_keys_json"] or "[]")
+                new_count = int(existing["occurrence_count"])
+                if session_key and session_key not in sessions:
+                    sessions.append(session_key)
+                    new_count += 1
+                elif not session_key:
+                    new_count += 1
+                # Upgrade severity if a red_silent occurrence arrives
+                merged_grade = existing["severity_grade"]
+                rank = {"green_minor": 0, "yellow_caught": 1, "red_silent": 2}
+                if rank.get(grade, 1) > rank.get(merged_grade, 1):
+                    merged_grade = grade
+                conn.execute(
+                    """
+                    UPDATE mistake_observations
+                    SET severity_grade = ?,
+                        title = CASE WHEN ? != '' THEN ? ELSE title END,
+                        phenomenon = CASE WHEN ? != '' THEN ? ELSE phenomenon END,
+                        truth = CASE WHEN ? != '' THEN ? ELSE truth END,
+                        thinking_root_cause = CASE WHEN ? != '' THEN ? ELSE thinking_root_cause END,
+                        caught_by = ?,
+                        occurrence_count = ?,
+                        session_keys_json = ?,
+                        version = version + 1,
+                        updated_at = ?
+                    WHERE obs_id = ?
+                    """,
+                    (
+                        merged_grade,
+                        title.strip(),
+                        title.strip(),
+                        phenomenon.strip(),
+                        phenomenon.strip(),
+                        truth.strip(),
+                        truth.strip(),
+                        thinking_root_cause.strip(),
+                        thinking_root_cause.strip(),
+                        catcher,
+                        new_count,
+                        json.dumps(sessions, ensure_ascii=False),
+                        now,
+                        existing["obs_id"],
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT * FROM mistake_observations WHERE obs_id = ?",
+                    (existing["obs_id"],),
+                ).fetchone()
+                return self._row_to_observation(row), False
+
+            obs_id = f"obs-{uuid.uuid4().hex[:10]}"
+            sessions = [session_key] if session_key else []
+            conn.execute(
+                """
+                INSERT INTO mistake_observations (
+                    obs_id, root_cause_key, severity_grade, title, phenomenon, truth,
+                    thinking_root_cause, caught_by, occurrence_count, session_keys_json,
+                    status, version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'observing', 1, ?, ?)
+                """,
+                (
+                    obs_id,
+                    key,
+                    grade,
+                    title.strip() or key,
+                    phenomenon.strip(),
+                    truth.strip(),
+                    thinking_root_cause.strip(),
+                    catcher,
+                    json.dumps(sessions, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM mistake_observations WHERE obs_id = ?",
+                (obs_id,),
+            ).fetchone()
+            return self._row_to_observation(row), True
+
+    @staticmethod
+    def _row_to_observation(row: sqlite3.Row) -> dict[str, Any]:
+        d = dict(row)
+        d["session_keys"] = json.loads(d.pop("session_keys_json", "[]") or "[]")
+        return d
+
+    def get_mistake_observation(self, obs_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM mistake_observations WHERE obs_id = ?", (obs_id,)).fetchone()
+            return self._row_to_observation(row) if row else None
+
+    def list_mistake_observations(
+        self,
+        *,
+        status: str | None = None,
+        severity_grade: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if severity_grade:
+            clauses.append("severity_grade = ?")
+            params.append(severity_grade)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM mistake_observations
+                {where}
+                ORDER BY
+                    CASE severity_grade WHEN 'red_silent' THEN 0 WHEN 'yellow_caught' THEN 1 ELSE 2 END ASC,
+                    occurrence_count DESC,
+                    updated_at DESC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+            return [self._row_to_observation(r) for r in rows]
+
+    def update_mistake_observation_status(
+        self,
+        obs_id: str,
+        status: str,
+        *,
+        promoted_rule_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE mistake_observations
+                SET status = ?,
+                    promoted_rule_id = COALESCE(?, promoted_rule_id),
+                    version = version + 1,
+                    updated_at = ?
+                WHERE obs_id = ?
+                """,
+                (status, promoted_rule_id, now, obs_id),
+            )
+            row = conn.execute("SELECT * FROM mistake_observations WHERE obs_id = ?", (obs_id,)).fetchone()
+            return self._row_to_observation(row) if row else None
+
+    # ---------------- v3 Dissent & Counter-Evidence Records ----------------
+    def add_dissent_record(
+        self,
+        *,
+        target_type: str = "rule",
+        target_id: str,
+        counter_claim: str,
+        condition_scope: str = "",
+        evidence_pointer: str = "",
+        session_key: str = "",
+    ) -> dict[str, Any]:
+        ttype = target_type if target_type in {"rule", "knowledge_doc", "skill"} else "rule"
+        claim = counter_claim.strip()
+        now = utc_now_iso()
+        with self.connect() as conn:
+            existing = conn.execute(
+                """
+                SELECT * FROM dissent_records
+                WHERE target_type = ? AND target_id = ? AND counter_claim = ? AND status = 'open'
+                """,
+                (ttype, target_id, claim),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE dissent_records
+                    SET condition_scope = CASE WHEN ? != '' THEN ? ELSE condition_scope END,
+                        evidence_pointer = CASE WHEN ? != '' THEN ? ELSE evidence_pointer END,
+                        updated_at = ?
+                    WHERE dissent_id = ?
+                    """,
+                    (
+                        condition_scope.strip(),
+                        condition_scope.strip(),
+                        evidence_pointer.strip(),
+                        evidence_pointer.strip(),
+                        now,
+                        existing["dissent_id"],
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT * FROM dissent_records WHERE dissent_id = ?",
+                    (existing["dissent_id"],),
+                ).fetchone()
+                return dict(row)
+
+            dissent_id = f"dis-{uuid.uuid4().hex[:10]}"
+            conn.execute(
+                """
+                INSERT INTO dissent_records (
+                    dissent_id, target_type, target_id, counter_claim, condition_scope,
+                    evidence_pointer, session_key, status, version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', 1, ?, ?)
+                """,
+                (
+                    dissent_id,
+                    ttype,
+                    target_id,
+                    claim,
+                    condition_scope.strip(),
+                    evidence_pointer.strip(),
+                    session_key.strip(),
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute("SELECT * FROM dissent_records WHERE dissent_id = ?", (dissent_id,)).fetchone()
+            return dict(row)
+
+    def list_dissent_records(
+        self,
+        *,
+        target_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if target_id:
+            clauses.append("target_id = ?")
+            params.append(target_id)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM dissent_records {where} ORDER BY created_at DESC LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_open_dissents_by_targets(self, target_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+        ids = [t for t in dict.fromkeys(target_ids) if t]
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM dissent_records
+                WHERE status = 'open' AND target_id IN ({placeholders})
+                ORDER BY created_at DESC
+                """,
+                tuple(ids),
+            ).fetchall()
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for r in rows:
+            d = dict(r)
+            grouped.setdefault(d["target_id"], []).append(d)
+        return grouped
+
+    def update_dissent_status(self, dissent_id: str, status: str) -> dict[str, Any] | None:
+        if status not in {"open", "merged", "dismissed"}:
+            return None
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE dissent_records
+                SET status = ?, version = version + 1, updated_at = ?
+                WHERE dissent_id = ?
+                """,
+                (status, now, dissent_id),
+            )
+            row = conn.execute("SELECT * FROM dissent_records WHERE dissent_id = ?", (dissent_id,)).fetchone()
+            return dict(row) if row else None
+
+    # ---------------- v3 Skill Usage & Health ----------------
+    def record_skill_usage(self, skill_names: list[str], *, passed: bool, at: str | None = None) -> None:
+        names = [s.strip() for s in dict.fromkeys(skill_names) if s and s.strip()]
+        if not names:
+            return
+        now = at or utc_now_iso()
+        with self.connect() as conn:
+            for name in names:
+                existing = conn.execute(
+                    "SELECT skill_name, fail_count FROM skill_assets WHERE skill_name = ?",
+                    (name,),
+                ).fetchone()
+                if existing:
+                    new_fails = int(existing["fail_count"] or 0) + (0 if passed else 1)
+                    health = "failing" if new_fails >= 3 else "active"
+                    conn.execute(
+                        """
+                        UPDATE skill_assets
+                        SET invoke_count = invoke_count + 1,
+                            verified_pass_count = verified_pass_count + ?,
+                            fail_count = ?,
+                            last_used_at = ?,
+                            health_state = ?,
+                            updated_at = ?
+                        WHERE skill_name = ?
+                        """,
+                        (1 if passed else 0, new_fails, now, health, now, name),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO skill_assets (
+                            skill_name, source_dir, description, origin, sha256, version,
+                            invoke_count, verified_pass_count, fail_count, last_used_at,
+                            health_state, created_at, updated_at
+                        ) VALUES (?, '', '', 'observed', '', 1, 1, ?, ?, ?, 'active', ?, ?)
+                        """,
+                        (name, 1 if passed else 0, 0 if passed else 1, now, now, now),
+                    )
+
+    # ---------------- v3 Rule Auto-Dormancy & Growth Metrics ----------------
+    def mark_dormant_stale_rules(self, *, days: int = 14) -> list[dict[str, Any]]:
+        """Auto-demote unverified_active rules older than `days` with hit_count == 0 to dormant."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        now = utc_now_iso()
+        demoted: list[dict[str, Any]] = []
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT rule_id, title, created_at FROM rules
+                WHERE status = ? AND hit_count = 0 AND created_at < ?
+                """,
+                (RuleStatus.UNVERIFIED_ACTIVE.value, cutoff),
+            ).fetchall()
+            for r in rows:
+                conn.execute(
+                    """
+                    UPDATE rules
+                    SET status = ?, dormant_at = ?, updated_at = ?
+                    WHERE rule_id = ?
+                    """,
+                    (RuleStatus.DORMANT.value, now, now, r["rule_id"]),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO audit_events (entity_type, entity_id, event_type, actor, summary, payload_json, created_at)
+                    VALUES ('rule', ?, 'auto_dormant', 'dream', ?, ?, ?)
+                    """,
+                    (
+                        r["rule_id"],
+                        f"试运行规则超过 {days} 天零命中，自动转入休眠：{r['title']}",
+                        json.dumps({"days_threshold": days, "created_at": r["created_at"]}, ensure_ascii=False),
+                        now,
+                    ),
+                )
+                demoted.append({"rule_id": r["rule_id"], "title": r["title"], "created_at": r["created_at"]})
+        return demoted
+
+    def save_metrics_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now_iso()
+        period_key = str(snapshot["period_key"])
+        snap_id = snapshot.get("snapshot_id") or f"snap-{period_key}"
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO flywheel_metrics_snapshots (
+                    snapshot_id, period_key, red_count, yellow_count, green_count,
+                    repeat_mistake_rate, self_catch_rate, active_rule_count, dormant_rule_count,
+                    open_dissent_count, expired_card_count, stale_skill_count, sample_sufficient,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(period_key) DO UPDATE SET
+                    red_count = excluded.red_count,
+                    yellow_count = excluded.yellow_count,
+                    green_count = excluded.green_count,
+                    repeat_mistake_rate = excluded.repeat_mistake_rate,
+                    self_catch_rate = excluded.self_catch_rate,
+                    active_rule_count = excluded.active_rule_count,
+                    dormant_rule_count = excluded.dormant_rule_count,
+                    open_dissent_count = excluded.open_dissent_count,
+                    expired_card_count = excluded.expired_card_count,
+                    stale_skill_count = excluded.stale_skill_count,
+                    sample_sufficient = excluded.sample_sufficient,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    snap_id,
+                    period_key,
+                    int(snapshot.get("red_count", 0)),
+                    int(snapshot.get("yellow_count", 0)),
+                    int(snapshot.get("green_count", 0)),
+                    float(snapshot.get("repeat_mistake_rate", 0.0)),
+                    float(snapshot.get("self_catch_rate", 0.0)),
+                    int(snapshot.get("active_rule_count", 0)),
+                    int(snapshot.get("dormant_rule_count", 0)),
+                    int(snapshot.get("open_dissent_count", 0)),
+                    int(snapshot.get("expired_card_count", 0)),
+                    int(snapshot.get("stale_skill_count", 0)),
+                    1 if snapshot.get("sample_sufficient") else 0,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM flywheel_metrics_snapshots WHERE period_key = ?",
+                (period_key,),
+            ).fetchone()
+            return dict(row) if row else {}
+
+    def get_latest_metrics_snapshot(self) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM flywheel_metrics_snapshots ORDER BY period_key DESC LIMIT 1"
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_metrics_snapshots(self, limit: int = 12) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM flywheel_metrics_snapshots ORDER BY period_key DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def compute_live_growth_metrics(self, today_ymd: str | None = None) -> dict[str, Any]:
+        today = today_ymd or shanghai_today_ymd()
+        stale_cutoff = (datetime.now(timezone.utc) - timedelta(days=21)).isoformat()
+        with self.connect() as conn:
+            obs_rows = conn.execute(
+                "SELECT severity_grade, occurrence_count, caught_by, status FROM mistake_observations WHERE status != 'archived'"
+            ).fetchall()
+            red_count = sum(1 for r in obs_rows if r["severity_grade"] == "red_silent")
+            yellow_count = sum(1 for r in obs_rows if r["severity_grade"] == "yellow_caught")
+            green_count = sum(1 for r in obs_rows if r["severity_grade"] == "green_minor")
+            total_obs = len(obs_rows)
+            repeat_obs = sum(1 for r in obs_rows if int(r["occurrence_count"] or 1) >= 2)
+            self_caught = sum(1 for r in obs_rows if r["caught_by"] in {"self", "tool"})
+
+            active_rule_count = int(
+                conn.execute(
+                    "SELECT COUNT(1) AS c FROM rules WHERE status IN ('verified_active', 'unverified_active')"
+                ).fetchone()["c"]
+            )
+            dormant_rule_count = int(
+                conn.execute(
+                    "SELECT COUNT(1) AS c FROM rules WHERE status = 'dormant'"
+                ).fetchone()["c"]
+            )
+            open_dissent_count = int(
+                conn.execute(
+                    "SELECT COUNT(1) AS c FROM dissent_records WHERE status = 'open'"
+                ).fetchone()["c"]
+            )
+            expired_card_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(1) AS c FROM knowledge_card_metrics
+                    WHERE freshness_state = 'needs_recheck'
+                       OR (valid_until IS NOT NULL AND valid_until != '' AND valid_until < ? AND freshness_state != 'archived')
+                    """,
+                    (today,),
+                ).fetchone()["c"]
+            )
+            stale_skill_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(1) AS c FROM skill_assets
+                    WHERE (origin = 'flywheel' AND invoke_count = 0 AND created_at < ?)
+                       OR fail_count >= 3
+                    """,
+                    (stale_cutoff,),
+                ).fetchone()["c"]
+            )
+            observing_pool_count = sum(1 for r in obs_rows if r["status"] == "observing")
+
+        return {
+            "red_count": red_count,
+            "yellow_count": yellow_count,
+            "green_count": green_count,
+            "total_mistakes": total_obs,
+            "observing_pool_count": observing_pool_count,
+            "repeat_mistake_rate": round(repeat_obs / total_obs, 4) if total_obs > 0 else 0.0,
+            "self_catch_rate": round(self_caught / total_obs, 4) if total_obs > 0 else 0.0,
+            "active_rule_count": active_rule_count,
+            "dormant_rule_count": dormant_rule_count,
+            "open_dissent_count": open_dissent_count,
+            "expired_card_count": expired_card_count,
+            "stale_skill_count": stale_skill_count,
+            "sample_sufficient": total_obs >= 5,
+        }

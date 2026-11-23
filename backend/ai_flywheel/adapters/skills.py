@@ -8,6 +8,7 @@ from typing import Any
 import yaml
 
 from ai_flywheel.config import FlywheelConfig
+from ai_flywheel.core.privacy import sanitize_and_check_secrets
 
 _SKILL_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 
@@ -80,6 +81,7 @@ class SkillWriterAdapter:
         fallback_title: str = "",
     ) -> dict[str, Any]:
         skill_name = self.extract_skill_name(relative_path, fallback_title=fallback_title)
+        content = sanitize_and_check_secrets(content, context=f"skill:{skill_name}")
         meta = self.validate_skill_markdown(skill_name, content)
 
         skills_root = self.root.resolve()

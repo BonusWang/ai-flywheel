@@ -42,8 +42,28 @@ class ScanSourceConfig(BaseModel):
     glob: str = "**/*.jsonl"
 
 
+class SessionTriageConfig(BaseModel):
+    enabled: bool = True
+    min_chars: int = 600
+    gray_workspace_min_chars: int = 1500
+    min_turns: int = 2
+    exclude_filename_prefixes: list[str] = Field(
+        default_factory=lambda: ["agent-", "subagent-", "warmup-"]
+    )
+    project_workspace_patterns: list[str] = Field(
+        default_factory=lambda: ["projects", "github", "repos", "workspace", "wiki", "src", "ideaprojects"]
+    )
+    temp_workspace_patterns: list[str] = Field(
+        default_factory=lambda: ["chat", "temp", "tmp", "scratch", "desktop", "downloads"]
+    )
+    exclude_workspace_patterns: list[str] = Field(
+        default_factory=lambda: ["node_modules", ".cache"]
+    )
+
+
 class SessionsConfig(BaseModel):
     scan_sources: list[ScanSourceConfig] = Field(default_factory=list)
+    triage: SessionTriageConfig = Field(default_factory=SessionTriageConfig)
 
 
 class KnowledgeSinkConfig(BaseModel):

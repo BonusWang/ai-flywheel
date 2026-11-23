@@ -8,6 +8,7 @@ import yaml
 
 from ai_flywheel.adapters.wiki_gate import WikiGate, WikiGateError, split_frontmatter
 from ai_flywheel.config import FlywheelConfig
+from ai_flywheel.core.privacy import compute_valid_until, sanitize_and_check_secrets, shanghai_today_ymd
 from ai_flywheel.storage.db import FlywheelDB, build_knowledge_search_text
 from ai_flywheel.storage.fs_store import file_sha256
 
@@ -227,6 +228,9 @@ class KnowledgeSinkAdapter:
                     "project_id": project_id,
                     "page_type": page_type,
                     "status": str(fm.get("status") or "").strip(),
+                    "freshness_tier": str(fm.get("freshness_tier") or "").strip(),
+                    "last_verified": str(fm.get("last_verified") or "").strip(),
+                    "valid_until": str(fm.get("valid_until") or "").strip(),
                 }
             )
             if limit is not None and len(docs) >= limit:
@@ -281,9 +285,11 @@ class KnowledgeSinkAdapter:
     # ---------------- write path ----------------
 
     def write_document_verified(self, relative_path: str, content: str, action: str = "create") -> dict[str, Any]:
-        """Controlled atomic write with pre-write schema gate and post-write D2 verification."""
+        """Controlled atomic write with privacy/secrets gate, pre-write schema gate, and post-write verification."""
         target = self._safe_resolve(relative_path)
         rel = relative_path.replace("\\", "/").lstrip("/")
+        # v3 write-time privacy & secret leak gate (<private> redaction + refuseSecrets)
+        content = sanitize_and_check_secrets(content, context=f"knowledge_doc:{rel}")
         gate_result = self.wiki_gate.validate_document(rel, content)
         if gate_result.applicable and not gate_result.ok:
             self.wiki_gate.write_artifact(gate_result, rel, {"stage": "pre_write"})
@@ -323,11 +329,27 @@ class KnowledgeSinkAdapter:
             self.wiki_gate.write_artifact(gate_result, rel, {"stage": "post_write"})
 
         self.sync_fts_index()
+        # Record initial freshness governance metadata for the written card
+        fm_parsed = self._parse_page_lenient(content).get("frontmatter") or {}
+        tier = str(fm_parsed.get("freshness_tier") or "evolving").strip().lower()
+        if tier not in {"volatile", "evolving", "evergreen"}:
+            tier = "evolving"
+        last_verified = str(fm_parsed.get("last_verified") or shanghai_today_ymd()).strip()
+        valid_until = str(fm_parsed.get("valid_until") or compute_valid_until(tier, last_verified)).strip()
+        self.db.upsert_knowledge_freshness(
+            rel,
+            freshness_tier=tier,
+            last_verified_at=last_verified,
+            valid_until=valid_until,
+            freshness_state="fresh",
+        )
         return {
             "relative_path": rel,
             "absolute_path": str(target),
             "preimage_sha256": preimage_sha,
             "postimage_sha256": postimage_sha,
+            "freshness_tier": tier,
+            "valid_until": valid_until,
             "verified": True,
             "wiki_gate": gate_result.to_dict() if gate_result.applicable else None,
         }
@@ -349,7 +371,29 @@ class KnowledgeSinkAdapter:
 
     def sync_fts_index(self) -> int:
         docs, _skipped = self._search_documents()
-        return self.db.rebuild_knowledge_fts(docs)
+        count = self.db.rebuild_knowledge_fts(docs)
+        existing_map = self.db.get_knowledge_freshness_map()
+        for doc in docs:
+            tier = doc.get("freshness_tier") or ""
+            last_v = doc.get("last_verified") or ""
+            valid_u = doc.get("valid_until") or ""
+            if not (tier or last_v or valid_u):
+                continue
+            rel = doc["doc_path"]
+            prev = existing_map.get(rel)
+            if prev and prev.get("last_verified_at") and last_v and str(prev["last_verified_at"]) >= last_v:
+                continue
+            effective_tier = tier if tier in {"volatile", "evolving", "evergreen"} else "evolving"
+            effective_v = last_v or shanghai_today_ymd()
+            effective_u = valid_u or compute_valid_until(effective_tier, effective_v)
+            self.db.upsert_knowledge_freshness(
+                rel,
+                freshness_tier=effective_tier,
+                last_verified_at=effective_v,
+                valid_until=effective_u,
+                freshness_state="fresh",
+            )
+        return count
 
 
 def _format_gate_failure(

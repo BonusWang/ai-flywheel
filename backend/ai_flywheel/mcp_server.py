@@ -171,6 +171,7 @@ def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
         origin: OutcomeOrigin = OutcomeOrigin.NATURAL,
         artifacts: list[str] | None = None,
         used_knowledge_paths: list[str] | None = None,
+        used_skills: list[str] | None = None,
     ) -> dict[str, Any]:
         """Submit structured task verification outcome with submission-time hard gate checks.
 
@@ -180,7 +181,8 @@ def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
           and non-empty evidence list whenever kind=='real' and result=='pass'.
         - status=='success' requires all required checks to have result=='pass'.
         - Every rule_id in applied_rule_ids must match one check with the same rule_id, result in {pass, fail}, and non-empty evidence. Pass [] if no rule was exercised.
-        - used_knowledge_paths lists Wiki cards actually re-read and helpful in this task (D6 card metrics).
+        - used_knowledge_paths lists Wiki cards actually re-read and helpful in this task (D6 card metrics & auto freshness renewal on real pass).
+        - used_skills lists local Skills actually invoked during this task (anti-Skill-theater tracking).
         """
         try:
             rec = runtime.receipts.record_outcome(
@@ -195,6 +197,7 @@ def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
                     summary=summary,
                     checks=checks,
                     applied_rule_ids=applied_rule_ids or [],
+                    used_skills=used_skills or [],
                     artifacts=artifacts or [],
                     used_knowledge_paths=used_knowledge_paths or [],
                 )
@@ -238,5 +241,11 @@ def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
         runs = runtime.db.list_workflow_runs(limit=1)
         data = runs[0].model_dump(mode="json") if runs else None
         return json.dumps(data, ensure_ascii=False, indent=2)
+
+    @mcp.resource("flywheel://core-card")
+    def resource_core_card() -> str:
+        """Derived <=200-line FLYWHEEL-CORE.md cross-agent index card (rules, mistake pool, skills, freshness warnings)."""
+        info = runtime.refresh_core_card()
+        return str(info["content"])
 
     return mcp

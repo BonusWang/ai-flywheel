@@ -15,6 +15,7 @@ class RuleStatus(str, Enum):
     UNVERIFIED_ACTIVE = "unverified_active"
     VERIFIED_ACTIVE = "verified_active"
     NEEDS_REVISION = "needs_revision"
+    DORMANT = "dormant"
     RETIRED = "retired"
 
 
@@ -143,6 +144,9 @@ class RuleRecord(BaseModel):
     hit_count: int = 0
     natural_pass_count: int = 0
     recurrence_count: int = 0
+    last_hit_at: str | None = None
+    dormant_at: str | None = None
+    root_cause_key: str | None = None
     revalidation_history: list[dict[str, Any]] = Field(default_factory=list)
     created_at: str = Field(default_factory=utc_now_iso)
     updated_at: str = Field(default_factory=utc_now_iso)
@@ -226,6 +230,7 @@ class RecordOutcomeRequest(BaseModel):
     artifacts: list[str] = Field(default_factory=list)
     # D6 (2026-11-23): Wiki knowledge cards actually re-read and helpful in this task.
     used_knowledge_paths: list[str] = Field(default_factory=list)
+    used_skills: list[str] = Field(default_factory=list)
 
 
 class OutcomeRecord(BaseModel):
@@ -241,6 +246,7 @@ class OutcomeRecord(BaseModel):
     applied_rule_ids: list[str]
     artifacts: list[str]
     used_knowledge_paths: list[str] = Field(default_factory=list)
+    used_skills: list[str] = Field(default_factory=list)
     revalidation_effects: list[dict[str, Any]] = Field(default_factory=list)
     created_at: str = Field(default_factory=utc_now_iso)
 

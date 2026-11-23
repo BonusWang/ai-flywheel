@@ -1,10 +1,16 @@
 import React, { useEffect, useState } from 'react'
-import { CheckCircle2, Plus, RefreshCcw, RotateCcw, Save } from 'lucide-react'
+import { AlertTriangle, ArrowUpRight, CheckCircle2, Plus, RefreshCcw, RotateCcw, Save } from 'lucide-react'
 import { api } from '../api'
 import { PillTabs } from '../components/PageLayout'
 import { StatusBadge } from '../components/StatusBadge'
 import { CLIENT_LABELS, labelOf, POLICY_SOURCE_LABELS, RETRO_KIND_LABELS } from '../lib/labels'
-import type { RetroItem, RuleRecord } from '../types'
+import type {
+  DissentRecord,
+  GrowthMetricsLive,
+  MistakeObservation,
+  RetroItem,
+  RuleRecord,
+} from '../types'
 
 interface Props {
   refreshToken: number
@@ -19,10 +25,16 @@ export const RulesRetroPage: React.FC<Props> = ({
 }) => {
   const [tab, setTab] = useState<'rules' | 'guidelines' | 'clues'>(initialTab)
   const [rules, setRules] = useState<RuleRecord[]>([])
+  const [dissentsByRule, setDissentsByRule] = useState<Record<string, DissentRecord[]>>({})
+  const [observations, setObservations] = useState<MistakeObservation[]>([])
+  const [growth, setGrowth] = useState<GrowthMetricsLive | null>(null)
   const [retros, setRetros] = useState<RetroItem[]>([])
   const [filter, setFilter] = useState<string>('all')
   const [showCreate, setShowCreate] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
+  const [dissentRuleId, setDissentRuleId] = useState<string | null>(null)
+  const [dissentClaim, setDissentClaim] = useState('')
+  const [dissentScope, setDissentScope] = useState('')
 
   // New rule fields
   const [title, setTitle] = useState('')
@@ -44,14 +56,19 @@ export const RulesRetroPage: React.FC<Props> = ({
   }, [initialTab])
 
   const loadAll = async () => {
-    const [rRes, qRes, pRes] = await Promise.all([
+    const [rRes, qRes, pRes, oRes, gRes] = await Promise.all([
       api.listRules(),
       api.listRetro(),
       api.listPolicies(),
+      api.listObservations(),
+      api.growthMetrics(),
     ])
     setRules(rRes.rules)
+    setDissentsByRule(rRes.dissents_by_rule || {})
     setRetros(qRes.items)
     setPolicies(pRes.policies)
+    setObservations(oRes.observations)
+    setGrowth(gRes.live)
 
     const al = pRes.policies.anti_laziness || {}
     setAntiEnabled(al.enabled !== false)
@@ -76,12 +93,50 @@ export const RulesRetroPage: React.FC<Props> = ({
   }
 
   const openClues = retros.filter((x) => x.status === 'open' || x.status === 'in_review')
+  const observingPool = observations.filter((o) => o.status === 'observing')
   const filteredRules = filter === 'all' ? rules : rules.filter((r) => r.status === filter)
 
   const handleTransition = async (ruleId: string, status: RuleRecord['status']) => {
     await api.transitionRule(ruleId, status, '人工调整规则状态')
     await loadAll()
     onGlobalRefresh()
+    if (status === 'unverified_active') {
+      showToast('规则已唤醒并重新进入试运行')
+    }
+  }
+
+  const handlePromoteObservation = async (obsId: string) => {
+    await api.promoteObservation(obsId)
+    await loadAll()
+    onGlobalRefresh()
+    showToast('已将该错题升级为试运行避坑规则')
+  }
+
+  const handleArchiveObservation = async (obsId: string) => {
+    await api.archiveObservation(obsId)
+    await loadAll()
+    onGlobalRefresh()
+  }
+
+  const handleAddDissent = async (ruleId: string) => {
+    if (!dissentClaim.trim()) return
+    await api.createDissent({
+      target_type: 'rule',
+      target_id: ruleId,
+      counter_claim: dissentClaim.trim(),
+      condition_scope: dissentScope.trim(),
+    })
+    setDissentRuleId(null)
+    setDissentClaim('')
+    setDissentScope('')
+    await loadAll()
+    showToast('已记下例外/分歧，下次命中规则时会一并提醒')
+  }
+
+  const handleDissentStatus = async (dissentId: string, status: 'merged' | 'dismissed') => {
+    await api.updateDissentStatus(dissentId, status)
+    await loadAll()
+    showToast(status === 'merged' ? '分歧已标记为吸收' : '分歧已忽略')
   }
 
   const handleRetroStatus = async (retroId: string, status: RetroItem['status']) => {
@@ -200,13 +255,63 @@ export const RulesRetroPage: React.FC<Props> = ({
         </div>
       </header>
 
+      {/* Compact 3-metric growth health bar */}
+      {growth && (
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-[12.5px]">
+          <div className="card px-4 py-3 flex items-center justify-between gap-2">
+            <div>
+              <div className="text-[11.5px] text-ink-4">错题观察池</div>
+              <div className="mt-0.5 text-[15px] font-semibold text-ink num">
+                {growth.observing_pool_count} 条待观察
+                {growth.red_count > 0 && (
+                  <span className="ml-2 text-[12px] text-hot font-medium">
+                    🔴 {growth.red_count} 条沉默错
+                  </span>
+                )}
+              </div>
+            </div>
+            <span className="text-[11.5px] text-ink-4 shrink-0 whitespace-nowrap">
+              {growth.sample_sufficient
+                ? `自查拦截 ${Math.round(growth.self_catch_rate * 100)}%`
+                : '样本 < 5 条'}
+            </span>
+          </div>
+
+          <div className="card px-4 py-3 flex items-center justify-between gap-2">
+            <div>
+              <div className="text-[11.5px] text-ink-4">规则健康度</div>
+              <div className="mt-0.5 text-[15px] font-semibold text-ink num">
+                {growth.active_rule_count} 条生效
+                <span className="ml-2 text-[12px] text-ink-4 font-normal">
+                  · {growth.dormant_rule_count} 条已休眠
+                </span>
+              </div>
+            </div>
+            <span className="text-[11.5px] text-ink-4 shrink-0 whitespace-nowrap">14天零命中休眠</span>
+          </div>
+
+          <div className="card px-4 py-3 flex items-center justify-between gap-2">
+            <div>
+              <div className="text-[11.5px] text-ink-4">分歧与经验保鲜</div>
+              <div className="mt-0.5 text-[15px] font-semibold text-ink num">
+                {growth.open_dissent_count} 条分歧
+                <span className="ml-2 text-[12px] text-ink-4 font-normal">
+                  · {growth.expired_card_count} 篇待复核
+                </span>
+              </div>
+            </div>
+            <span className="text-[11.5px] text-ink-4 shrink-0 whitespace-nowrap">反例保留不覆盖</span>
+          </div>
+        </div>
+      )}
+
       {/* Main 3 clean tabs */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <PillTabs
           items={[
             { key: 'rules', label: '避坑规则', count: rules.length },
             { key: 'guidelines', label: '我的规矩' },
-            { key: 'clues', label: '问题线索', count: openClues.length },
+            { key: 'clues', label: '错题观察池', count: observingPool.length + openClues.length },
           ]}
           active={tab}
           onChange={(k) => setTab(k as 'rules' | 'guidelines' | 'clues')}
@@ -219,6 +324,7 @@ export const RulesRetroPage: React.FC<Props> = ({
               ['verified_active', '已生效'],
               ['unverified_active', '试运行'],
               ['needs_revision', '需修改'],
+              ['dormant', '已休眠'],
               ['retired', '已停用'],
             ].map(([k, label]) => (
               <button
@@ -340,19 +446,108 @@ export const RulesRetroPage: React.FC<Props> = ({
                   </div>
                 </div>
 
+                {/* Open dissents / counter-evidence attached to this rule */}
+                {(dissentsByRule[rule.rule_id]?.length || 0) > 0 && (
+                  <div className="mt-3 p-3 rounded-[var(--radius-control)] bg-amber-soft/55 border border-amber/30 text-[12px] space-y-2">
+                    <div className="flex items-center gap-1.5 font-semibold text-amber-ink">
+                      <AlertTriangle className="w-3.5 h-3.5" />
+                      已知分歧 / 例外场景（保留供下次复核，不直接覆盖原规则）
+                    </div>
+                    {dissentsByRule[rule.rule_id].map((d) => (
+                      <div
+                        key={d.dissent_id}
+                        className="flex flex-wrap items-start justify-between gap-2 pt-1.5 border-t border-amber/20"
+                      >
+                        <div className="min-w-0 flex-1 text-ink-2">
+                          <span>{d.counter_claim}</span>
+                          {d.condition_scope && (
+                            <span className="ml-2 text-[11.5px] text-ink-4">
+                              （例外条件：{d.condition_scope}）
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-1 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => handleDissentStatus(d.dissent_id, 'merged')}
+                            className="h-6 px-2 rounded-[var(--radius-mark)] bg-ok-soft text-ok-ink text-[11px] font-medium"
+                          >
+                            已吸收
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDissentStatus(d.dissent_id, 'dismissed')}
+                            className="h-6 px-2 rounded-[var(--radius-mark)] border border-line text-ink-3 text-[11px]"
+                          >
+                            忽略
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {dissentRuleId === rule.rule_id && (
+                  <div className="mt-3 p-3 rounded-[var(--radius-control)] bg-bg-sunk/70 border border-line space-y-2 text-[12px]">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                      <input
+                        value={dissentClaim}
+                        onChange={(e) => setDissentClaim(e.target.value)}
+                        placeholder="写下这条规则什么时候不适用、或遇到什么反例"
+                        className="field-input px-2.5 py-1.5"
+                      />
+                      <input
+                        value={dissentScope}
+                        onChange={(e) => setDissentScope(e.target.value)}
+                        placeholder="例外条件（选填，例如：只读查询或本地脚本）"
+                        className="field-input px-2.5 py-1.5"
+                      />
+                    </div>
+                    <div className="flex justify-end gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDissentRuleId(null)
+                          setDissentClaim('')
+                          setDissentScope('')
+                        }}
+                        className="h-7 px-2.5 rounded-[var(--radius-mark)] border border-line text-ink-3"
+                      >
+                        取消
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleAddDissent(rule.rule_id)}
+                        className="h-7 px-3 rounded-[var(--radius-mark)] bg-accent text-accent-contrast font-medium"
+                      >
+                        保存分歧
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 <div className="mt-3 pt-3 border-t border-line-soft flex flex-wrap items-center justify-between gap-2 text-[12px]">
-                  <span className="text-[11.5px] text-ink-4 truncate max-w-[65%]">
+                  <span className="text-[11.5px] text-ink-4 truncate max-w-[55%]">
                     来源：{rule.source_pointers.join('、') || '系统内置'}
                   </span>
                   <div className="flex flex-wrap gap-1.5">
-                    {rule.status === 'needs_revision' && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setDissentRuleId((cur) => (cur === rule.rule_id ? null : rule.rule_id))
+                      }
+                      className="h-7 px-2.5 rounded-[var(--radius-mark)] border border-line text-ink-3 hover:text-ink"
+                    >
+                      + 记例外
+                    </button>
+                    {(rule.status === 'needs_revision' || rule.status === 'dormant') && (
                       <button
                         type="button"
                         onClick={() => handleTransition(rule.rule_id, 'unverified_active')}
                         className="inline-flex items-center gap-1 h-7 px-2.5 rounded-[var(--radius-mark)] bg-accent-soft text-accent-ink font-medium"
                       >
                         <RefreshCcw className="w-3 h-3" />
-                        重新启用
+                        {rule.status === 'dormant' ? '唤醒启用' : '重新启用'}
                       </button>
                     )}
                     {rule.status === 'unverified_active' && (
@@ -464,55 +659,127 @@ export const RulesRetroPage: React.FC<Props> = ({
         </div>
       )}
 
-      {/* Tab 3: Problem Clues (Quiet input material for daily batches) */}
+      {/* Tab 3: Mistake Observation Pool ("事不过三" + Red-Silent fast track) + Live Clues */}
       {tab === 'clues' && (
-        <section className="card p-5">
-          <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-line-soft">
-            <h2 className="text-[15px] font-bold text-ink">收集到的问题线索</h2>
-            <span className="text-[12px] text-ink-4">
-              这些线索会在每天 20:00 的批次里自动一起回顾，也可以手动标记处理。
-            </span>
-          </div>
-          {retros.length === 0 ? (
-            <p className="text-[13px] text-ink-4 py-8 text-center">暂无问题线索。</p>
-          ) : (
-            <div className="divide-y divide-line-soft mt-1">
-              {retros.map((item) => (
-                <div
-                  key={item.retro_id}
-                  className="py-3.5 flex flex-wrap items-start justify-between gap-3"
-                >
-                  <div className="space-y-1.5 min-w-0 flex-1">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <StatusBadge status={item.status} />
-                      <span className="chip">{labelOf(RETRO_KIND_LABELS, item.kind)}</span>
-                      <span className="chip">{labelOf(CLIENT_LABELS, item.client)}</span>
-                    </div>
-                    <p className="text-[13.5px] leading-[1.65] text-ink">{item.summary}</p>
-                  </div>
-                  {(item.status === 'open' || item.status === 'in_review') && (
-                    <div className="flex items-center gap-1.5 shrink-0">
-                      <button
-                        type="button"
-                        onClick={() => handleRetroStatus(item.retro_id, 'resolved')}
-                        className="h-7 px-2.5 rounded-[var(--radius-mark)] bg-ok-soft text-ok-ink text-[12px] font-medium"
-                      >
-                        已处理
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleRetroStatus(item.retro_id, 'dismissed')}
-                        className="h-7 px-2.5 rounded-[var(--radius-mark)] border border-line text-ink-3 text-[12px]"
-                      >
-                        忽略
-                      </button>
-                    </div>
-                  )}
-                </div>
-              ))}
+        <div className="space-y-5">
+          <section className="card p-5">
+            <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-line-soft">
+              <div>
+                <h2 className="text-[15px] font-bold text-ink">错题观察池（事不过三）</h2>
+                <p className="text-[12px] text-ink-4 mt-0.5">
+                  普通失误先在这里按根因聚类，累计出现 3 次自动晋升规则（防止规则膨胀）；高危沉默错误（🔴）可首次直通试运行。
+                </p>
+              </div>
+              <span className="chip num">共 {observations.length} 条记录</span>
             </div>
-          )}
-        </section>
+
+            {observations.length === 0 ? (
+              <p className="text-[13px] text-ink-4 py-8 text-center">
+                观察池目前为空。每天 20:00 跑完沉淀批次后，AI 遇到的各类踩坑会自动归类到这里。
+              </p>
+            ) : (
+              <div className="divide-y divide-line-soft mt-1">
+                {observations.map((obs) => (
+                  <div
+                    key={obs.obs_id}
+                    className="py-3.5 flex flex-wrap items-start justify-between gap-3"
+                  >
+                    <div className="space-y-1.5 min-w-0 flex-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <StatusBadge status={obs.severity_grade} />
+                        <StatusBadge status={obs.status} />
+                        <span className="chip num font-medium">
+                          复现 {obs.occurrence_count}/3
+                        </span>
+                        <span className="mono text-[11.5px] text-ink-4">{obs.root_cause_key}</span>
+                      </div>
+                      <div className="text-[14px] font-semibold text-ink">{obs.title}</div>
+                      {obs.thinking_root_cause && (
+                        <p className="text-[12.5px] text-ink-2">
+                          <span className="text-ink-4">思维根因：</span>
+                          {obs.thinking_root_cause}
+                        </p>
+                      )}
+                      {obs.truth && (
+                        <p className="text-[12.5px] text-ink-3">
+                          <span className="text-ink-4">正确做法：</span>
+                          {obs.truth}
+                        </p>
+                      )}
+                    </div>
+                    {obs.status === 'observing' && (
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => handlePromoteObservation(obs.obs_id)}
+                          className="inline-flex items-center gap-1 h-7 px-2.5 rounded-[var(--radius-mark)] bg-accent-soft text-accent-ink text-[12px] font-medium"
+                        >
+                          <ArrowUpRight className="w-3.5 h-3.5" />
+                          立即升级为规则
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleArchiveObservation(obs.obs_id)}
+                          className="h-7 px-2.5 rounded-[var(--radius-mark)] border border-line text-ink-3 text-[12px]"
+                        >
+                          归档
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+
+          <section className="card p-5">
+            <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-line-soft">
+              <h2 className="text-[14.5px] font-bold text-ink">实时异常线索</h2>
+              <span className="text-[12px] text-ink-4">
+                运行中捕获的卡死重试、规则复发等即时信号，会在每日批次中一并复盘。
+              </span>
+            </div>
+            {retros.length === 0 ? (
+              <p className="text-[13px] text-ink-4 py-6 text-center">暂无实时异常线索。</p>
+            ) : (
+              <div className="divide-y divide-line-soft mt-1">
+                {retros.map((item) => (
+                  <div
+                    key={item.retro_id}
+                    className="py-3.5 flex flex-wrap items-start justify-between gap-3"
+                  >
+                    <div className="space-y-1.5 min-w-0 flex-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <StatusBadge status={item.status} />
+                        <span className="chip">{labelOf(RETRO_KIND_LABELS, item.kind)}</span>
+                        <span className="chip">{labelOf(CLIENT_LABELS, item.client)}</span>
+                      </div>
+                      <p className="text-[13.5px] leading-[1.65] text-ink">{item.summary}</p>
+                    </div>
+                    {(item.status === 'open' || item.status === 'in_review') && (
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => handleRetroStatus(item.retro_id, 'resolved')}
+                          className="h-7 px-2.5 rounded-[var(--radius-mark)] bg-ok-soft text-ok-ink text-[12px] font-medium"
+                        >
+                          已处理
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleRetroStatus(item.retro_id, 'dismissed')}
+                          className="h-7 px-2.5 rounded-[var(--radius-mark)] border border-line text-ink-3 text-[12px]"
+                        >
+                          忽略
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+        </div>
       )}
     </div>
   )

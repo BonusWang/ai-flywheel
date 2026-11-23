@@ -2,7 +2,10 @@ import type {
   AboutPayload,
   AuditEventRecord,
   ConnectPayload,
+  DissentRecord,
+  GrowthMetricsPayload,
   KnowledgeDocSummary,
+  MistakeObservation,
   OverviewResponse,
   PreflightResponse,
   RetroItem,
@@ -76,7 +79,10 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
-  listRules: () => req<{ rules: RuleRecord[] }>('/api/site/rules'),
+  listRules: () =>
+    req<{ rules: RuleRecord[]; dissents_by_rule?: Record<string, DissentRecord[]> }>(
+      '/api/site/rules'
+    ),
   createRule: (body: {
     title: string
     domain: string
@@ -93,6 +99,36 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ status, note }),
     }),
+
+  listObservations: () => req<{ observations: MistakeObservation[] }>('/api/site/observations'),
+  promoteObservation: (obsId: string) =>
+    req<{ observation: MistakeObservation; rule: RuleRecord }>(
+      `/api/site/observations/${obsId}/promote`,
+      { method: 'POST' }
+    ),
+  archiveObservation: (obsId: string) =>
+    req<{ observation: MistakeObservation }>(`/api/site/observations/${obsId}/archive`, {
+      method: 'POST',
+    }),
+
+  createDissent: (body: {
+    target_type?: 'rule' | 'knowledge_doc' | 'skill'
+    target_id: string
+    counter_claim: string
+    condition_scope?: string
+  }) =>
+    req<{ dissent: DissentRecord }>('/api/site/dissents', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  updateDissentStatus: (dissentId: string, status: 'open' | 'merged' | 'dismissed') =>
+    req<{ dissent: DissentRecord }>(`/api/site/dissents/${dissentId}/status`, {
+      method: 'POST',
+      body: JSON.stringify({ status }),
+    }),
+
+  growthMetrics: () => req<GrowthMetricsPayload>('/api/site/growth-metrics'),
+  coreCard: () => req<{ path: string; lines: number; bytes: number; content: string }>('/api/site/core-card'),
 
   listRetro: () => req<{ items: RetroItem[] }>('/api/site/retro'),
   updateRetroStatus: (retroId: string, status: RetroItem['status']) =>
