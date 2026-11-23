@@ -218,11 +218,12 @@ class WorkflowOrchestrator:
             lock = self.db.get_workflow_lock()
             raise WorkflowLockError(f"Another workflow run already holds the lock: {lock}")
 
-        runner_mode = (
-            "cli"
-            if (self.cfg.runner.mode == "cli" and self.cfg.runner.cli.command and self.cfg.safety_valves.cli_execution_enabled)
-            else "dry_run"
-        )
+        if self.cfg.runner.mode == "api" and self.cfg.runner.api.base_url and self.cfg.runner.api.model and self.cfg.safety_valves.cli_execution_enabled:
+            runner_mode = f"api:{self.cfg.runner.api.model}"
+        elif self.cfg.runner.mode == "cli" and self.cfg.runner.cli.command and self.cfg.safety_valves.cli_execution_enabled:
+            runner_mode = "cli"
+        else:
+            runner_mode = "dry_run"
         run = WorkflowRunRecord(
             run_id=run_id,
             trigger=trigger,

@@ -71,8 +71,17 @@ class CliRunnerConfig(BaseModel):
     working_dir: str | None = None
 
 
+class ApiRunnerConfig(BaseModel):
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    timeout_seconds: int = 120
+    extra_headers: dict[str, str] = Field(default_factory=dict)
+
+
 class RunnerConfig(BaseModel):
-    mode: str = "dry_run"  # dry_run | cli
+    mode: str = "dry_run"  # dry_run | api | cli
+    api: ApiRunnerConfig = Field(default_factory=ApiRunnerConfig)
     cli: CliRunnerConfig = Field(default_factory=CliRunnerConfig)
 
 

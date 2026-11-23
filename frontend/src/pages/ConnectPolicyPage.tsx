@@ -39,10 +39,14 @@ export const ConnectPolicyPage: React.FC<Props> = ({ section, onGlobalRefresh })
   const [kbType, setKbType] = useState('builtin_kb')
   const [kbRoot, setKbRoot] = useState('./data/knowledge')
   const [runnerMode, setRunnerMode] = useState('dry_run')
+  const [apiBaseUrl, setApiBaseUrl] = useState('')
+  const [apiModel, setApiModel] = useState('')
+  const [apiKey, setApiKey] = useState('')
   const [cliCmd, setCliCmd] = useState('')
   const [cliArgs, setCliArgs] = useState('')
   const [autoApprove, setAutoApprove] = useState(false)
   const [workflowEnabled, setWorkflowEnabled] = useState(true)
+  const [scheduleEnabled, setScheduleEnabled] = useState(false)
 
   const loadAll = async () => {
     const [cRes, pRes] = await Promise.all([api.connectInfo(), api.listPolicies()])
@@ -67,12 +71,16 @@ export const ConnectPolicyPage: React.FC<Props> = ({ section, onGlobalRefresh })
     setKbType(cfg.knowledge_sink?.type || 'builtin_kb')
     setKbRoot(cfg.knowledge_sink?.root || './data/knowledge')
     setRunnerMode(cfg.runner?.mode || 'dry_run')
+    setApiBaseUrl(cfg.runner?.api?.base_url || '')
+    setApiModel(cfg.runner?.api?.model || '')
+    setApiKey(cfg.runner?.api?.api_key || '')
     setCliCmd(cfg.runner?.cli?.command || '')
     setCliArgs((cfg.runner?.cli?.args || []).join(' '))
     setAutoApprove(
       Boolean(cfg.workflow?.auto_approve_writes && cfg.safety_valves?.auto_approve_writes)
     )
     setWorkflowEnabled(cfg.safety_valves?.workflow_enabled !== false)
+    setScheduleEnabled(Boolean(cfg.workflow?.schedule_enabled))
   }
 
   useEffect(() => {
@@ -131,12 +139,18 @@ export const ConnectPolicyPage: React.FC<Props> = ({ section, onGlobalRefresh })
       },
       runner: {
         mode: runnerMode,
+        api: {
+          base_url: apiBaseUrl.trim(),
+          model: apiModel.trim(),
+          api_key: apiKey.trim(),
+        },
         cli: {
           command: cliCmd.trim(),
           args: cliArgs.trim() ? cliArgs.trim().split(/\s+/) : [],
         },
       },
       workflow: {
+        schedule_enabled: scheduleEnabled,
         auto_approve_writes: autoApprove,
       },
       safety_valves: {
@@ -481,7 +495,7 @@ export const ConnectPolicyPage: React.FC<Props> = ({ section, onGlobalRefresh })
         </section>
 
         <section className="card p-5 space-y-3">
-          <h2 className="text-[14.5px] font-bold text-ink">3. 后台执行大脑（本地 CLI / Dry-run）</h2>
+          <h2 className="text-[14.5px] font-bold text-ink">3. 后台执行大脑（OpenAI 兼容 API / 本地 CLI / Dry-run）</h2>
           <div>
             <label className="block text-ink-3 mb-1">执行模式</label>
             <select
@@ -489,34 +503,80 @@ export const ConnectPolicyPage: React.FC<Props> = ({ section, onGlobalRefresh })
               onChange={(e) => setRunnerMode(e.target.value)}
               className="field-input w-full px-3 py-2 text-[12.5px]"
             >
-              <option value="dry_run">Dry-run 零成本本地启发式模式</option>
+              <option value="api">OpenAI 兼容 API（可直连本地 Magpie 网关 / DeepSeek / Ollama）</option>
               <option value="cli">可配置本地 CLI 子进程模式（复用本机订阅额度）</option>
+              <option value="dry_run">Dry-run 零成本本地启发式模式</option>
             </select>
           </div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-            <div>
-              <label className="block text-ink-3 mb-1">CLI 可执行命令/路径</label>
-              <input
-                value={cliCmd}
-                onChange={(e) => setCliCmd(e.target.value)}
-                placeholder="如 claude / codex"
-                className="field-input mono w-full px-3 py-2 text-[12px]"
-              />
+          {runnerMode === 'api' && (
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              <div>
+                <label className="block text-ink-3 mb-1">Base URL</label>
+                <input
+                  value={apiBaseUrl}
+                  onChange={(e) => setApiBaseUrl(e.target.value)}
+                  placeholder="http://127.0.0.1:3425/v1"
+                  className="field-input mono w-full px-2.5 py-1.5 text-[12px]"
+                />
+              </div>
+              <div>
+                <label className="block text-ink-3 mb-1">Model / 路由组</label>
+                <input
+                  value={apiModel}
+                  onChange={(e) => setApiModel(e.target.value)}
+                  placeholder="group/cheap-first"
+                  className="field-input mono w-full px-2.5 py-1.5 text-[12px]"
+                />
+              </div>
+              <div>
+                <label className="block text-ink-3 mb-1">API Key</label>
+                <input
+                  type="password"
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  placeholder="magpie / sk-..."
+                  className="field-input mono w-full px-2.5 py-1.5 text-[12px]"
+                />
+              </div>
             </div>
-            <div>
-              <label className="block text-ink-3 mb-1">参数模板（支持 {'{prompt}'}）</label>
-              <input
-                value={cliArgs}
-                onChange={(e) => setCliArgs(e.target.value)}
-                placeholder="-p {prompt}"
-                className="field-input mono w-full px-3 py-2 text-[12px]"
-              />
+          )}
+          {runnerMode === 'cli' && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              <div>
+                <label className="block text-ink-3 mb-1">CLI 可执行命令/路径</label>
+                <input
+                  value={cliCmd}
+                  onChange={(e) => setCliCmd(e.target.value)}
+                  placeholder="如 claude / codex"
+                  className="field-input mono w-full px-3 py-2 text-[12px]"
+                />
+              </div>
+              <div>
+                <label className="block text-ink-3 mb-1">参数模板（支持 {'{prompt}'}）</label>
+                <input
+                  value={cliArgs}
+                  onChange={(e) => setCliArgs(e.target.value)}
+                  placeholder="-p {prompt}"
+                  className="field-input mono w-full px-3 py-2 text-[12px]"
+                />
+              </div>
             </div>
-          </div>
+          )}
         </section>
 
         <section className="card p-5 space-y-3">
-          <h2 className="text-[14.5px] font-bold text-ink">4. 显式安全阀（Safety Valves）</h2>
+          <h2 className="text-[14.5px] font-bold text-ink">4. 定时调度与安全阀（Safety Valves）</h2>
+          <label className="flex items-center justify-between p-3 rounded-[var(--radius-control)] bg-bg-sunk/70 border border-line-soft cursor-pointer">
+            <div>
+              <div className="font-medium text-ink">启用每日 20:00 自动定时运转（schedule_enabled）</div>
+              <div className="text-[11.5px] text-ink-4">到点自主跑 P00–P03，默认停在画布等你审批放行</div>
+            </div>
+            <input
+              type="checkbox"
+              checked={scheduleEnabled}
+              onChange={(e) => setScheduleEnabled(e.target.checked)}
+            />
+          </label>
           <label className="flex items-center justify-between p-3 rounded-[var(--radius-control)] bg-bg-sunk/70 border border-line-soft cursor-pointer">
             <div>
               <div className="font-medium text-ink">允许执行后台工作流（WORKFLOW_ENABLED）</div>

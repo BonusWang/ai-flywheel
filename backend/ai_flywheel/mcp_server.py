@@ -159,32 +159,27 @@ def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
 
     @mcp.tool()
     def flywheel_record_outcome(
-        status: str,
+        status: OutcomeStatus,
         summary: str,
-        checks: list[dict[str, Any]],
+        checks: list[OutcomeCheck],
         applied_rule_ids: list[str] | None = None,
         client: str = "generic",
         session_id: str = "",
         session_key: str = "",
         turn_id: str = "",
         preflight_receipt_id: str | None = None,
-        origin: str = "natural",
+        origin: OutcomeOrigin = OutcomeOrigin.NATURAL,
         artifacts: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Submit structured task verification outcome with hard gate validation to drive two-tier rule revalidation."""
-        parsed_checks: list[OutcomeCheck] = []
-        for raw in checks:
-            parsed_checks.append(
-                OutcomeCheck(
-                    name=str(raw.get("name", "unnamed-check")),
-                    result=CheckResult(str(raw.get("result", "unknown"))),
-                    kind=VerificationKind(str(raw.get("kind", "unknown"))),
-                    required=bool(raw.get("required", True)),
-                    evidence=[str(e) for e in raw.get("evidence", [])],
-                    rule_id=raw.get("rule_id"),
-                    note=str(raw.get("note", "")),
-                )
-            )
+        """Submit structured task verification outcome with submission-time hard gate checks.
+
+        Rules:
+        - status must be one of: success | partial | failed | unverified.
+        - Every item in checks requires: name, result (pass|fail|unknown|skipped), kind (real|test|static|unknown),
+          and non-empty evidence list whenever kind=='real' and result=='pass'.
+        - status=='success' requires all required checks to have result=='pass'.
+        - Every rule_id in applied_rule_ids must match one check with the same rule_id, result in {pass, fail}, and non-empty evidence. Pass [] if no rule was exercised.
+        """
         try:
             rec = runtime.receipts.record_outcome(
                 RecordOutcomeRequest(
@@ -193,10 +188,10 @@ def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
                     session_id=session_id,
                     turn_id=turn_id,
                     preflight_receipt_id=preflight_receipt_id,
-                    origin=OutcomeOrigin(origin),
-                    status=OutcomeStatus(status),
+                    origin=origin,
+                    status=status,
                     summary=summary,
-                    checks=parsed_checks,
+                    checks=checks,
                     applied_rule_ids=applied_rule_ids or [],
                     artifacts=artifacts or [],
                 )

@@ -92,9 +92,13 @@ class ThinHookProcessor:
             )
         )
         header = f"[ai-flywheel · receipt={resp.receipt_id} · mode={resp.anti_laziness_mode}]"
+        context_text = f"{header}\n{resp.compact_context}"
         return {
             "continue": True,
-            "additionalContext": f"{header}\n{resp.compact_context}",
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": context_text,
+            },
             "receipt_id": resp.receipt_id,
         }
 
@@ -161,7 +165,13 @@ class ThinHookProcessor:
                 )
 
         if warnings:
-            return {"continue": True, "additionalContext": "\n".join(warnings)}
+            return {
+                "continue": True,
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "additionalContext": "\n".join(warnings),
+                },
+            }
         return {"continue": True}
 
     def _handle_session_lifecycle(

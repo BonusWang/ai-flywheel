@@ -174,7 +174,8 @@ def test_thin_hooks_fail_open_and_retry_breaker(isolated_runtime: FlywheelRuntim
         },
     )
     assert res["continue"] is True
-    assert "[反偷懒·执行]" in res["additionalContext"]
+    assert res["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+    assert "[反偷懒·执行]" in res["hookSpecificOutput"]["additionalContext"]
 
     # Read-only tool stays silent
     ro = rt.hooks.handle(
@@ -183,7 +184,7 @@ def test_thin_hooks_fail_open_and_retry_breaker(isolated_runtime: FlywheelRuntim
     )
     assert ro == {"continue": True}
 
-    # Identical failing tool call alerts on attempt 3
+    # Identical failing tool call alerts on attempt 3 with hookSpecificOutput envelope
     payload = {
         "hook_event_name": "PreToolUse",
         "session_id": "s1",
@@ -191,10 +192,11 @@ def test_thin_hooks_fail_open_and_retry_breaker(isolated_runtime: FlywheelRuntim
         "tool_name": "Bash",
         "tool_input": "python -c 'bad'",
     }
-    assert "additionalContext" not in rt.hooks.handle("claude-code", payload)
-    assert "additionalContext" not in rt.hooks.handle("claude-code", payload)
+    assert "hookSpecificOutput" not in rt.hooks.handle("claude-code", payload)
+    assert "hookSpecificOutput" not in rt.hooks.handle("claude-code", payload)
     third = rt.hooks.handle("claude-code", payload)
-    assert "死循环保护" in third.get("additionalContext", "")
+    assert third["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+    assert "死循环保护" in third["hookSpecificOutput"]["additionalContext"]
     assert len(rt.db.list_retro_items()) == 1
 
 
@@ -256,7 +258,8 @@ async def test_mcp_tools_and_fastapi_endpoints(isolated_runtime: FlywheelRuntime
     rt = isolated_runtime
     # Direct MCP tool verification via official MCPServer
     tools = await rt.mcp.list_tools()
-    tool_names = {t.name for t in tools}
+    tool_map = {t.name: t for t in tools}
+    tool_names = set(tool_map.keys())
     assert {
         "flywheel_register_session",
         "flywheel_ingest_session",
@@ -265,6 +268,9 @@ async def test_mcp_tools_and_fastapi_endpoints(isolated_runtime: FlywheelRuntime
         "flywheel_record_outcome",
         "flywheel_status",
     }.issubset(tool_names)
+    # G-4 regression gate: record_outcome schema must expose strongly-typed OutcomeCheck definitions
+    outcome_schema = json.dumps(tool_map["flywheel_record_outcome"].input_schema)
+    assert "OutcomeCheck" in outcome_schema and "VerificationKind" in outcome_schema
 
     reg_res = await rt.mcp.call_tool(
         "flywheel_ingest_session",

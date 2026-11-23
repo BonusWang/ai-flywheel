@@ -53,8 +53,13 @@ workflow:
 
 # Background AI execution runner for P02/P03/P04
 runner:
-  # "dry_run" (zero cost heuristic/local preview) | "cli" (local CLI subprocess)
+  # "dry_run" (zero cost heuristic) | "api" (OpenAI-compatible HTTP / local gateway) | "cli" (local CLI subprocess)
   mode: "dry_run"
+  api:
+    base_url: ""
+    api_key: ""
+    model: ""
+    timeout_seconds: 120
   cli:
     # Example for local Codex / Claude CLI:
     # command: "claude"

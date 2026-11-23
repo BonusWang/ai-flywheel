@@ -7,6 +7,8 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
+
 from ai_flywheel.config import FlywheelConfig
 from ai_flywheel.models import PlannedWrite, RetroItem, RuleRecord, SessionRecord
 from ai_flywheel.storage.fs_store import ImmutableFileStore, canonical_hash
@@ -296,7 +298,124 @@ class CliSubprocessRunner(BaseWorkflowRunner):
         )
 
 
+class OpenAICompatibleRunner(BaseWorkflowRunner):
+    """OpenAI-compatible HTTP API runner (works with local Magpie gateway, OpenAI, DeepSeek, Ollama, etc.)."""
+
+    def __init__(self, cfg: FlywheelConfig, fs_store: ImmutableFileStore) -> None:
+        self.cfg = cfg
+        self.fs_store = fs_store
+        self.fallback = DryRunHeuristicRunner()
+
+    def _invoke_api(self, stage: str, prompt: str) -> dict[str, Any] | None:
+        api_cfg = self.cfg.runner.api
+        if not self.cfg.safety_valves.cli_execution_enabled or not api_cfg.base_url or not api_cfg.model:
+            return None
+
+        prompt_hash = canonical_hash(
+            {"stage": stage, "base_url": api_cfg.base_url, "model": api_cfg.model, "prompt": prompt}
+        )
+        cache_dir = self.fs_store.root / "api_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / f"{stage}-{prompt_hash[:16]}.json"
+        if cache_file.exists():
+            try:
+                return json.loads(cache_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        endpoint = api_cfg.base_url.rstrip("/")
+        if not endpoint.endswith("/chat/completions"):
+            endpoint = f"{endpoint}/chat/completions"
+
+        headers = {"Content-Type": "application/json", **api_cfg.extra_headers}
+        if api_cfg.api_key:
+            headers.setdefault("Authorization", f"Bearer {api_cfg.api_key}")
+
+        resp = httpx.post(
+            endpoint,
+            headers=headers,
+            json={
+                "model": api_cfg.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are an AI Flywheel workflow worker. Return strictly valid JSON with no markdown prose outside JSON.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.1,
+            },
+            timeout=api_cfg.timeout_seconds,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        parsed = _extract_json_block(content if isinstance(content, str) else json.dumps(content))
+        if parsed is not None:
+            cache_file.write_text(json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8")
+        return parsed
+
+    def review_sessions(
+        self,
+        sessions: list[tuple[SessionRecord, str]],
+        open_retros: list[RetroItem],
+    ) -> dict[str, Any]:
+        payload = [
+            {"session_key": s.session_key, "client": s.client, "project": s.project, "title": s.title, "text": t[:6000]}
+            for s, t in sessions
+        ]
+        prompt = (
+            "You are the P02 Review Worker of AI Flywheel. Analyze the sessions and return STRICT JSON: "
+            '{"findings":[{"session_key":"...","client":"...","project":"...","title":"...",'
+            '"facts":["..."],"anomalies":["..."],"tags":["..."],"suggest_rule":true}]}.\n\n'
+            + json.dumps(payload, ensure_ascii=False)
+        )
+        parsed = self._invoke_api("p02_review", prompt)
+        if parsed and isinstance(parsed.get("findings"), list):
+            parsed["runner"] = f"api:{self.cfg.runner.api.model}"
+            parsed["sessions_reviewed"] = len(parsed["findings"])
+            return parsed
+        res = self.fallback.review_sessions(sessions, open_retros)
+        res["runner"] = f"api_fallback_dry_run:{self.cfg.runner.api.model or 'unconfigured'}"
+        return res
+
+    def plan_writes(
+        self,
+        review_findings: dict[str, Any],
+        existing_rules: list[RuleRecord],
+        max_write_set: int,
+        default_doc_prefix: str = "lessons/",
+    ) -> list[PlannedWrite]:
+        existing_summary = [{"rule_id": r.rule_id, "title": r.title, "status": r.status.value} for r in existing_rules]
+        prompt = (
+            "You are the P03 Route & Write-Plan Worker of AI Flywheel. Deduplicate against existing_rules and return STRICT JSON: "
+            f'{{"planned_writes":[{{"target_kind":"knowledge_doc|flywheel_rule","relative_path":"{default_doc_prefix}....md or null",'
+            '"action":"create|update|register_rule","title":"...","summary":"...","content_preview":"...",'
+            '"rule_payload":null,"source_session_keys":["..."]}]}. '
+            f"Max items: {max_write_set}.\n\n"
+            + json.dumps({"findings": review_findings.get("findings", []), "existing_rules": existing_summary}, ensure_ascii=False)
+        )
+        parsed = self._invoke_api("p03_plan", prompt)
+        if parsed and isinstance(parsed.get("planned_writes"), list):
+            out: list[PlannedWrite] = []
+            for item in parsed["planned_writes"][:max_write_set]:
+                try:
+                    out.append(PlannedWrite.model_validate(item))
+                except Exception:
+                    continue
+            if out:
+                return out
+        return self.fallback.plan_writes(
+            review_findings,
+            existing_rules,
+            max_write_set,
+            default_doc_prefix=default_doc_prefix,
+        )
+
+
 def build_runner(cfg: FlywheelConfig, fs_store: ImmutableFileStore) -> BaseWorkflowRunner:
+    if cfg.runner.mode == "api" and cfg.runner.api.base_url and cfg.runner.api.model and cfg.safety_valves.cli_execution_enabled:
+        return OpenAICompatibleRunner(cfg, fs_store)
     if cfg.runner.mode == "cli" and cfg.runner.cli.command and cfg.safety_valves.cli_execution_enabled:
         return CliSubprocessRunner(cfg, fs_store)
     return DryRunHeuristicRunner()
