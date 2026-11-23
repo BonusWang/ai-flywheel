@@ -1,0 +1,31 @@
+# Hard Gates & Observational Guardrails
+policy_id: "hard_gates"
+name: "执行硬门禁与复盘触发规则"
+version: "1.0.0"
+enabled: true
+description: "控制死循环告警阈值、Write-Set 上限、提交期回执校验与高危操作观察规则。"
+
+retry_breaker:
+  enabled: true
+  max_same_cause_retries: 2
+  alert_at_attempt: 3
+  mode: "warning_only" # Always fail-open, never hard-block tool calls
+
+high_risk_patterns:
+  - "rm -rf"
+  - "git push --force"
+  - "git reset --hard"
+  - "DROP TABLE"
+  - "TRUNCATE TABLE"
+  - "DELETE FROM"
+  - "kubectl delete"
+
+outcome_gate:
+  require_evidence_for_applied_rules: true
+  reject_static_as_real: true
+  allow_empty_applied_rules: true
+
+write_set:
+  max_files_per_run: 8
+  require_readback_verify: true
+  default_require_approval: true

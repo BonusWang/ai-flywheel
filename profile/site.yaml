@@ -1,0 +1,51 @@
+# Replicable personal portal branding & copy (inspired by AIHOT industry/site.ts)
+brand:
+  name: "AI Flywheel"
+  tagline: "Evidence-Driven AI Collaboration Operating System"
+  motto: "以目标开局，以证据执行，以复盘提炼，以沉淀复用，以再验证迭代"
+  subtitle: "正确执行 → 证实结果 → 提炼规律 → 改变下次行为"
+  owner_display: "Personal Flywheel Portal"
+  mcp_prefix: "flywheel"
+  version: "0.1.0"
+
+loop_steps:
+  - step: 1
+    key: "goal_boundary"
+    title: "目标与边界"
+    short: "明确目标、禁区与权威源"
+    phase: "frontstage"
+  - step: 2
+    key: "context_activation"
+    title: "上下文激活"
+    short: "加载策略、先例与禁用路线"
+    phase: "frontstage"
+  - step: 3
+    key: "execution"
+    title: "证据执行"
+    short: "拆解任务、过程观测、防死循环"
+    phase: "frontstage"
+  - step: 4
+    key: "verification"
+    title: "真实验证"
+    short: "区分真实/测试/静态/未验证"
+    phase: "frontstage"
+  - step: 5
+    key: "review"
+    title: "事实回顾"
+    short: "独立盘点多事件事实、防漏项"
+    phase: "backstage"
+  - step: 6
+    key: "retrospective"
+    title: "根因复盘"
+    short: "分析异常根因与机制缺口"
+    phase: "backstage"
+  - step: 7
+    key: "sedimentation"
+    title: "受控沉淀"
+    short: "落入正确载体并回读验收"
+    phase: "backstage"
+  - step: 8
+    key: "iterative_activation"
+    title: "迭代激活"
+    short: "下次任务命中并再验证晋升"
+    phase: "backstage"

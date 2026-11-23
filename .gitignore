@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Local runtime config & private data (never commit personal overrides or local DB)
+flywheel.yaml
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# OS & Editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

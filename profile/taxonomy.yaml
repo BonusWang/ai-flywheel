@@ -1,0 +1,44 @@
+# Controlled taxonomy for routing, domains, and priority tiers
+schema_version: 1
+
+priorities:
+  - id: "P0_CORE"
+    label: "核心业务/交付"
+    weight: 100
+  - id: "P1_SIGNAL"
+    label: "含异常/复盘信号"
+    weight: 80
+  - id: "P1_GENERAL"
+    label: "常规协作会话"
+    weight: 50
+  - id: "P2_META"
+    label: "工具/元配置调试"
+    weight: 20
+
+domains:
+  - id: "engineering"
+    label: "软件工程与调试"
+    keywords: ["bug", "fix", "deploy", "build", "test", "sql", "api", "refactor", "调试", "构建", "部署", "测试"]
+  - id: "workflow-ops"
+    label: "工作流与自动化"
+    keywords: ["workflow", "pipeline", "ci", "hook", "mcp", "cron", "自动化", "流水线", "飞轮"]
+  - id: "architecture"
+    label: "架构与产品设计"
+    keywords: ["architecture", "design", "spec", "schema", "架构", "设计", "规划", "方案"]
+  - id: "knowledge"
+    label: "知识沉淀与写作"
+    keywords: ["wiki", "doc", "note", "retro", "summary", "复盘", "沉淀", "总结", "文档"]
+  - id: "general"
+    label: "通用协作"
+    keywords: []
+
+sediment_targets:
+  - id: "knowledge_doc"
+    label: "知识库文档 / 经验卡"
+    description: "领域规则、架构决策、排查实战、可复用知识"
+  - id: "flywheel_rule"
+    label: "飞轮活跃规则"
+    description: "可自动触发的必查清单、禁用路线与行为防线"
+  - id: "skill_improvement"
+    label: "Skill / Agent 改进提案"
+    description: "重复工作流缺陷或角色指令优化"

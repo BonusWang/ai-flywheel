@@ -1,0 +1,19 @@
+# 8-Step Collaboration Loop & Verification Taxonomy Policy
+policy_id: "loop_contract"
+name: "8 步协作闭环与验证标准"
+version: "1.0.0"
+enabled: true
+description: "定义回顾、复盘、沉淀、优化、迭代的清晰边界与任务验证分级标准。"
+
+concept_boundaries:
+  review: "回顾是盘点事实：做了什么、交付了什么、漏了什么"
+  retrospective: "复盘是分析原因：为什么错、为什么返工、机制缺口在哪里"
+  sedimentation: "沉淀是知识入库：权威落点、查重、write-set、回读验证"
+  optimization: "优化是改机制或产物：改规则、Skill、流程、代码或配置"
+  iteration: "迭代是用真实任务再验证：确认旧知识仍有效，复发即降级修订"
+
+verification_kinds:
+  real: "真实运行观测（真实命令、真实接口/MCP 调用、真实浏览器验证）"
+  test: "自动化单元测试或回放用例通过"
+  static: "仅静态代码阅读、类型检查或逻辑推演（不能冒充 real）"
+  unknown: "未观测或缺少证据，必须如实暴露"

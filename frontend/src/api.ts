@@ -1,0 +1,121 @@
+import type {
+  ConnectPayload,
+  KnowledgeDocSummary,
+  OverviewResponse,
+  PreflightResponse,
+  RetroItem,
+  RuleRecord,
+  SessionRecord,
+  WorkflowRunRecord,
+} from './types'
+
+async function req<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, {
+    headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
+    ...init,
+  })
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`
+    try {
+      const data = await res.json()
+      msg = data.detail || data.error || msg
+    } catch {
+      // ignore
+    }
+    throw new Error(msg)
+  }
+  return res.json() as Promise<T>
+}
+
+export const api = {
+  overview: () => req<OverviewResponse>('/api/site/overview'),
+  seed: () => req<Record<string, number>>('/api/site/seed', { method: 'POST' }),
+  preflight: (body: { task: string; project?: string; client?: string }) =>
+    req<PreflightResponse>('/api/site/preflight', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  listRuns: () =>
+    req<{ runs: WorkflowRunRecord[]; lock: { run_id: string; acquired_at: string } | null }>(
+      '/api/site/runs'
+    ),
+  startRun: (body: { phase?: string; auto_approve?: boolean | null }) =>
+    req<{ run: WorkflowRunRecord }>('/api/site/runs', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  approveRun: (runId: string, approvedIndices?: number[]) =>
+    req<{ run: WorkflowRunRecord }>(`/api/site/runs/${runId}/approve`, {
+      method: 'POST',
+      body: JSON.stringify({ approved_indices: approvedIndices ?? null }),
+    }),
+  rejectRun: (runId: string, reason?: string) =>
+    req<{ run: WorkflowRunRecord }>(`/api/site/runs/${runId}/reject`, {
+      method: 'POST',
+      body: JSON.stringify({ reason: reason || '用户在画布中取消放行' }),
+    }),
+
+  listSessions: () => req<{ sessions: SessionRecord[] }>('/api/site/sessions'),
+  registerSession: (body: {
+    client: string
+    session_id: string
+    title: string
+    project: string
+    summary: string
+    content?: string
+    tags?: string[]
+  }) =>
+    req<{ session: SessionRecord }>('/api/site/sessions', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  listRules: () => req<{ rules: RuleRecord[] }>('/api/site/rules'),
+  createRule: (body: {
+    title: string
+    domain: string
+    triggers: string[]
+    checklist: string[]
+    forbidden_routes: string[]
+  }) =>
+    req<{ rule: RuleRecord }>('/api/site/rules', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  transitionRule: (ruleId: string, status: RuleRecord['status'], note = '') =>
+    req<{ rule: RuleRecord }>(`/api/site/rules/${ruleId}/transition`, {
+      method: 'POST',
+      body: JSON.stringify({ status, note }),
+    }),
+
+  listRetro: () => req<{ items: RetroItem[] }>('/api/site/retro'),
+  updateRetroStatus: (retroId: string, status: RetroItem['status']) =>
+    req<{ item: RetroItem }>(`/api/site/retro/${retroId}/status`, {
+      method: 'POST',
+      body: JSON.stringify({ status }),
+    }),
+
+  listPolicies: () => req<{ policies: Record<string, any> }>('/api/site/policies'),
+  updatePolicy: (policyId: string, patch: Record<string, any>) =>
+    req<{ policy: any }>(`/api/site/policies/${policyId}`, {
+      method: 'PUT',
+      body: JSON.stringify(patch),
+    }),
+  resetPolicy: (policyId: string) =>
+    req<{ policy: any }>(`/api/site/policies/${policyId}/reset`, { method: 'POST' }),
+
+  connectInfo: () => req<ConnectPayload>('/api/site/connect'),
+  updateConfig: (patch: Record<string, any>) =>
+    req<{ config: Record<string, any> }>('/api/site/config', {
+      method: 'PUT',
+      body: JSON.stringify(patch),
+    }),
+
+  listKnowledge: () =>
+    req<{ sink_type: string; root: string; documents: KnowledgeDocSummary[] }>('/api/site/knowledge'),
+  readKnowledgeDoc: (path: string) =>
+    req<{ doc_path: string; content: string; sha256: string }>(
+      `/api/site/knowledge/doc?path=${encodeURIComponent(path)}`
+    ),
+}

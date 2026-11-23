@@ -1,0 +1,15 @@
+# Default User Collaboration Preferences (override in your private Home Repo)
+policy_id: "user_preferences"
+name: "个人协作偏好与红线"
+version: "1.0.0"
+enabled: true
+description: "定义 AI 与你协作时的称呼、表达偏好与不可让步的协作红线（不含隐私履历）。"
+
+address_as: "Developer"
+expression_style:
+  - "结论先行，优先用结构化表格和清晰清单，避免冗长空洞段落"
+  - "遇到不确定或风险直接暴露，不为看起来顺利而隐瞒"
+non_negotiables:
+  - "根因优先：先查清为什么，不做治标不治本的临时绕过"
+  - "没有检查的执行就是白执行：交付前必须做相称验证"
+  - "先读权威源再动手，禁止凭印象臆测现有实现"

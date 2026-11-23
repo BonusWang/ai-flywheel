@@ -1,0 +1,84 @@
+# AI Flywheel local configuration template
+# Copy to `flywheel.yaml` (gitignored) to customize without modifying the repo.
+
+server:
+  host: "127.0.0.1"
+  port: 8765
+  data_dir: "./data"
+
+profile:
+  # Default bundled profile (replicable open-source defaults)
+  default_dir: "./profile"
+  # Optional personal override pack (e.g. from your private Home Repo)
+  # override_dir: "E:/github/ai-home/flywheel-profile"
+  override_dir: null
+
+# Optional local directories for read-only Skill/Agent probing & P04 approved improvements
+capabilities:
+  skills_dirs: []
+  agents_dirs: []
+
+# Pluggable session sources for P00 reconcile scan (in addition to MCP push)
+sessions:
+  scan_sources: []
+  # Example:
+  # - client: "codex"
+  #   path: "~/.codex/sessions"
+  #   glob: "**/*.jsonl"
+  # - client: "claude-code"
+  #   path: "~/.claude/projects"
+  #   glob: "**/*.jsonl"
+
+# Pluggable knowledge sink (decoupled from flywheel policies)
+knowledge_sink:
+  # "builtin_kb" writes to ./data/knowledge (zero config)
+  # "local_markdown_wiki" mounts any local Markdown / Obsidian / Wiki folder
+  type: "builtin_kb"
+  root: "./data/knowledge"
+  allowed_write_prefixes:
+    - "lessons/"
+    - "topics/"
+    - "projects/"
+  max_write_set: 8
+
+# Autonomous workflow P00-P07 execution engine
+workflow:
+  schedule_enabled: false
+  daily_cron: "0 20 * * *"
+  weekly_exception_cron: "0 20 * * 5"
+  # Default safe mode: pause after P03 for Diff/rule preview approval in Web UI
+  auto_approve_writes: false
+  max_sessions_per_run: 10
+  max_chars_per_run: 180000
+
+# Background AI execution runner for P02/P03/P04
+runner:
+  # "dry_run" (zero cost heuristic/local preview) | "cli" (local CLI subprocess)
+  mode: "dry_run"
+  cli:
+    # Example for local Codex / Claude CLI:
+    # command: "claude"
+    # args: ["-p", "{prompt}", "--output-format", "json"]
+    command: ""
+    args: []
+    timeout_seconds: 180
+    working_dir: null
+
+# Delivery adapters after P06 report
+delivery:
+  local_portal: true
+  git_closure:
+    enabled: false
+    remote: "origin"
+    branch: "main"
+  webhook:
+    enabled: false
+    url: ""
+
+# Explicit safety valves (inspired by AIHOT): control external actions without changing state machine logic
+safety_valves:
+  workflow_enabled: true
+  cli_execution_enabled: true
+  auto_approve_writes: false
+  git_closure_enabled: false
+  public_export_strip_paths: true
