@@ -7,12 +7,7 @@ from ai_flywheel.config import FlywheelConfig
 
 
 def _thin_hook_cmd(base_url: str, client: str) -> str:
-    return (
-        'python -c "import sys,urllib.request; '
-        f"req=urllib.request.Request('{base_url}/api/hooks/{client}',"
-        "data=sys.stdin.read().encode('utf-8'),headers={'Content-Type':'application/json'}); "
-        'print(urllib.request.urlopen(req,timeout=5).read().decode(\'utf-8\'))"'
-    )
+    return f"flywheel hook-forward {client} --url {base_url}"
 
 
 def build_client_connect_guides(cfg: FlywheelConfig) -> dict[str, Any]:

@@ -23,7 +23,7 @@ from ai_flywheel.storage.seed import seed_demo_data
 class FlywheelRuntime:
     """Single dependency container wiring all decoupled engines, adapters, MCP, and APIs."""
 
-    def __init__(self, cfg: FlywheelConfig) -> None:
+    def __init__(self, cfg: FlywheelConfig, *, skip_fts_sync: bool = False) -> None:
         self.cfg = cfg
         self.db = FlywheelDB(cfg.db_path)
         self.fs_store = ImmutableFileStore(cfg.receipts_dir)
@@ -48,8 +48,9 @@ class FlywheelRuntime:
         self.hooks = ThinHookProcessor(self)
         self.publication = PublicationLayer(cfg, self.db, self.policies, self.activation)
         self.mcp = build_mcp_server(self)
-        # Ensure initial FTS index is synced with knowledge directory
-        self.knowledge.sync_fts_index()
+        # Ensure initial FTS index is synced with knowledge directory (skip in fast stdio mode)
+        if not skip_fts_sync:
+            self.knowledge.sync_fts_index()
 
     @classmethod
     def create(
@@ -57,9 +58,10 @@ class FlywheelRuntime:
         config_path: str | Path | None = None,
         base_dir: str | Path | None = None,
         auto_seed: bool = False,
+        skip_fts_sync: bool = False,
     ) -> FlywheelRuntime:
         cfg = load_config(config_path=config_path, base_dir=base_dir)
-        rt = cls(cfg)
+        rt = cls(cfg, skip_fts_sync=skip_fts_sync)
         if auto_seed:
             seed_demo_data(rt.cfg, rt.db, rt.activation, rt.receipts)
         return rt

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import urllib.request
 from pathlib import Path
 
 import uvicorn
@@ -34,7 +35,26 @@ def main(argv: list[str] | None = None) -> int:
     p_export = sub.add_parser("export-public", help="Export desensitized public showcase JSON snapshot")
     p_export.add_argument("--output", default="public-snapshot.json")
 
+    p_hook = sub.add_parser("hook-forward", help="Thin fail-open hook forwarder reading stdin JSON")
+    p_hook.add_argument("client", help="Client name, e.g. codex or claude-code")
+    p_hook.add_argument("--url", default="http://127.0.0.1:8765", help="Base URL of running ai-flywheel server")
+
     args = parser.parse_args(argv)
+
+    if args.command == "hook-forward":
+        raw = sys.stdin.read()
+        endpoint = f"{args.url.rstrip('/')}/api/hooks/{args.client}"
+        try:
+            req = urllib.request.Request(
+                endpoint,
+                data=raw.encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                sys.stdout.write(resp.read().decode("utf-8"))
+        except Exception:
+            sys.stdout.write('{"continue": true}')
+        return 0
 
     if args.command == "serve":
         rt = FlywheelRuntime.create(
@@ -50,7 +70,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "mcp-stdio":
-        rt = FlywheelRuntime.create(config_path=args.config, base_dir=args.base_dir)
+        rt = FlywheelRuntime.create(
+            config_path=args.config,
+            base_dir=args.base_dir,
+            skip_fts_sync=True,
+        )
         rt.mcp.run(transport="stdio")
         return 0
 
