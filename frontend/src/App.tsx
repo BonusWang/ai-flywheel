@@ -102,8 +102,8 @@ export function App() {
 
   return (
     <div className="min-h-dvh flex bg-bg text-ink">
-      {/* Desktop Sticky Left Sidebar (AIHOT 180px signature shell) */}
-      <aside className="sticky top-0 hidden h-dvh w-[184px] shrink-0 flex-col border-r border-line bg-sidebar px-3 pb-3.5 pt-6 lg:flex">
+      {/* Desktop Sticky Left Sidebar (AIHOT editorial shell) */}
+      <aside className="sticky top-0 hidden h-dvh w-[204px] shrink-0 flex-col border-r border-line bg-sidebar px-3 pb-3.5 pt-6 lg:flex">
         <button
           type="button"
           onClick={() => setPage('home')}
@@ -112,7 +112,7 @@ export function App() {
           <span className="flex size-7 shrink-0 items-center justify-center rounded-[var(--radius-control)] bg-accent text-accent-contrast">
             <RefreshCw className="w-3.5 h-3.5" />
           </span>
-          <span className="min-w-0 truncate text-[15px] font-bold tracking-tight">
+          <span className="min-w-0 truncate text-[14px] font-bold tracking-tight">
             {brandName}
           </span>
         </button>

@@ -43,9 +43,8 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate, onRefresh }) =
       .catch(() => {})
   }, [overview?.metrics.workflow_runs_total])
 
-  const runPreflightTest = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!prompt.trim()) return
+  const executePreflight = async () => {
+    if (!prompt.trim() || pfLoading) return
     setPfLoading(true)
     try {
       const res = await api.preflight({
@@ -58,6 +57,11 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate, onRefresh }) =
     } finally {
       setPfLoading(false)
     }
+  }
+
+  const runPreflightTest = async (e: React.FormEvent) => {
+    e.preventDefault()
+    await executePreflight()
   }
 
   const openDoc = async (path: string) => {
@@ -108,7 +112,8 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate, onRefresh }) =
             className="field-input w-full px-2.5 py-1.5 text-[12px]"
           />
           <button
-            type="submit"
+            type="button"
+            onClick={executePreflight}
             disabled={pfLoading}
             className="w-full py-2 rounded-[var(--radius-control)] bg-accent text-accent-contrast text-[12.5px] font-medium hover:bg-accent-ink disabled:opacity-50 transition-colors"
           >
