@@ -510,3 +510,67 @@ def test_two_level_session_triage_filters_temp_chats_and_keeps_project_or_deep_k
     assert run.status == RunStatus.PASS
     assert len(run.planned_writes) == 0
     assert rt.db.get_session("claude:translate-01").status == SessionStatus.ARCHIVED
+
+
+def test_wiki_gate_normalizes_generic_p03_doc_into_valid_t5_practice_card(tmp_path: Path):
+    wiki_root = tmp_path / "wiki"
+    practice_dir = wiki_root / "wiki-知识库" / "projects-项目" / "demo-project" / "实战笔记"
+    practice_dir.mkdir(parents=True)
+    (practice_dir / "笔记索引.md").write_text(
+        "---\ntitle: Demo 索引\ntype: project-practice-index\nproject_id: demo-proj\ncreated: 2026-11-23\nupdated: 2026-11-23\nstatus: active\n---\n\n# Demo 索引\n",
+        encoding="utf-8",
+    )
+    (wiki_root / ".wiki-schema.md").write_text(
+        """---
+title: Wiki Schema
+description: Test schema
+type: protocol
+created: 2026-11-01
+updated: 2026-11-23
+status: active
+core_contract:
+  version: "2.1"
+  core_files: [.wiki-schema.md]
+  required_fields: [title, description, type, created, updated]
+partition_contract:
+  version: "1.0"
+  partitions:
+    projects:
+      root: wiki-知识库/projects-项目
+content_contract:
+  version: "1.4.1"
+  page_types:
+    project-practice-note:
+      partition: projects
+      required_fields: [title, description, type, project_id, record_id, event_date, load_policy, default_load, created, updated, status]
+      path_pattern: "^[^/]+/实战笔记/[^/]+\\\\.md$"
+      allowed_status: [active, deprecated, archived]
+---
+# Schema
+""",
+        encoding="utf-8",
+    )
+    cfg = FlywheelConfig(base_dir=tmp_path)
+    cfg.knowledge_sink.type = "local_markdown_wiki"
+    cfg.knowledge_sink.root = str(wiki_root)
+    cfg.knowledge_sink.wiki_gate_enabled = True
+    cfg.knowledge_sink.wiki_gate_require_scripts = False
+
+    from ai_flywheel.adapters.wiki_gate import WikiGate
+
+    gate = WikiGate(cfg)
+    raw_content = "---\ntitle: 网关超时排查\ntags: [gateway, timeout]\n---\n\n# 网关超时排查\n- 修复连接池超时。\n"
+    norm_rel, norm_md = gate.normalize_planned_document(
+        "wiki-知识库/projects-项目/2026-11-23-网关超时排查.md",
+        "网关超时排查",
+        "修复连接池超时导致请求失败",
+        raw_content,
+        source_sessions=["codex:s1"],
+        project_hint="demo-project",
+    )
+    assert norm_rel.startswith("wiki-知识库/projects-项目/demo-project/实战笔记/")
+    res = gate.validate_document(norm_rel, norm_md)
+    assert res.ok is True, f"Unexpected WikiGate issues: {res.issues}"
+    assert res.page_type == "project-practice-note"
+    assert "适用前提与失效条件" in norm_md
+    assert "分歧与反例" in norm_md

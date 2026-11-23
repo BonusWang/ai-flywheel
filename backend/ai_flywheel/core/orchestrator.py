@@ -503,6 +503,32 @@ class WorkflowOrchestrator:
                 existing_skills=existing_skills,
                 phase=resolved_phase,
             )
+            # If a schema-governed Wiki is mounted, normalize knowledge_doc writes to pass WikiGate cleanly
+            if self.knowledge.wiki_gate.applicable:
+                used_norm_paths: set[str] = set()
+                sess_by_key = {s.session_key: s for s, _ in admitted}
+                for w in planned_writes:
+                    if w.target_kind != "knowledge_doc":
+                        continue
+                    hint_parts = []
+                    for sk in w.source_session_keys:
+                        sr = sess_by_key.get(sk)
+                        if sr:
+                            hint_parts.extend([sr.project, sr.workspace])
+                    new_rel, new_md = self.knowledge.wiki_gate.normalize_planned_document(
+                        w.relative_path,
+                        w.title,
+                        w.summary,
+                        w.content_preview,
+                        source_sessions=w.source_session_keys,
+                        project_hint=" ".join(hint_parts),
+                    )
+                    if new_rel in used_norm_paths:
+                        stem = new_rel[:-3] if new_rel.endswith(".md") else new_rel
+                        new_rel = f"{stem}-{len(used_norm_paths) + 1}.md"
+                    used_norm_paths.add(new_rel)
+                    w.relative_path = new_rel
+                    w.content_preview = new_md
             run.planned_writes = planned_writes
             skill_plans = sum(1 for w in planned_writes if w.target_kind == "skill_improvement")
             self._finish_node(
@@ -694,9 +720,19 @@ class WorkflowOrchestrator:
             write_receipts: list[dict[str, Any]] = []
             for item in approved_items:
                 if item.target_kind == "knowledge_doc" and item.relative_path:
+                    rel_to_write = item.relative_path
+                    content_to_write = item.content_preview
+                    if self.knowledge.wiki_gate.applicable:
+                        rel_to_write, content_to_write = self.knowledge.wiki_gate.normalize_planned_document(
+                            rel_to_write,
+                            item.title,
+                            item.summary,
+                            content_to_write,
+                            source_sessions=item.source_session_keys,
+                        )
                     res = self.knowledge.write_document_verified(
-                        item.relative_path,
-                        item.content_preview,
+                        rel_to_write,
+                        content_to_write,
                         action=item.action,
                     )
                     written_paths.append(res["relative_path"])

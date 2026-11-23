@@ -448,6 +448,179 @@ class WikiGate:
         result.checks.append("body_skeleton")
         return result
 
+    def _discover_practice_projects(self, projects_root: Path) -> list[dict[str, str]]:
+        """Dynamically inspect mounted Wiki project dirs that host a 实战笔记/ folder (zero hardcoded names)."""
+        if not projects_root.is_dir():
+            return []
+        found: list[dict[str, str]] = []
+        for child in sorted(projects_root.iterdir()):
+            if not child.is_dir() or child.name.startswith(".") or child.name.startswith("archive-"):
+                continue
+            practice_dir = child / "实战笔记"
+            if not practice_dir.is_dir():
+                continue
+            project_id = child.name
+            index_file = practice_dir / "笔记索引.md"
+            if index_file.is_file():
+                fm_text, _ = split_frontmatter(index_file.read_text(encoding="utf-8", errors="ignore"))
+                if fm_text:
+                    try:
+                        fm = yaml.safe_load(fm_text) or {}
+                        if isinstance(fm, dict) and fm.get("project_id"):
+                            project_id = str(fm["project_id"]).strip()
+                    except yaml.YAMLError:
+                        pass
+            found.append({"dir_name": child.name, "project_id": project_id})
+        return found
+
+    def normalize_planned_document(
+        self,
+        relative_path: str | None,
+        title: str,
+        summary: str,
+        content: str,
+        *,
+        source_sessions: list[str] | None = None,
+        project_hint: str = "",
+    ) -> tuple[str, str]:
+        """Adapt a generic P03 knowledge_doc into a schema-compliant Wiki page (T5 project-practice-note) when WikiGate applies."""
+        rel = self._normalize(relative_path or "")
+        if not self.applicable:
+            return rel, content
+        try:
+            schema = self._load_schema()
+        except Exception:
+            return rel, content
+
+        # If already valid against the mounted schema, keep as-is
+        if rel and self.validate_document(rel, content).ok:
+            return rel, content
+
+        partition_contract = schema.get("partition_contract") or {}
+        partitions = partition_contract.get("partitions") or {}
+        projects_root_rel = str((partitions.get("projects") or {}).get("root") or "wiki-知识库/projects-项目").strip("/")
+        projects_root = self.root / projects_root_rel
+        candidates = self._discover_practice_projects(projects_root)
+
+        haystack = f"{project_hint} {rel} {title} {summary} {content[:600]}".lower()
+        chosen = None
+        for cand in candidates:
+            tokens = [cand["dir_name"].lower(), cand["project_id"].lower()]
+            tokens.extend(seg.lower() for seg in re.split(r"[-_\s]+", cand["dir_name"]) if len(seg) >= 2)
+            if any(tok and tok in haystack for tok in tokens):
+                chosen = cand
+                break
+        if chosen is None and candidates:
+            # Prefer a general/sedimentation/knowledge practice directory if present, else first available
+            chosen = next(
+                (c for c in candidates if any(k in c["dir_name"].lower() for k in ("沉淀", "flywheel", "general", "ai"))),
+                candidates[0],
+            )
+        dir_name = chosen["dir_name"] if chosen else "general"
+        project_id = chosen["project_id"] if chosen else "general"
+
+        today_str = date.today().isoformat()
+        clean_title = re.sub(r"[\r\n]+", " ", (title or "协作实战经验卡")).strip()[:64] or "协作实战经验卡"
+        file_slug = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff]+", "-", clean_title).strip("-").lower()[:40] or "practice-note"
+        rec_slug = re.sub(r"[^a-z0-9]+", "-", clean_title.lower()).strip("-")[:24]
+        if len(rec_slug) < 3:
+            rec_slug = hashlib.sha1(clean_title.encode("utf-8")).hexdigest()[:10]
+        record_id = f"{today_str}-{rec_slug}"
+        target_rel = f"{projects_root_rel}/{dir_name}/实战笔记/{today_str}-{file_slug}.md"
+
+        # Parse any existing frontmatter tags & body facts from the draft content
+        fm_text, raw_body = split_frontmatter(content or "")
+        draft_fm: dict[str, Any] = {}
+        if fm_text:
+            try:
+                loaded = yaml.safe_load(fm_text)
+                if isinstance(loaded, dict):
+                    draft_fm = loaded
+            except yaml.YAMLError:
+                draft_fm = {}
+        raw_tags = draft_fm.get("tags")
+        tags: list[str] = []
+        if isinstance(raw_tags, list):
+            tags = [str(t).strip() for t in raw_tags if str(t).strip()][:6]
+        elif isinstance(raw_tags, str) and raw_tags.strip():
+            tags = [t.strip() for t in re.split(r"[,，\s]+", raw_tags) if t.strip()][:6]
+        if not tags:
+            tags = ["实战复盘", "协作飞轮"]
+
+        desc_raw = re.sub(r"[\r\n]+", " ", (summary or clean_title)).strip()
+        description = desc_raw[:MAX_DESCRIPTION_CHARS]
+
+        # Extract concise non-heading content lines from raw_body so no LLM insight is lost
+        body_bullets: list[str] = []
+        for line in (raw_body or "").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#") or s.startswith("---"):
+                continue
+            s = s.lstrip("-*• ").strip()
+            if s and s not in body_bullets:
+                body_bullets.append(s[:180])
+            if len(body_bullets) >= 8:
+                break
+        if not body_bullets:
+            body_bullets = [description]
+
+        sources_list = [f"ai-flywheel session: {sk}" for sk in (source_sessions or []) if sk][:5]
+        if not sources_list:
+            sources_list = [f"ai-flywheel batch {today_str}"]
+
+        fm_obj = {
+            "title": clean_title,
+            "description": description,
+            "type": "project-practice-note",
+            "project_id": project_id,
+            "record_id": record_id,
+            "event_date": today_str,
+            "load_policy": "on_demand",
+            "default_load": False,
+            "created": today_str,
+            "updated": today_str,
+            "status": "active",
+            "tags": tags[:MAX_TAGS],
+            "sources": sources_list,
+        }
+        fm_yaml = yaml.safe_dump(fm_obj, allow_unicode=True, sort_keys=False).strip()
+
+        good_flow_lines = [f"- {b}" for b in body_bullets[:3]]
+        key_lines = [f"- {b}" for b in body_bullets[3:6]]
+        key_lines.extend(
+            [
+                "- 适用前提与失效条件：适用于当前项目与工具链配置；若接口、分支策略或前置环境变更需重新核验。",
+                "- 分歧与反例：暂未记录反例；遇例外场景请追加记录，勿直接覆盖原结论。",
+            ]
+        )
+        evidence_lines = [f"- `{s}`" for s in sources_list]
+
+        body_parts = [
+            f"# {clean_title}",
+            "",
+            f"> 背景与结论：{description}",
+            "",
+            "## 好流程",
+            *good_flow_lines,
+            "",
+            "## 错误示范",
+            "- 跳过前置核查或凭记忆沿用过期方案，未保留真实运行验证证据。",
+            "",
+            "## 关键事项",
+            *key_lines,
+            "",
+            "## 遗留与待办",
+            "- 后续在同类真实任务中复测验证，通过后自动续期本经验卡。",
+            "",
+            "## 证据指针",
+            *evidence_lines,
+            "",
+            "> 分流判定：单项目/单事件实战经验卡，按 T5 单层规范沉淀；跨项目稳定规律经复测后再升格为主题页或全局规则。",
+            "",
+        ]
+        normalized_md = f"---\n{fm_yaml}\n---\n\n" + "\n".join(body_parts)
+        return target_rel, normalized_md
+
     def _validate_body(
         self,
         result: WikiGateResult,
