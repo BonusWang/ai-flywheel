@@ -38,6 +38,9 @@ PRACTICE_FIELD_WHITELIST = {
     "sources",
     "related",
     "sensitivity",
+    "freshness_tier",
+    "last_verified",
+    "valid_until",
 }
 FORBIDDEN_PATH_SEGMENTS = {"raw", "raw-原始素材", ".wiki-tmp", ".wiki-agent-memory"}
 MAX_DESCRIPTION_CHARS = 120
@@ -580,6 +583,9 @@ class WikiGate:
             "created": today_str,
             "updated": today_str,
             "status": "active",
+            "freshness_tier": "evolving",
+            "last_verified": today_str,
+            "valid_until": date.fromordinal(date.fromisoformat(today_str).toordinal() + 90).isoformat(),
             "tags": tags[:MAX_TAGS],
             "sources": sources_list,
         }
