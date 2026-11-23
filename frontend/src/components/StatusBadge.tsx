@@ -1,29 +1,29 @@
 import React from 'react'
 
 const STATUS_STYLES: Record<string, string> = {
-  PASS: 'bg-emerald-50 text-emerald-700 border-emerald-200',
-  verified_active: 'bg-emerald-50 text-emerald-700 border-emerald-200',
-  processed: 'bg-emerald-50 text-emerald-700 border-emerald-200',
-  resolved: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  PASS: 'bg-ok-soft text-ok-ink border-ok/25',
+  verified_active: 'bg-ok-soft text-ok-ink border-ok/25',
+  processed: 'bg-ok-soft text-ok-ink border-ok/25',
+  resolved: 'bg-ok-soft text-ok-ink border-ok/25',
 
-  RUNNING: 'bg-blue-50 text-blue-700 border-blue-200 animate-pulse',
-  in_progress: 'bg-blue-50 text-blue-700 border-blue-200',
-  in_review: 'bg-blue-50 text-blue-700 border-blue-200',
+  RUNNING: 'bg-accent-soft text-accent-ink border-accent/30 animate-pulse',
+  in_progress: 'bg-accent-soft text-accent-ink border-accent/30',
+  in_review: 'bg-accent-soft text-accent-ink border-accent/30',
 
-  AWAITING_APPROVAL: 'bg-amber-50 text-amber-800 border-amber-300',
-  unverified_active: 'bg-amber-50 text-amber-800 border-amber-200',
-  PARTIAL: 'bg-amber-50 text-amber-800 border-amber-200',
-  pending: 'bg-amber-50 text-amber-700 border-amber-200',
-  open: 'bg-amber-50 text-amber-800 border-amber-200',
+  AWAITING_APPROVAL: 'bg-amber-soft text-amber-ink border-amber/35',
+  unverified_active: 'bg-amber-soft text-amber-ink border-amber/30',
+  PARTIAL: 'bg-amber-soft text-amber-ink border-amber/30',
+  pending: 'bg-amber-soft text-amber-ink border-amber/30',
+  open: 'bg-amber-soft text-amber-ink border-amber/30',
 
-  FAILED: 'bg-rose-50 text-rose-700 border-rose-200',
-  needs_revision: 'bg-rose-50 text-rose-700 border-rose-200',
-  high: 'bg-rose-50 text-rose-700 border-rose-200',
+  FAILED: 'bg-hot-soft text-hot border-hot/30',
+  needs_revision: 'bg-hot-soft text-hot border-hot/30',
+  high: 'bg-hot-soft text-hot border-hot/30',
 
-  PENDING: 'bg-slate-100 text-slate-600 border-slate-200',
-  SKIPPED: 'bg-slate-100 text-slate-500 border-slate-200',
-  retired: 'bg-slate-100 text-slate-500 border-slate-200',
-  dismissed: 'bg-slate-100 text-slate-500 border-slate-200',
+  PENDING: 'bg-bg-sunk text-ink-4 border-line',
+  SKIPPED: 'bg-bg-sunk text-ink-4 border-line',
+  retired: 'bg-bg-sunk text-ink-4 border-line',
+  dismissed: 'bg-bg-sunk text-ink-4 border-line',
 }
 
 const LABELS: Record<string, string> = {
@@ -50,11 +50,11 @@ export const StatusBadge: React.FC<{ status: string; className?: string }> = ({
   status,
   className = '',
 }) => {
-  const style = STATUS_STYLES[status] || 'bg-slate-100 text-slate-700 border-slate-200'
+  const style = STATUS_STYLES[status] || 'bg-bg-sunk text-ink-3 border-line'
   const label = LABELS[status] || status
   return (
     <span
-      className={`inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full border ${style} ${className}`}
+      className={`inline-flex items-center px-2 py-0.5 text-[11.5px] font-medium rounded-full border ${style} ${className}`}
     >
       {label}
     </span>

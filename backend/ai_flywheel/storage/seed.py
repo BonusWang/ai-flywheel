@@ -38,52 +38,53 @@ def seed_demo_data(
     if db.list_rules() or db.list_workflow_runs():
         return {"seeded": 0}
 
-    # 1. Built-in sample knowledge docs (zero external Wiki dependency)
-    kb_root = cfg.knowledge_root_path
-    lessons_dir = kb_root / "lessons"
-    lessons_dir.mkdir(parents=True, exist_ok=True)
-    sample_doc = lessons_dir / "2026-11-verify-before-claim.md"
-    if not sample_doc.exists():
-        sample_doc.write_text(
-            "---\n"
-            "title: 真实验证优先于静态判断\n"
-            "tags: [verification, anti-laziness, mcp]\n"
-            "---\n\n"
-            "# 真实验证优先于静态判断\n\n"
-            "## 背景与根因\n"
-            "在多次脚本和 API 改动中，仅凭代码阅读判定“已完成”导致上线后仍存在路径或参数错误。\n\n"
-            "## 沉淀规矩\n"
-            "- 区分 `real`（真实运行）、`test`（单测）、`static`（静态阅读）与 `unknown`。\n"
-            "- 凡声明 `applied_rule_ids` 的任务，必须附上真实命令输出或文件哈希证据。\n",
-            encoding="utf-8",
+    # 1. Built-in sample knowledge docs (never write demo files into an external mounted Wiki)
+    if cfg.knowledge_sink.type == "builtin_kb":
+        kb_root = cfg.knowledge_root_path
+        lessons_dir = kb_root / "lessons"
+        lessons_dir.mkdir(parents=True, exist_ok=True)
+        sample_doc = lessons_dir / "2026-11-verify-before-claim.md"
+        if not sample_doc.exists():
+            sample_doc.write_text(
+                "---\n"
+                "title: 真实验证优先于静态判断\n"
+                "tags: [verification, anti-laziness, mcp]\n"
+                "---\n\n"
+                "# 真实验证优先于静态判断\n\n"
+                "## 背景与根因\n"
+                "在多次脚本和 API 改动中，仅凭代码阅读判定“已完成”导致上线后仍存在路径或参数错误。\n\n"
+                "## 沉淀规矩\n"
+                "- 区分 `real`（真实运行）、`test`（单测）、`static`（静态阅读）与 `unknown`。\n"
+                "- 凡声明 `applied_rule_ids` 的任务，必须附上真实命令输出或文件哈希证据。\n",
+                encoding="utf-8",
+            )
+        sample_doc_2 = lessons_dir / "2026-11-retry-loop-breaker.md"
+        if not sample_doc_2.exists():
+            sample_doc_2.write_text(
+                "---\n"
+                "title: 同工具同因重试上限与换路原则\n"
+                "tags: [debugging, retry-breaker, shell]\n"
+                "---\n\n"
+                "# 同工具同因重试上限与换路原则\n\n"
+                "同一工具遇到相同报错原因最多重试 2 次；第 3 次必须停止盲目重试，改为检查解释器、环境路径或换专用工具。\n",
+                encoding="utf-8",
+            )
+        db.rebuild_knowledge_fts(
+            [
+                {
+                    "doc_path": "lessons/2026-11-verify-before-claim.md",
+                    "title": "真实验证优先于静态判断",
+                    "body": sample_doc.read_text(encoding="utf-8"),
+                    "tags": "verification anti-laziness mcp",
+                },
+                {
+                    "doc_path": "lessons/2026-11-retry-loop-breaker.md",
+                    "title": "同工具同因重试上限与换路原则",
+                    "body": sample_doc_2.read_text(encoding="utf-8"),
+                    "tags": "debugging retry-breaker shell",
+                },
+            ]
         )
-    sample_doc_2 = lessons_dir / "2026-11-retry-loop-breaker.md"
-    if not sample_doc_2.exists():
-        sample_doc_2.write_text(
-            "---\n"
-            "title: 同工具同因重试上限与换路原则\n"
-            "tags: [debugging, retry-breaker, shell]\n"
-            "---\n\n"
-            "# 同工具同因重试上限与换路原则\n\n"
-            "同一工具遇到相同报错原因最多重试 2 次；第 3 次必须停止盲目重试，改为检查解释器、环境路径或换专用工具。\n",
-            encoding="utf-8",
-        )
-    db.rebuild_knowledge_fts(
-        [
-            {
-                "doc_path": "lessons/2026-11-verify-before-claim.md",
-                "title": "真实验证优先于静态判断",
-                "body": sample_doc.read_text(encoding="utf-8"),
-                "tags": "verification anti-laziness mcp",
-            },
-            {
-                "doc_path": "lessons/2026-11-retry-loop-breaker.md",
-                "title": "同工具同因重试上限与换路原则",
-                "body": sample_doc_2.read_text(encoding="utf-8"),
-                "tags": "debugging retry-breaker shell",
-            },
-        ]
-    )
 
     # 2. Sample sessions from Codex, Claude Code, and Claude Desktop
     now = datetime.now(timezone.utc)
