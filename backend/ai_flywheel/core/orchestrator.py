@@ -328,7 +328,17 @@ class WorkflowOrchestrator:
                 self.cfg.knowledge_sink.max_write_set,
                 int(self.policies.get_hard_gates().get("write_set", {}).get("max_files_per_run", 8)),
             )
-            planned_writes = runner.plan_writes(review_findings, existing_rules, max_write_set=max_ws)
+            default_prefix = (
+                self.cfg.knowledge_sink.allowed_write_prefixes[0]
+                if self.cfg.knowledge_sink.allowed_write_prefixes
+                else "lessons/"
+            )
+            planned_writes = runner.plan_writes(
+                review_findings,
+                existing_rules,
+                max_write_set=max_ws,
+                default_doc_prefix=default_prefix,
+            )
             run.planned_writes = planned_writes
             self._finish_node(
                 run,

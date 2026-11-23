@@ -64,6 +64,7 @@ class BaseWorkflowRunner(ABC):
         review_findings: dict[str, Any],
         existing_rules: list[RuleRecord],
         max_write_set: int,
+        default_doc_prefix: str = "lessons/",
     ) -> list[PlannedWrite]:
         """P03: Deduplicate against existing rules and generate controlled write plan."""
 
@@ -109,9 +110,12 @@ class DryRunHeuristicRunner(BaseWorkflowRunner):
         review_findings: dict[str, Any],
         existing_rules: list[RuleRecord],
         max_write_set: int,
+        default_doc_prefix: str = "lessons/",
     ) -> list[PlannedWrite]:
         existing_titles = {r.title.lower() for r in existing_rules}
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        prefix = default_doc_prefix.replace("\\", "/").strip("/")
+        prefix = f"{prefix}/" if prefix else "lessons/"
         plans: list[PlannedWrite] = []
 
         for item in review_findings.get("findings", []):
@@ -119,7 +123,7 @@ class DryRunHeuristicRunner(BaseWorkflowRunner):
                 break
             title = item["title"]
             slug = _slugify(title)
-            rel_path = f"lessons/{today}-{slug}.md"
+            rel_path = f"{prefix}{today}-{slug}.md"
             facts_md = "\n".join(f"- {f}" for f in item.get("facts", [])) or "- 待补充事实"
             anomalies_md = (
                 "\n".join(f"- {a}" for a in item.get("anomalies", []))
@@ -263,11 +267,12 @@ class CliSubprocessRunner(BaseWorkflowRunner):
         review_findings: dict[str, Any],
         existing_rules: list[RuleRecord],
         max_write_set: int,
+        default_doc_prefix: str = "lessons/",
     ) -> list[PlannedWrite]:
         existing_summary = [{"rule_id": r.rule_id, "title": r.title, "status": r.status.value} for r in existing_rules]
         prompt = (
             "You are the P03 Route & Write-Plan Worker of AI Flywheel. Deduplicate against existing_rules and return STRICT JSON: "
-            '{"planned_writes":[{"target_kind":"knowledge_doc|flywheel_rule","relative_path":"lessons/....md or null",'
+            f'{{"planned_writes":[{{"target_kind":"knowledge_doc|flywheel_rule","relative_path":"{default_doc_prefix}....md or null",'
             '"action":"create|update|register_rule","title":"...","summary":"...","content_preview":"...",'
             '"rule_payload":null,"source_session_keys":["..."]}]}. '
             f"Max items: {max_write_set}.\n\n"
@@ -283,7 +288,12 @@ class CliSubprocessRunner(BaseWorkflowRunner):
                     continue
             if out:
                 return out
-        return self.fallback.plan_writes(review_findings, existing_rules, max_write_set)
+        return self.fallback.plan_writes(
+            review_findings,
+            existing_rules,
+            max_write_set,
+            default_doc_prefix=default_doc_prefix,
+        )
 
 
 def build_runner(cfg: FlywheelConfig, fs_store: ImmutableFileStore) -> BaseWorkflowRunner:
