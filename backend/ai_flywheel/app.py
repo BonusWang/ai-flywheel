@@ -109,7 +109,7 @@ def create_app(
 
     app = FastAPI(
         title="AI Flywheel",
-        version="0.1.0",
+        version="0.3.0",
         description="Evidence-driven AI collaboration flywheel portal, API, and MCP server.",
         lifespan=lifespan,
     )
@@ -135,7 +135,7 @@ def create_app(
     # ---------------- Public Unified Layer (AIHOT-inspired) ----------------
     @app.get("/health")
     def health() -> dict[str, Any]:
-        return {"status": "ok", "version": "0.1.0", "lock": rt.db.get_workflow_lock()}
+        return {"status": "ok", "version": "0.3.0", "lock": rt.db.get_workflow_lock()}
 
     @app.get("/llms.txt", response_class=PlainTextResponse)
     def llms_txt() -> str:

@@ -9,6 +9,9 @@ from ai_flywheel.models import OutcomeOrigin, RuleStatus, SessionStatus, Verific
 from ai_flywheel.storage.db import FlywheelDB
 
 
+FLYWHEEL_VERSION = "0.3.0"
+
+
 MCP_TOOL_CATALOG: list[dict[str, str]] = [
     {
         "name": "flywheel_register_session",
@@ -51,6 +54,34 @@ MCP_TOOL_CATALOG: list[dict[str, str]] = [
         "phase": "观测",
         "description_zh": "查看飞轮全局健康指标、活跃规则分布与最近一次后台工作流状态。",
         "description": "Inspect flywheel health metrics and latest P00-P07 run status.",
+    },
+]
+
+
+MCP_RESOURCE_CATALOG: list[dict[str, str]] = [
+    {
+        "uri": "flywheel://core-card",
+        "title_zh": "核心索引卡",
+        "description_zh": "自动派生的 ≤200 行跨智能体索引卡：生效规则（含未决分歧）、错题观察池聚类、活跃 Skill 实效账本、过期经验卡提醒。",
+        "description": "Derived <=200-line cross-agent index card: active rules with open dissents, mistake-pool clusters, skill effectiveness ledger, expired card warnings.",
+    },
+    {
+        "uri": "flywheel://policies/active",
+        "title_zh": "现行策略",
+        "description_zh": "全部现行飞轮方法论策略（反偷懒、闭环契约、硬门禁、个人偏好）。",
+        "description": "All active flywheel methodology policies (anti-laziness, loop contract, hard gates, user preferences).",
+    },
+    {
+        "uri": "flywheel://rules/active",
+        "title_zh": "现行规则",
+        "description_zh": "当前生效的先例避坑规则（试运行与已验证）。",
+        "description": "Currently active precedent rules (unverified_active and verified_active).",
+    },
+    {
+        "uri": "flywheel://runs/latest",
+        "title_zh": "最新批次",
+        "description_zh": "最近一次 P00–P07 自主工作流运行报告。",
+        "description": "Latest P00-P07 autonomous workflow run report.",
     },
 ]
 
@@ -164,6 +195,7 @@ class PublicationLayer:
             "",
             f"> {brand.get('motto', '')}",
             f"> {brand.get('subtitle', '')}",
+            f"> Version: {FLYWHEEL_VERSION}",
             "",
             "## MCP Endpoint",
             f"- Streamable HTTP: {mcp_http_url}",
@@ -171,6 +203,9 @@ class PublicationLayer:
             "",
             "## Available MCP Tools",
             *[f"- `{tool['name']}`: {tool['description']}" for tool in MCP_TOOL_CATALOG],
+            "",
+            "## Available MCP Resources (read-only)",
+            *[f"- `{res['uri']}`: {res['description']}" for res in MCP_RESOURCE_CATALOG],
             "",
             "## Current Metrics",
             f"- Preflight Activations: {metrics['preflight_activations']}",

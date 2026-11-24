@@ -28,7 +28,7 @@ def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
     mcp = MCPServer(
         name="ai-flywheel",
         title="AI Collaboration Flywheel",
-        version="0.1.0",
+        version="0.3.0",
         instructions=(
             "Evidence-driven AI collaboration flywheel. "
             "Call flywheel_preflight_activate before non-trivial tasks to receive anti-laziness "
