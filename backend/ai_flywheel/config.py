@@ -253,7 +253,16 @@ class FlywheelConfig(BaseModel):
 
     @property
     def default_profile_path(self) -> Path:
-        return self.resolve_path(self.profile.default_dir)
+        candidate = self.resolve_path(self.profile.default_dir)
+        if candidate.exists():
+            return candidate
+        # When launched with an external --config / FLYWHEEL_CONFIG (so base_dir
+        # points outside the checkout), fall back to the bundled profile/.
+        if self.profile.default_dir in {"./profile", "profile"}:
+            bundled = (Path(__file__).resolve().parents[2] / "profile").resolve()
+            if bundled.exists():
+                return bundled
+        return candidate
 
     @property
     def override_profile_path(self) -> Path | None:
@@ -362,12 +371,14 @@ def load_config(config_path: str | Path | None = None, base_dir: str | Path | No
 
     if config_path:
         target_path = Path(config_path).resolve()
-        resolved_base = target_path.parent
+        if not base_dir:
+            resolved_base = target_path.parent
     else:
         env_cfg = os.environ.get("FLYWHEEL_CONFIG")
         if env_cfg:
             target_path = Path(env_cfg).resolve()
-            resolved_base = target_path.parent
+            if not base_dir:
+                resolved_base = target_path.parent
         else:
             candidate = resolved_base / "flywheel.yaml"
             if candidate.exists():

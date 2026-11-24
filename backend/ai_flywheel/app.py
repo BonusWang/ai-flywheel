@@ -648,6 +648,11 @@ def create_app(
 
     # ---- Built React Frontend SPA Hosting ----
     frontend_dist = (rt.cfg.base_dir / "frontend" / "dist").resolve()
+    if not frontend_dist.exists():
+        # Fall back to the checkout's built dist so an external --config still serves the console.
+        bundled_dist = (Path(__file__).resolve().parents[2] / "frontend" / "dist").resolve()
+        if bundled_dist.exists():
+            frontend_dist = bundled_dist
     if frontend_dist.exists():
         assets_dir = frontend_dist / "assets"
         if assets_dir.exists():

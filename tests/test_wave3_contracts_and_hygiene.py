@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -53,7 +54,6 @@ from ai_flywheel.storage.db import FlywheelDB
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BACKEND_ROOT = REPO_ROOT / "backend" / "ai_flywheel"
 FRONTEND_SRC = REPO_ROOT / "frontend" / "src"
-EXPECTED_VERSION = "0.4.0"
 
 
 # ---------------- helpers ----------------
@@ -89,16 +89,16 @@ def _rule(index: int, status: RuleStatus) -> RuleRecord:
 
 
 def test_version_is_declared_in_one_place_and_agrees_everywhere():
-    assert __version__ == EXPECTED_VERSION
+    assert re.fullmatch(r"\d+\.\d+\.\d+", __version__)
 
     pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert pyproject["project"]["version"] == EXPECTED_VERSION
+    assert pyproject["project"]["version"] == __version__
 
     site = yaml.safe_load((REPO_ROOT / "profile" / "site.yaml").read_text(encoding="utf-8"))
-    assert site["brand"]["version"] == EXPECTED_VERSION
+    assert site["brand"]["version"] == __version__
 
     package = json.loads((REPO_ROOT / "frontend" / "package.json").read_text(encoding="utf-8"))
-    assert package["version"] == EXPECTED_VERSION
+    assert package["version"] == __version__
 
 
 def test_no_module_hardcodes_the_old_version():
@@ -122,7 +122,7 @@ def test_runtime_surfaces_the_version(tmp_path: Path):
     with TestClient(create_app(runtime=rt)) as client:
         resp = client.get("/health")
     assert resp.status_code == 200
-    assert resp.json()["version"] == EXPECTED_VERSION
+    assert resp.json()["version"] == __version__
 
 
 # ---------------- W3.1 死代码确实没有调用方 ----------------
@@ -680,3 +680,46 @@ def test_git_closure_skips_a_non_git_knowledge_root(tmp_path: Path):
     cfg.knowledge_sink.root = str(kb)
     adapter = DeliveryAdapter(cfg)
     assert adapter._git_closure(["a.md"], "run-1") == "SKIPPED (not a git repo)"
+
+
+# ---------------- 外部 --config 启动时的路径与控制台回退 ----------------
+
+
+def test_load_config_respects_explicit_base_dir_with_external_config(tmp_path: Path):
+    """Explicit --base-dir must not be clobbered by an external --config path."""
+    cfg_dir = tmp_path / "external"
+    base = tmp_path / "repo"
+    cfg_dir.mkdir()
+    base.mkdir()
+    cfg_file = cfg_dir / "flywheel.yaml"
+    cfg_file.write_text("server:\n  port: 9911\n", encoding="utf-8")
+
+    cfg = load_config(config_path=cfg_file, base_dir=base)
+    assert cfg.base_dir == base.resolve()
+    assert cfg.config_path == cfg_file.resolve()
+    assert cfg.server.port == 9911
+
+
+def test_external_config_falls_back_to_bundled_profile_and_spa(tmp_path: Path):
+    """Running with an external --config still resolves the bundled profile/ and frontend/dist."""
+    from fastapi.testclient import TestClient
+
+    from ai_flywheel.app import create_app
+    from ai_flywheel.runtime import FlywheelRuntime
+
+    cfg_file = tmp_path / "flywheel.yaml"
+    cfg_file.write_text(
+        f'server:\n  data_dir: "{(tmp_path / "data").as_posix()}"\n'
+        'sessions:\n  scan_sources: []\n',
+        encoding="utf-8",
+    )
+    cfg = load_config(config_path=cfg_file)
+    assert cfg.default_profile_path == (REPO_ROOT / "profile").resolve()
+
+    rt = FlywheelRuntime.create(config_path=cfg_file, skip_fts_sync=True)
+    app = create_app(runtime=rt)
+    if (REPO_ROOT / "frontend" / "dist" / "index.html").is_file():
+        client = TestClient(app)
+        resp = client.get("/")
+        assert resp.status_code == 200
+        assert '<div id="root">' in resp.text

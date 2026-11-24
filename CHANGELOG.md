@@ -5,6 +5,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-25
+
+### Fixed
+- **External `--config` / `FLYWHEEL_CONFIG` console & profile resolution** (`config.py`, `app.py`):
+  - `load_config(config_path, base_dir)` no longer overwrites an explicit `--base-dir` with `config_path.parent`.
+  - Launching `flywheel --config <external-path> serve` (where `base_dir` is outside the repository checkout) now falls back to the checkout's built `frontend/dist` and bundled `profile/` instead of returning `404` on `/` or missing default policies.
+
 ## [0.4.0] - 2026-11-25
 
 ### Added
