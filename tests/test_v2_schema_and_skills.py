@@ -65,7 +65,7 @@ def test_p04_malformed_llm_rule_payload_never_crashes(tmp_path: Path):
     assert len(normalized["triggers"]) >= 1
 
 
-def test_smart_approval_auto_passes_routine_and_pauses_for_skill(tmp_path: Path):
+def test_smart_approval_auto_passes_routine_and_dry_run_defers_skill_candidates(tmp_path: Path):
     rt = _make_runtime(tmp_path, approval_mode="smart")
 
     # 1. Routine session (note + rule, NO skill workflow) -> auto-passes in smart mode!
@@ -87,7 +87,8 @@ def test_smart_approval_auto_passes_routine_and_pauses_for_skill(tmp_path: Path)
     assert routine_run.batch_seq == 1
     assert len(rt.db.list_audit_events(entity_type="workflow_run", entity_id=routine_run.run_id)) >= 2
 
-    # 2. Session with repeated workflow -> proposes skill_improvement -> pauses for approval!
+    # 2. Session with repeated workflow in dry-run mode: the heuristic planner does not author Skills.
+    #    The candidate is traced, nothing pauses, and nothing lands in the skills directory.
     rt.register_session(
         RegisterSessionRequest(
             client="claude-code",
@@ -100,16 +101,17 @@ def test_smart_approval_auto_passes_routine_and_pauses_for_skill(tmp_path: Path)
         )
     )
     skill_run = rt.orchestrator.start_run(trigger="test", phase="daily")
-    assert skill_run.status == RunStatus.AWAITING_APPROVAL
-    assert any(w.target_kind == "skill_improvement" for w in skill_run.planned_writes)
-
-    # Approve -> P04 writes validated SKILL.md into skills_dirs[0] and registers skill_assets!
-    finished = rt.orchestrator.approve_and_resume(skill_run.run_id)
-    assert finished.status == RunStatus.PASS, f"Run failed with error: {finished.error}"
-    skill_files = list((tmp_path / "skills").glob("*/SKILL.md"))
-    assert len(skill_files) == 1
-    assert "---" in skill_files[0].read_text(encoding="utf-8")
-    assert any(a["origin"] == "flywheel_created" for a in rt.db.list_skill_assets())
+    assert skill_run.status == RunStatus.PASS, f"Run failed with error: {skill_run.error}"
+    assert all(w.target_kind != "skill_improvement" for w in skill_run.planned_writes)
+    assert not list((tmp_path / "skills").glob("*/SKILL.md"))
+    p03 = next(n for n in skill_run.nodes if n.node_id == "P03_ROUTE_PLAN")
+    assert "1 个重复流程候选未生成 Skill 计划" in p03.summary
+    assert any(
+        e["event_type"] == "skill_candidates_deferred"
+        for e in rt.db.list_audit_events(entity_type="workflow_run", entity_id=skill_run.run_id)
+    )
+    # A Skill still reaches P04 when the model plans it (smart mode pauses for approval):
+    # see tests/test_p03_plan_contract.py::test_model_skill_item_reaches_approval_and_the_write_path
 
 
 def test_friday_auto_phase_resolution():

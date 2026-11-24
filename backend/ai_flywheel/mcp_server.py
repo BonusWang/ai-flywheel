@@ -5,9 +5,9 @@ from typing import TYPE_CHECKING, Any
 
 from mcp.server.mcpserver import MCPServer
 
+from ai_flywheel import __version__
 from ai_flywheel.core.receipts import OutcomeGateError
 from ai_flywheel.models import (
-    CheckResult,
     OutcomeCheck,
     OutcomeOrigin,
     OutcomeStatus,
@@ -16,7 +16,6 @@ from ai_flywheel.models import (
     RegisterSessionRequest,
     ReportSignalRequest,
     SignalKind,
-    VerificationKind,
 )
 
 if TYPE_CHECKING:
@@ -24,11 +23,11 @@ if TYPE_CHECKING:
 
 
 def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
-    """Create the official MCP Server exposing 6 core tools + 3 read-only resources."""
+    """Create the official MCP Server exposing 6 core tools + 4 read-only resources."""
     mcp = MCPServer(
         name="ai-flywheel",
         title="AI Collaboration Flywheel",
-        version="0.3.0",
+        version=__version__,
         instructions=(
             "Evidence-driven AI collaboration flywheel. "
             "Call flywheel_preflight_activate before non-trivial tasks to receive anti-laziness "
@@ -245,7 +244,9 @@ def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
     @mcp.resource("flywheel://core-card")
     def resource_core_card() -> str:
         """Derived <=200-line FLYWHEEL-CORE.md cross-agent index card (rules, mistake pool, skills, freshness warnings)."""
-        info = runtime.refresh_core_card()
+        # A read, not a rebuild: every mutation path refreshes the card, and a
+        # plain read must not write to the data directory.
+        info = runtime.read_core_card()
         return str(info["content"])
 
     return mcp

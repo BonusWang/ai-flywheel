@@ -1,0 +1,89 @@
+schema: spec-driven
+
+# 项目上下文：OpenSpec 生成产物（proposal / specs / design / tasks）时注入给 AI 的约束。
+# 本仓库是公开产品仓库：这里只放脱敏后的通用约定，个人绝对路径、私有项目名、账号与密钥一律不得出现。
+context: |
+  # AI Flywheel —— 项目上下文
+
+  ## 是什么
+  本地优先、方法论策略与知识库彻底解耦的证据驱动 AI 协作飞轮：通过 MCP / Hook 接入各类 AI 工具，
+  后台按 P00–P07 固定 8 节点工作流把会话沉淀为知识，并提供 4+1 Web 控制台。版本演进见 CHANGELOG.md。
+
+  ## 技术栈
+  - 后端：Python 3.11+，FastAPI + Pydantic v2 + PyYAML + SQLite（FTS5）+ APScheduler + MCP SDK + httpx
+  - 前端：React 19 + TypeScript + Vite（frontend/）
+  - 代码图谱：codegraph（.codegraph/ 为本机索引，不入库）
+
+  ## 目录与分层
+  - backend/ai_flywheel/core/      领域引擎：orchestrator（P00–P07 状态机）、activation（预检/规则）、triage（会话初筛）、dream（周五蒸馏）、core_card、privacy、receipts、heartbeat、feishu_*（卡片/通道/监听/自检）、time_utils（上海时区日期）
+  - backend/ai_flywheel/adapters/  出站适配：runners/（dry_run / cli / api 执行器与契约、提示词、归一化）、wiki/（挂载 Wiki 的 schema、routing、gate、validator、t5_adapter、postflight）、knowledge（知识落点 + 写入链路）、skills（Skill 追加式写入）、sessions、delivery、lark_cli
+  - backend/ai_flywheel/storage/   db/（SQLite 存储与迁移，按仓储拆分）、fs_store.py（不可变回执）、outbox.py（受管投递外发箱）、clock.py（可注入时钟）、seed.py
+  - backend/ai_flywheel/           app.py（REST/SSE）、mcp_server.py、cli.py、config.py、models.py、runtime.py
+  - profile/                       与知识库解耦的方法论策略（policies/）与默认模板
+  - frontend/src/                  4+1 控制台：pages/、components/、api.ts、types.ts、lib/labels.ts
+  - tests/                         pytest（asyncio auto 模式）；test_arch_invariants.py 固化跨层不变量
+  - scripts/verify_repo.py         一次性验收闸门：卫生 → openspec 校验 → pytest → 前端构建
+  - openspec/                      规格驱动开发：specs/（现行基线）、changes/（进行中与已归档变更）
+
+  ## 流水线副作用边界（P00–P07）
+  - P00 准备 / P01 独占启动：只读会话与配置，只写运行记录、审计与独占锁。
+  - P02 全文审查：**只读**。错题与分歧只作候选留在节点载荷里，审批通过前不入池、不落库。
+  - P03 路由与写入计划：**只读**（对知识/错题/分歧/Skill 而言）。只产出计划，绝不写入。
+  - P04 受控写入与验收：**唯一的受控写入阶段**。写知识文档、规则与 Skill，并首次落库错题与分歧。
+  - P05 台账与队列结算：幂等结算会话状态（已审查 → processed，未审查 → pending）、结算 retro_queue、刷新一次核心索引卡；全文检索索引整批只重建一次。
+  - P06 机器报告 / P07 交付与终态释锁：报告、投递与终态；独占锁在 P07 释放，不得提前。
+  - 失败契约：失败节点下游显式 SKIPPED，准入会话回到 pending，独占锁必须释放；审批被拒的终态是 CANCELLED，不是 PARTIAL。
+
+  ## 缓存与契约
+  - 模型回复只在通过语义校验之后才写入 api_cache/；不可用或不可解析的输出绝不入缓存，避免污染下一次运行。
+  - 不允许静默回退：配置的 planner / reviewer 产不出可用结果时该节点失败并留下原因码与结构化诊断，不得偷偷换成本地启发式却仍报 api:<model>。
+  - 写入必须原子且回读校验：临时文件 → 原子替换 → 回读比对。Skill 的 update 是追加，不是重写。
+
+  ## Windows 契约
+  - 工作区路径按反斜杠与正斜杠一并切段（项目名精确命中，而不是子串命中）。
+  - 写出的知识文档一律 LF 行尾；Wiki 脚本在 Git Bash 下运行，不用 WSL 启动器。
+  - 环境变量不得用来在生产流水线里 sleep / hold / park 一个真实批次。
+
+  ## 常用命令
+  - 安装：python -m venv .venv 后激活，pip install -e ".[dev]"
+  - 测试：python -m pytest tests -q
+  - 一键验收：python scripts/verify_repo.py --frontend
+  - 启动：flywheel serve --seed  →  http://127.0.0.1:8765 （MCP HTTP: /mcp；stdio: flywheel mcp-stdio）
+  - 前端构建：cd frontend && npm install && npm run build
+  - 代码图谱：codegraph status / codegraph sync / codegraph callers|impact|affected <symbol>
+  - 规格校验：openspec validate --all --strict
+
+  ## 工程约定
+  - 本仓库是公开产品仓库：个人绝对路径、私有项目名、账号与密钥一律不得出现；
+    个人配置只进 gitignored 的 flywheel.yaml 或 profile.override_dir。
+  - 策略与个人偏好不得硬编码进公开代码。
+  - 写知识文档、Skill、规则前必须过隐私与密钥门禁；挂载 Schema 治理的 Wiki 时必须过 Wiki 门禁（写前校验 + 写后 D2）。
+  - LLM 输出一律视为不可信：进入 P04 前必须经过确定性归一化与校验，禁止把可预见的不合规留到写入阶段才暴露。
+  - 运行失败遵守 fail-run 契约：失败节点的下游显式 SKIPPED，准入会话回到 pending，独占锁必须释放。
+  - 证据分级：real（真实运行）/ test（自动测试）/ static（静态判断）/ unknown（未验证）。
+    声明"已修复"至少要有 test 级证据；涉及写入链路、接口或脚本的改动必须有 real 级证据。
+
+  ## OpenSpec 使用约定（本仓库）
+  - 流程：Explore（澄清）→ Propose（proposal → specs → design → tasks）→ Apply → Verify → Archive。
+  - 变更命名：kebab-case 英文；修复类以 fix- 开头，新能力以 feat- 开头，文档/治理类以 docs- 或 chore- 开头。
+    已安装的 openspec CLI 1.4.1 只接受 kebab-case 变更名。
+  - 文档语言：正文用中文；解析关键字保持英文原文不改（## Why、## What Changes、## Capabilities、## Impact、
+    ## ADDED/MODIFIED/REMOVED Requirements、### Requirement:、#### Scenario:、**WHEN**、**THEN**）。
+  - 能力命名：specs/ 目录用 kebab-case 英文名，spec.md 首行写中文标题；一个能力一份 spec.md。
+  - 棕地规则：改动触及尚无基线的能力时，先在同一 change 的 specs 里用 ADDED Requirements 补该能力的现状基线，再写增量。
+  - tasks.md 每条任务末尾用【test】/【real】/【static】标注验收方式；涉及真实写入链路的任务在真实运行验证完成前不得勾选。
+  - 归档不是自动动作：Verify 通过且真实运行验证完成后，由维护者确认再执行 openspec archive。
+
+# 按产物类型的附加规则（同样注入给 AI）
+rules:
+  proposal:
+    - "Why 必须写清现象、影响与根因层级；修复类变更要引用真实证据（运行记录 / 回放结果 / 测试输出）。"
+    - "公开仓库：不得出现个人绝对路径、私有项目名、账号、密钥。"
+  specs:
+    - "每条 Requirement 至少一个 Scenario，Scenario 必须以 #### Scenario: 开头。"
+    - "只写行为契约（系统必须做什么），实现细节放 design.md。"
+    - "需求与场景正文用中文，SHALL/MUST 等关键字保留。"
+  design:
+    - "每个决策写明备选方案与取舍；涉及写入链路的变更必须写明真实验证方式。"
+  tasks:
+    - "任务粒度以一次可完成为准；每条任务末尾用【test】/【real】/【static】标注验收方式。"

@@ -13,9 +13,14 @@ build/
 flywheel.yaml
 data/
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 *.log
+
+# Local code graph index (machine-local, never committed)
+.codegraph/
 
 # Frontend
 frontend/node_modules/

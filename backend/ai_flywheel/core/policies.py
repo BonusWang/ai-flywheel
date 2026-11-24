@@ -35,13 +35,6 @@ class PolicyEngine:
             base = deep_merge(base, ov)
         return base
 
-    def load_taxonomy(self) -> dict[str, Any]:
-        base = self._load_yaml_if_exists(self.cfg.default_profile_path / "taxonomy.yaml")
-        if self.cfg.override_profile_path:
-            ov = self._load_yaml_if_exists(self.cfg.override_profile_path / "taxonomy.yaml")
-            base = deep_merge(base, ov)
-        return base
-
     def list_policies(self) -> dict[str, dict[str, Any]]:
         policies: dict[str, dict[str, Any]] = {}
         default_dir = self.cfg.default_profile_path / "policies"

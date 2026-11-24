@@ -22,7 +22,6 @@ READONLY_TOOLS = {
     "LS",
     "view_image",
     "list_dir",
-    "apply_patch",
 }
 
 READONLY_CMD_PREFIXES = (
@@ -110,11 +109,19 @@ class ThinHookProcessor:
         if not tool_name or tool_name in READONLY_TOOLS:
             return {"continue": True}
 
+        # A shell tool carries its command in the tool input; a dict input must be
+        # unwrapped before the read-only command prefixes can be matched.
+        if isinstance(tool_input, dict):
+            command = str(tool_input.get("command") or tool_input.get("cmd") or "")
+        else:
+            command = str(tool_input)
+        lower_command = command.strip().lower()
+        for prefix in READONLY_CMD_PREFIXES:
+            if lower_command.startswith(prefix):
+                return {"continue": True}
+
         input_str = str(tool_input)
         lower_input = input_str.strip().lower()
-        for prefix in READONLY_CMD_PREFIXES:
-            if lower_input.startswith(prefix):
-                return {"continue": True}
 
         hard_gates = self.runtime.policies.get_hard_gates()
         warnings: list[str] = []
@@ -183,6 +190,8 @@ class ThinHookProcessor:
         workspace = str(payload.get("cwd") or payload.get("workspace") or "")
         title = str(payload.get("title") or "")
         summary = payload.get("summary")
+        # A lifecycle hook arrives late: it must not re-open a session the flywheel already
+        # settled, nor wipe the triage metadata that decided its fate.
         self.runtime.register_session(
             RegisterSessionRequest(
                 client=client,
@@ -192,6 +201,7 @@ class ThinHookProcessor:
                 transcript_path=str(transcript_path) if transcript_path else None,
                 summary=str(summary) if summary else None,
                 metadata={"last_hook_event": event},
-            )
+            ),
+            preserve_existing_lifecycle=True,
         )
         return {"continue": True}

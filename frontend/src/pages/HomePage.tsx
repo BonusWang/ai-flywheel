@@ -14,7 +14,7 @@ import { api } from '../api'
 import { MarkdownView } from '../components/MarkdownView'
 import { AsideCard, ReadingLayout } from '../components/PageLayout'
 import { StatusBadge } from '../components/StatusBadge'
-import { formatDateYMD, labelOf, SINK_TYPE_LABELS } from '../lib/labels'
+import { formatDateYMD, labelOf, RULE_STATUS_LABELS, SINK_TYPE_LABELS } from '../lib/labels'
 import type { KnowledgeDocSummary, OverviewResponse } from '../types'
 
 interface Props {
@@ -91,8 +91,8 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
                 className="pb-2.5 border-b border-line-soft last:border-b-0 last:pb-0"
               >
                 <div className="text-[13px] font-medium text-ink leading-snug">{r.title}</div>
-                <div className="mt-1.5 flex items-center justify-between text-[11.5px] text-ink-4">
-                  <StatusBadge status={r.status} />
+                <div className="mt-1.5 flex items-center justify-between gap-2 text-[11.5px] text-ink-4">
+                  <span className="text-ink-3">{labelOf(RULE_STATUS_LABELS, r.status)}</span>
                   <span className="num">已提醒 {r.hit_count} 次</span>
                 </div>
               </div>
@@ -178,7 +178,7 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
           </div>
         </header>
 
-        {/* 2. Only surface a calm prompt when a batch actually needs JT's approval */}
+        {/* 2. Only surface a calm prompt when a batch actually needs the maintainer's approval */}
         {awaitingApproval && latest_run && (
           <section className="rounded-[var(--radius-card)] border border-amber/40 bg-amber-soft/50 px-4 py-3 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2 text-[13px] text-ink">

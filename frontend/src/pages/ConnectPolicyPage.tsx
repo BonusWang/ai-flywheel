@@ -18,6 +18,8 @@ export const ConnectPolicyPage: React.FC<Props> = ({
   const [connectData, setConnectData] = useState<ConnectPayload | null>(null)
   const [selectedClient, setSelectedClient] = useState('codex')
   const [notice, setNotice] = useState<string | null>(null)
+  // Settings that only take effect after the service restarts.
+  const [restartNotice, setRestartNotice] = useState<string[]>([])
 
   // Test sandbox
   const [pfPrompt, setPfPrompt] = useState('修复接口报错并做真实验证')
@@ -65,11 +67,20 @@ export const ConnectPolicyPage: React.FC<Props> = ({
     setApiKeyConfigured(Boolean(cfg.runner?.api?.api_key_configured))
     setCliCmd(cfg.runner?.cli?.command || '')
     setCliArgs((cfg.runner?.cli?.args || []).join(' '))
+    // The effective mode, not the configured one: `auto` needs the safety
+    // valve open, so a configured `auto` behind a closed valve really runs as
+    // `smart`. The dropdown must say what will happen.
+    const configuredMode = String(cfg.workflow?.approval_mode || 'always')
+    const workflowAuto = Boolean(cfg.workflow?.auto_approve_writes)
+    const valveAuto = Boolean(cfg.safety_valves?.auto_approve_writes)
     const resolvedMode =
-      cfg.workflow?.approval_mode ||
-      (cfg.workflow?.auto_approve_writes && cfg.safety_valves?.auto_approve_writes
-        ? 'auto'
-        : 'always')
+      configuredMode === 'auto'
+        ? valveAuto
+          ? 'auto'
+          : 'smart'
+        : workflowAuto && valveAuto
+          ? 'auto'
+          : configuredMode
     setApprovalMode(resolvedMode)
     setFridayWeekly(cfg.workflow?.friday_weekly_enabled !== false)
     setWorkflowEnabled(cfg.safety_valves?.workflow_enabled !== false)
@@ -113,7 +124,7 @@ export const ConnectPolicyPage: React.FC<Props> = ({
     if (apiKey.trim()) {
       apiPatch.api_key = apiKey.trim()
     }
-    await api.updateConfig({
+    const saved = await api.updateConfig({
       profile: {
         override_dir: overrideDir.trim() || null,
       },
@@ -153,7 +164,13 @@ export const ConnectPolicyPage: React.FC<Props> = ({
     })
     await loadAll()
     onGlobalRefresh()
-    showToast('设置已保存')
+    if (saved.restart_required) {
+      setRestartNotice(saved.restart_reasons || [])
+      showToast('设置已保存（部分需重启后生效）')
+    } else {
+      setRestartNotice([])
+      showToast('设置已保存')
+    }
   }
 
   const clientObj =
@@ -198,6 +215,21 @@ export const ConnectPolicyPage: React.FC<Props> = ({
         active={tab}
         onChange={(k) => setTab(k as 'connect' | 'storage' | 'test')}
       />
+
+      {restartNotice.length > 0 && (
+        <div className="rounded-[var(--radius-card)] border border-amber/40 bg-amber-soft/55 px-4 py-3 text-[12.5px] text-ink-2">
+          <div className="font-semibold text-ink">
+            设置已保存，但以下几项要重启服务后才生效：
+          </div>
+          <ul className="mt-1.5 list-disc pl-5 space-y-0.5 text-ink-3">
+            {restartNotice.map((reason) => (
+              <li key={reason} className="mono text-[11.5px]">
+                {reason}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {/* Tab 1: Connect AI Clients */}
       {tab === 'connect' && connectData && (

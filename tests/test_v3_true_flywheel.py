@@ -40,6 +40,9 @@ def rt(tmp_path: Path) -> FlywheelRuntime:
     shutil.copytree(REPO_ROOT / "profile", tmp_path / "profile")
     cfg = load_config(base_dir=tmp_path)
     cfg.workflow.approval_mode = "auto"
+    # `auto` only takes effect with the safety valve open: the valve has
+    # the last word, so a closed valve would run the batch as `smart`.
+    cfg.safety_valves.auto_approve_writes = True
     return FlywheelRuntime(cfg)
 
 

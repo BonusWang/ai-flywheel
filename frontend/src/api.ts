@@ -1,6 +1,7 @@
 import type {
   AboutPayload,
   AuditEventRecord,
+  ConfigSaveResponse,
   ConnectPayload,
   DissentRecord,
   GrowthMetricsPayload,
@@ -11,6 +12,8 @@ import type {
   RetroItem,
   RuleRecord,
   SessionRecord,
+  SkillPreview,
+  WorkflowLock,
   WorkflowRunRecord,
 } from './types'
 
@@ -43,21 +46,32 @@ export const api = {
     }),
 
   listRuns: () =>
-    req<{ runs: WorkflowRunRecord[]; lock: { run_id: string; acquired_at: string } | null }>(
-      '/api/site/runs'
-    ),
+    req<{ runs: WorkflowRunRecord[]; lock: WorkflowLock | null }>('/api/site/runs'),
   getRunEvents: (runId: string) =>
     req<{ events: AuditEventRecord[] }>(`/api/site/runs/${runId}/events`),
-  startRun: (body: { phase?: string; auto_approve?: boolean | null }) =>
-    req<{ run: WorkflowRunRecord }>('/api/site/runs', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }),
-  approveRun: (runId: string, approvedIndices?: number[]) =>
-    req<{ run: WorkflowRunRecord }>(`/api/site/runs/${runId}/approve`, {
-      method: 'POST',
-      body: JSON.stringify({ approved_indices: approvedIndices ?? null }),
-    }),
+  startRun: (
+    body: { phase?: string; auto_approve?: boolean | null },
+    options?: { background?: boolean }
+  ) =>
+    req<{ run: WorkflowRunRecord | null; run_id?: string; background?: boolean }>(
+      `/api/site/runs${options?.background ? '?background=true' : ''}`,
+      {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }
+    ),
+  approveRun: (
+    runId: string,
+    approvedIndices?: number[],
+    options?: { background?: boolean }
+  ) =>
+    req<{ run: WorkflowRunRecord | null; background?: boolean }>(
+      `/api/site/runs/${runId}/approve${options?.background ? '?background=true' : ''}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ approved_indices: approvedIndices ?? null }),
+      }
+    ),
   rejectRun: (runId: string, reason?: string) =>
     req<{ run: WorkflowRunRecord }>(`/api/site/runs/${runId}/reject`, {
       method: 'POST',
@@ -128,7 +142,10 @@ export const api = {
     }),
 
   growthMetrics: () => req<GrowthMetricsPayload>('/api/site/growth-metrics'),
-  coreCard: () => req<{ path: string; lines: number; bytes: number; content: string }>('/api/site/core-card'),
+  coreCard: () =>
+    req<{ path: string; lines: number; bytes: number; content: string; source?: string }>(
+      '/api/site/core-card'
+    ),
 
   listRetro: () => req<{ items: RetroItem[] }>('/api/site/retro'),
   updateRetroStatus: (retroId: string, status: RetroItem['status']) =>
@@ -148,15 +165,21 @@ export const api = {
 
   connectInfo: () => req<ConnectPayload>('/api/site/connect'),
   updateConfig: (patch: Record<string, any>) =>
-    req<{ config: Record<string, any> }>('/api/site/config', {
+    req<ConfigSaveResponse>('/api/site/config', {
       method: 'PUT',
       body: JSON.stringify(patch),
     }),
 
   listKnowledge: () =>
     req<{ sink_type: string; root: string; documents: KnowledgeDocSummary[] }>('/api/site/knowledge'),
+  feishuCheckStatus: () =>
+    req<{ state: string; valid?: boolean; reason?: string; listener?: { state: string; reason: string } | null }>(
+      '/api/site/feishu-check'
+    ),
   readKnowledgeDoc: (path: string) =>
     req<{ doc_path: string; content: string; sha256: string }>(
       `/api/site/knowledge/doc?path=${encodeURIComponent(path)}`
     ),
+  skillPreview: (skillName: string) =>
+    req<SkillPreview>(`/api/site/skills/${encodeURIComponent(skillName)}/preview`),
 }

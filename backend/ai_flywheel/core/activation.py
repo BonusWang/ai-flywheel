@@ -284,6 +284,49 @@ class ActivationEngine:
         )
         return self.db.upsert_rule(rule)
 
+    def promote_observation(
+        self, obs_id: str, *, actor: str = "user"
+    ) -> tuple[dict[str, Any], RuleRecord] | None:
+        """Promote one mistake observation into a trial rule.
+
+        The promotion is one decision, not four: the triggers are read off the
+        observation, the rule is registered, the observation is marked
+        ``promoted`` and the move is audited. Returns ``None`` when the
+        observation does not exist.
+        """
+        obs = self.db.get_mistake_observation(obs_id)
+        if not obs:
+            return None
+        tokens = re.findall(r"[a-zA-Z0-9_-]{3,}|[一-鿿]{2,6}", obs["title"])
+        triggers = list(dict.fromkeys(tokens))[:5] or ["review"]
+        sess_keys = obs.get("session_keys") or []
+        req = CreateRuleRequest(
+            title=f"避坑规则：{obs['title'][:36]}",
+            domain="engineering",
+            projects=["generic"],
+            triggers=triggers,
+            checklist=[
+                obs.get("truth") or "执行前核对前置条件并真实验证",
+                "保留真实运行证据并提交结构化回执",
+            ],
+            forbidden_routes=[obs.get("thinking_root_cause") or "跳过前置核查直接盲改"],
+            source_pointers=sess_keys[:3],
+            origin_session_key=sess_keys[0] if sess_keys else None,
+        )
+        rule = self.register_rule(req, root_cause_key=obs["root_cause_key"])
+        updated = self.db.update_mistake_observation_status(
+            obs_id, "promoted", promoted_rule_id=rule.rule_id
+        )
+        self.db.append_audit_event(
+            entity_type="mistake_observation",
+            entity_id=obs_id,
+            event_type="manual_promoted",
+            actor=actor,
+            summary=f"手动将错题「{obs['title']}」升级为试运行规则 {rule.rule_id}",
+            payload={"rule_id": rule.rule_id},
+        )
+        return (updated or obs), rule
+
     def revalidate_from_outcome(self, outcome: OutcomeRecord) -> list[dict[str, Any]]:
         """Two-tier activation lifecycle transition driven by real natural outcomes."""
         if outcome.origin != OutcomeOrigin.NATURAL:

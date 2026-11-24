@@ -1,15 +1,29 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
+from ai_flywheel import __version__
 from ai_flywheel.config import FlywheelConfig
 from ai_flywheel.core.activation import ActivationEngine
 from ai_flywheel.core.policies import PolicyEngine
-from ai_flywheel.models import OutcomeOrigin, RuleStatus, SessionStatus, VerificationKind
+from ai_flywheel.models import OutcomeOrigin, RetroStatus, RuleStatus, SessionStatus
 from ai_flywheel.storage.db import FlywheelDB
+from ai_flywheel.storage.fs_store import redact_text
 
 
-FLYWHEEL_VERSION = "0.3.0"
+FLYWHEEL_VERSION = __version__
+
+# The rule states that count as "in force". A retired, dormant or
+# needs-revision rule is not one of them and must not be shown as such.
+ACTIVE_RULE_STATUSES = frozenset(
+    {RuleStatus.VERIFIED_ACTIVE.value, RuleStatus.UNVERIFIED_ACTIVE.value}
+)
+
+# A path-looking token: an absolute Windows or POSIX path. The look-behind
+# keeps a relative path (`lessons/a.md`) and a URL (`https://host/a.md`) out of
+# the match — only a real absolute path is stripped.
+_ABS_PATH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9:/])((?:[A-Za-z]:[\\/]|/)[^\s\"'`<>|]*)")
 
 
 MCP_TOOL_CATALOG: list[dict[str, str]] = [
@@ -108,30 +122,34 @@ class PublicationLayer:
     def get_overview(self, public_mode: bool = False) -> dict[str, Any]:
         site = self.policies.load_site_profile()
         rules = self.db.list_rules()
-        sessions = self.db.list_sessions(limit=200)
-        outcomes = self.db.list_outcomes(limit=200)
-        retro_items = self.db.list_retro_items(limit=200)
         runs = self.db.list_workflow_runs(limit=20)
         preflight_count = self.db.count_preflights()
+
+        # The counts are exact: they come from COUNT(*), not from a page of rows.
+        # A page would cap the number at its size and the portal would say
+        # "20 sessions" on a store that holds 200.
+        sessions_total = self.db.count_sessions()
+        sessions_pending = self.db.count_sessions(status=SessionStatus.PENDING.value)
+        natural_outcomes_total = self.db.count_outcomes(origin=OutcomeOrigin.NATURAL.value)
+        real_verified_outcomes = self.db.count_real_verified_natural_outcomes()
+        open_retro_count = self.db.count_retro_items(
+            status=RetroStatus.OPEN.value
+        ) + self.db.count_retro_items(status=RetroStatus.IN_REVIEW.value)
+        workflow_runs_total = self.db.count_workflow_runs()
 
         rule_counts = {
             RuleStatus.UNVERIFIED_ACTIVE.value: 0,
             RuleStatus.VERIFIED_ACTIVE.value: 0,
             RuleStatus.NEEDS_REVISION.value: 0,
+            RuleStatus.DORMANT.value: 0,
             RuleStatus.RETIRED.value: 0,
         }
         for r in rules:
             rule_counts[r.status.value] = rule_counts.get(r.status.value, 0) + 1
 
-        natural_outcomes = [o for o in outcomes if o.origin == OutcomeOrigin.NATURAL]
-        real_verified_outcomes = [
-            o
-            for o in natural_outcomes
-            if any(c.kind == VerificationKind.REAL and c.result.value == "pass" for c in o.checks)
-        ]
         real_verification_rate = (
-            round(len(real_verified_outcomes) / len(natural_outcomes) * 100, 1)
-            if natural_outcomes
+            round(real_verified_outcomes / natural_outcomes_total * 100, 1)
+            if natural_outcomes_total
             else None
         )
 
@@ -142,33 +160,42 @@ class PublicationLayer:
             else None
         )
 
-        open_retro = [x for x in retro_items if x.status.value in {"open", "in_review"}]
-        pending_sessions = [s for s in sessions if s.status == SessionStatus.PENDING]
         latest_run = runs[0] if runs else None
+        # Only the rules that are in force are shown as active ones; a retired
+        # or dormant rule would otherwise be counted and labelled as if it were.
+        active_rules = [r for r in rules if r.status.value in ACTIVE_RULE_STATUSES]
+        open_retro = sorted(
+            [
+                *self.db.list_retro_items(status=RetroStatus.OPEN.value, limit=5),
+                *self.db.list_retro_items(status=RetroStatus.IN_REVIEW.value, limit=5),
+            ],
+            key=lambda item: item.created_at,
+            reverse=True,
+        )[:5]
 
         skills = [] if public_mode else self.activation.probe_local_skills()
         return {
             "site": site,
             "metrics": {
                 "preflight_activations": preflight_count,
-                "sessions_total": len(sessions),
-                "sessions_pending": len(pending_sessions),
+                "sessions_total": sessions_total,
+                "sessions_pending": sessions_pending,
                 "rules_total": len(rules),
                 "rules_by_status": rule_counts,
                 "verified_rule_ratio": verified_ratio,
-                "natural_outcomes_total": len(natural_outcomes),
+                "natural_outcomes_total": natural_outcomes_total,
                 "real_verification_rate": real_verification_rate,
-                "open_retro_count": len(open_retro),
-                "workflow_runs_total": len(runs),
+                "open_retro_count": open_retro_count,
+                "workflow_runs_total": workflow_runs_total,
                 "probed_skills_count": len(skills),
             },
             "latest_run": self._sanitize_run(latest_run.model_dump(mode="json"), public_mode)
             if latest_run
             else None,
             "recent_rules": [
-                self._sanitize_rule(r.model_dump(mode="json"), public_mode) for r in rules[:6]
+                self._sanitize_rule(r.model_dump(mode="json"), public_mode) for r in active_rules[:6]
             ],
-            "recent_retro": [r.model_dump(mode="json") for r in open_retro[:5]],
+            "recent_retro": [self._sanitize_retro(r.model_dump(mode="json"), public_mode) for r in open_retro[:5]],
             "safety_valves": self.cfg.safety_valves.model_dump(mode="json"),
             "workflow_lock": self.db.get_workflow_lock(),
         }
@@ -179,10 +206,63 @@ class PublicationLayer:
             rule["origin_session_key"] = None
         return rule
 
-    def _sanitize_run(self, run: dict[str, Any], public_mode: bool) -> dict[str, Any]:
+    def _sanitize_retro(self, item: dict[str, Any], public_mode: bool) -> dict[str, Any]:
         if public_mode and self.cfg.safety_valves.public_export_strip_paths:
-            for node in run.get("nodes", []):
-                node["artifacts"] = [a.split("/")[-1].split("\\")[-1] for a in node.get("artifacts", [])]
+            if item.get("summary"):
+                item["summary"] = redact_text(str(item["summary"]))
+            if item.get("session_key"):
+                item["session_key"] = redact_text(str(item["session_key"]))
+            if isinstance(item.get("detail"), dict):
+                item["detail"] = self._redact_structure(item["detail"])
+        return item
+
+    @staticmethod
+    def _strip_abs_paths(text: str) -> str:
+        """Take the local layout out of a path.
+
+        An absolute path is reduced to its file name: ``C:\\Users\\<name>\\kb\\lessons\\a.md``
+        becomes ``a.md`` and ``/home/<name>/kb/lessons/a.md`` becomes ``a.md`` —
+        the local layout and the account name both go. A relative path stays as
+        it is: it carries the knowledge partition (``lessons/``, ``projects/``)
+        and no private prefix.
+        """
+
+        def _one(token: str) -> str:
+            parts = [p for p in token.replace("\\", "/").split("/") if p]
+            return parts[-1] if parts else token
+
+        return _ABS_PATH_TOKEN_RE.sub(lambda m: _one(m.group(1)), text)
+
+    def _redact_structure(self, value: Any) -> Any:
+        """Walk a JSON-ish structure and take paths and credentials out of it."""
+        if isinstance(value, str):
+            return redact_text(self._strip_abs_paths(value))
+        if isinstance(value, dict):
+            return {k: self._redact_structure(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._redact_structure(v) for v in value]
+        return value
+
+    def _sanitize_run(self, run: dict[str, Any], public_mode: bool) -> dict[str, Any]:
+        if not (public_mode and self.cfg.safety_valves.public_export_strip_paths):
+            return run
+        for node in run.get("nodes", []):
+            node["artifacts"] = [self._strip_abs_paths(a) for a in node.get("artifacts", [])]
+            if node.get("payload"):
+                node["payload"] = self._redact_structure(node["payload"])
+        for write in run.get("planned_writes", []):
+            if write.get("relative_path"):
+                write["relative_path"] = redact_text(self._strip_abs_paths(str(write["relative_path"])))
+            if write.get("content_preview"):
+                write["content_preview"] = redact_text(str(write["content_preview"]))
+            if write.get("summary"):
+                write["summary"] = redact_text(str(write["summary"]))
+        if run.get("digest_markdown"):
+            run["digest_markdown"] = redact_text(str(run["digest_markdown"]))
+        if run.get("admitted_sessions"):
+            run["admitted_sessions"] = [redact_text(str(s)) for s in run["admitted_sessions"]]
+        if run.get("error"):
+            run["error"] = redact_text(self._strip_abs_paths(str(run["error"])))
         return run
 
     def build_llms_txt(self) -> str:
@@ -231,7 +311,7 @@ class PublicationLayer:
                     "signal_only": s.status == SessionStatus.PENDING,
                 }
             )
-        for r in rules[:12]:
+        for r in [rule for rule in rules if rule.status.value in ACTIVE_RULE_STATUSES][:12]:
             river_sources.append(
                 {
                     "name": r.title,

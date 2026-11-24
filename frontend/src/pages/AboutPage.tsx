@@ -4,6 +4,7 @@ import type { PageKey } from '../App'
 import { api } from '../api'
 import { CodeBlock, CopyButton } from '../components/CodeBlock'
 import { FlywheelRiver } from '../components/FlywheelRiver'
+import { labelOf, RULE_STATUS_LABELS } from '../lib/labels'
 import type { AboutPayload, RiverSource, RuleRecord } from '../types'
 
 interface Props {
@@ -72,7 +73,7 @@ function LatestRule({
           {rule.title}
         </span>
         <span className="mt-1 block truncate text-[12px] text-ink-4">
-          {rule.status === 'verified_active' ? '已真实验证' : '待自然验证'} · {rule.domain}
+          {labelOf(RULE_STATUS_LABELS, rule.status)} · {rule.domain}
         </span>
       </span>
     </button>

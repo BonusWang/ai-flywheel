@@ -1,21 +1,43 @@
 from __future__ import annotations
 
-import json
-import shutil
 import subprocess
+from pathlib import Path
 from typing import Any
 
 import httpx
 
+from ai_flywheel.adapters.lark_cli import LarkCliRunner
 from ai_flywheel.config import FlywheelConfig
 from ai_flywheel.models import WorkflowRunRecord
 
 
 class DeliveryAdapter:
-    """P07 Delivery & notification adapters: local portal, optional Git closure, Webhook, and Feishu CLI."""
+    """P07 Delivery & notification adapters: local portal, optional Git closure, Webhook, and Feishu CLI.
 
-    def __init__(self, cfg: FlywheelConfig) -> None:
+    Feishu notifications (alert / optional fyi) go through the shared LarkCliRunner so
+    they never pass through a cmd.exe shim; status distinguishes sent / failed /
+    unknown (timeout or killed process — the message may still have been delivered).
+    """
+
+    def __init__(self, cfg: FlywheelConfig, lark_runner: LarkCliRunner | None = None) -> None:
         self.cfg = cfg
+        self._lark = lark_runner
+
+    def set_lark_runner(self, runner: LarkCliRunner | None) -> None:
+        """Share one resolved lark-cli invocation with the rest of the process.
+
+        The Feishu channel and the delivery adapter would otherwise freeze two
+        copies of the same executable — and only one of them would carry the
+        configured identity.
+        """
+        self._lark = runner
+
+    @property
+    def lark(self) -> LarkCliRunner:
+        if self._lark is None:
+            fcfg = self.cfg.delivery.feishu_cli
+            self._lark = LarkCliRunner(fcfg.command, fcfg.command_args, identity=fcfg.identity)
+        return self._lark
 
     def deliver(self, run: WorkflowRunRecord, written_paths: list[str]) -> dict[str, Any]:
         results: dict[str, Any] = {
@@ -36,7 +58,7 @@ class DeliveryAdapter:
             results["webhook"] = self._post_webhook(run)
 
         if self.cfg.delivery.feishu_cli.enabled and self.cfg.delivery.feishu_cli.notify_on_fyi:
-            fres = self.send_feishu_card(
+            fres = self.send_feishu_text_notice(
                 title=f"每日沉淀已完成（{run.batch_date or run.run_id}）",
                 markdown=run.digest_markdown or f"批次 `{run.run_id}` 已自动完成。",
                 kind="fyi",
@@ -46,7 +68,7 @@ class DeliveryAdapter:
 
         return results
 
-    def send_feishu_card(
+    def send_feishu_text_notice(
         self,
         *,
         title: str,
@@ -54,7 +76,11 @@ class DeliveryAdapter:
         kind: str = "ask",
         idempotency_key: str = "",
     ) -> dict[str, Any]:
-        """Send an important decision ('ask'), alert, or optional 'fyi' message via local lark-cli."""
+        """Send an important decision ('ask'), alert, or optional 'fyi' message via local lark-cli.
+
+        The name says what it does: it sends a plain-text notice. Interactive
+        cards go through the Feishu channel, not through here.
+        """
         fcfg = self.cfg.delivery.feishu_cli
         if not fcfg.enabled:
             return {"status": "SKIPPED", "reason": "feishu_cli disabled", "external_ref": None, "error": None}
@@ -63,52 +89,33 @@ class DeliveryAdapter:
         if not fcfg.user_id and not fcfg.chat_id:
             return {"status": "SKIPPED", "reason": "no user_id or chat_id configured", "external_ref": None, "error": None}
 
-        exe = shutil.which(fcfg.command) or fcfg.command
-        # Use single-line JSON via --content so Windows .cmd wrappers never split on raw newlines
-        plain_text = f"【{title}】\n\n{markdown}".replace("**", "")
-        content_json = json.dumps({"text": plain_text[:3500]}, ensure_ascii=False)
-        cmd = [
-            exe,
-            "im",
-            "+messages-send",
-            "--as",
-            fcfg.identity or "bot",
-        ]
-        if fcfg.user_id:
-            cmd.extend(["--user-id", fcfg.user_id])
-        else:
-            cmd.extend(["--chat-id", fcfg.chat_id])
-        cmd.extend(["--msg-type", "text", "--content", content_json, "--format", "json"])
-        if idempotency_key:
-            cmd.extend(["--idempotency-key", idempotency_key[:64]])
+        plain_text = f"【{title}】\n\n{markdown}".replace("**", "")[:3500]
+        res = self.lark.send_text(
+            user_id=fcfg.user_id,
+            chat_id=fcfg.chat_id if not fcfg.user_id else "",
+            text=plain_text,
+            idempotency_key=idempotency_key,
+        )
+        return {"status": res.status, "reason": None, "external_ref": res.message_id, "error": res.error}
 
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=20,
-                check=False,
-            )
-            if proc.returncode != 0:
-                err = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()[:300]
-                return {"status": "failed", "external_ref": None, "error": err}
-            ext_ref: str | None = None
-            try:
-                parsed = json.loads(proc.stdout)
-                ext_ref = (
-                    parsed.get("data", {}).get("message_id")
-                    or parsed.get("message_id")
-                )
-            except Exception:
-                pass
-            return {"status": "sent", "external_ref": ext_ref, "error": None}
-        except Exception as exc:
-            return {"status": "failed", "external_ref": None, "error": str(exc)[:300]}
+    def send_feishu_card(self, **kwargs: Any) -> dict[str, Any]:
+        """Backward-compatible alias for :meth:`send_feishu_text_notice`.
+
+        The old name promised a card and delivered plain text. It stays as an
+        alias so existing callers keep working; new code should say what it
+        actually sends.
+        """
+        return self.send_feishu_text_notice(**kwargs)
 
     def _git_closure(self, written_paths: list[str], run_id: str) -> str:
+        """Commit the exact write-set in the knowledge repo, then publish it.
+
+        The remote and the branch come from ``delivery.git_closure`` (they
+        default to ``origin`` / ``main``). Publishing is skipped — never fatal —
+        when the clone has no such remote or the checked-out branch is not the
+        configured one: the commit is the deliverable, and a misconfigured
+        remote must not fail a batch whose writes already landed.
+        """
         kb_root = self.cfg.knowledge_root_path
         if not (kb_root / ".git").exists():
             return "SKIPPED (not a git repo)"
@@ -130,7 +137,51 @@ class DeliveryAdapter:
         )
         if commit_proc.returncode != 0 and "nothing to commit" not in commit_proc.stdout.lower():
             raise RuntimeError(f"git commit failed: {commit_proc.stderr}")
-        return "PASS (committed exact write-set)"
+        return f"PASS (committed exact write-set{self._publish_commit(kb_root)})"
+
+    def _publish_commit(self, kb_root: Path) -> str:
+        """Push the committed write-set to the configured remote/branch.
+
+        Returns a short suffix describing what happened, or an empty string
+        when there is nothing to publish.
+        """
+        closure = self.cfg.delivery.git_closure
+        remote = (closure.remote or "").strip()
+        branch = (closure.branch or "").strip()
+        if not remote or not branch:
+            return ""
+
+        remotes = subprocess.run(
+            ["git", "remote"],
+            cwd=str(kb_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if remote not in remotes.stdout.split():
+            return f"; push skipped (no remote '{remote}' in this clone)"
+
+        current = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(kb_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        current_branch = current.stdout.strip()
+        if current_branch != branch:
+            return f"; push skipped (on branch '{current_branch}', configured '{branch}')"
+
+        push = subprocess.run(
+            ["git", "push", remote, branch],
+            cwd=str(kb_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if push.returncode != 0:
+            raise RuntimeError(f"git push {remote} {branch} failed: {push.stderr or push.stdout}")
+        return f"; pushed to {remote}/{branch}"
 
     def _post_webhook(self, run: WorkflowRunRecord) -> str:
         resp = httpx.post(

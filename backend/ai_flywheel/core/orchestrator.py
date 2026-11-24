@@ -2,20 +2,45 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
+from collections import Counter
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable, Iterable
 
 from ai_flywheel.adapters.delivery import DeliveryAdapter
 from ai_flywheel.adapters.knowledge import KnowledgeSinkAdapter
-from ai_flywheel.adapters.runners import build_runner, normalize_rule_payload
+from ai_flywheel.adapters.runners import (
+    P02_MAX_SESSIONS,
+    PLAN_SOURCE_CLI,
+    PLAN_SOURCE_HEURISTIC,
+    PLAN_SOURCE_MODEL,
+    REVIEW_SOURCE_CLI,
+    REVIEW_SOURCE_HEURISTIC,
+    REVIEW_SOURCE_MODEL,
+    REVIEW_SOURCE_UNDECLARED,
+    PlanDiagnostics,
+    PlanUnavailableError,
+    ReviewUnavailableError,
+    build_runner,
+    normalize_rule_payload,
+    resolve_runner_mode,
+)
 from ai_flywheel.adapters.sessions import SessionAdapter
 from ai_flywheel.adapters.skills import SkillWriterAdapter
+from ai_flywheel.adapters.wiki_gate import (
+    ROUTE_DECLARED,
+    ROUTE_EVIDENCE,
+    UNROUTED_REASON_LABEL,
+    RouteDecision,
+    RoutingCandidates,
+)
 from ai_flywheel.config import FlywheelConfig
 from ai_flywheel.core.activation import ActivationEngine
 from ai_flywheel.core.core_card import rebuild_core_card
 from ai_flywheel.core.dream import run_dream_consolidation
+from ai_flywheel.core.heartbeat import HeartbeatManager
 from ai_flywheel.core.policies import PolicyEngine
 from ai_flywheel.models import (
     CreateRuleRequest,
@@ -24,12 +49,36 @@ from ai_flywheel.models import (
     PlannedWrite,
     RetroStatus,
     RunStatus,
+    SessionRecord,
     SessionStatus,
     WorkflowRunRecord,
+    is_sensitive_write,
     utc_now_iso,
 )
-from ai_flywheel.storage.db import FlywheelDB
+from ai_flywheel.storage.db import (
+    FlywheelDB,
+    RunAlreadyFinalizedError,
+    SEVERITY_RANK,
+    normalize_root_cause_key,
+)
 from ai_flywheel.storage.fs_store import ImmutableFileStore
+
+logger = logging.getLogger(__name__)
+
+# How the P03 node names the planner that produced the write plan.
+PLAN_SOURCE_LABELS = {
+    PLAN_SOURCE_MODEL: "API 模型",
+    PLAN_SOURCE_CLI: "本地 CLI",
+    PLAN_SOURCE_HEURISTIC: "本地启发式计划器",
+}
+
+# How the P02 node names the reviewer that reviewed the sessions.
+REVIEW_SOURCE_LABELS = {
+    REVIEW_SOURCE_MODEL: "API 模型",
+    REVIEW_SOURCE_CLI: "本地 CLI",
+    REVIEW_SOURCE_HEURISTIC: "本地启发式审查器",
+    REVIEW_SOURCE_UNDECLARED: "未声明",
+}
 
 
 NODE_TEMPLATES = [
@@ -42,6 +91,32 @@ NODE_TEMPLATES = [
     ("P06_REPORT", "机器报告与摘要", "report-worker"),
     ("P07_DELIVER", "交付与终态释锁", "delivery-worker"),
 ]
+
+
+def _unrouted_reason_breakdown(reason_counts: Counter) -> str:
+    """``<label> <count>`` per reason code, in order of first appearance."""
+    return "、".join(f"{UNROUTED_REASON_LABEL.get(code, code)} {count}" for code, count in reason_counts.items())
+
+
+def _model_call_failure_payload(exc: Exception) -> dict[str, Any]:
+    """The trace of a failed model call: the stage, the threshold, the attempts, the exception type.
+
+    Nothing about the gateway or the reply is carried: only what is needed to tell a timeout
+    from a bad request from a broken connection.
+    """
+    summary = getattr(exc, "summary", None)
+    if not isinstance(summary, dict):
+        return {}
+    payload: dict[str, Any] = {"call_error": dict(summary)}
+    telemetry = getattr(exc, "telemetry", None)
+    if isinstance(telemetry, dict):
+        payload["call_telemetry"] = dict(telemetry)
+    return payload
+
+
+# A routed document the landing adapter could not turn into a page. Not expected: the route verdict
+# already guarantees a page type the adapter can materialise.
+LANDING_FAILED_REASON = "路由通过，但落点适配未能生成页面"
 
 
 class EventBroker:
@@ -86,6 +161,23 @@ class WorkflowLockError(RuntimeError):
     """Raised when an active workflow run already holds the exclusive lock."""
 
 
+class ApprovalLockBusy(RuntimeError):
+    """Raised when an approval claim fails because another run holds an unexpired lock.
+
+    Carries the holder's run id and the lock's expiry so callers can surface a
+    meaningful retry hint (portal maps this to HTTP 409).
+    """
+
+    def __init__(self, message: str, *, lock_run_id: str | None, lock_expires_at: str | None) -> None:
+        super().__init__(message)
+        self.lock_run_id = lock_run_id
+        self.lock_expires_at = lock_expires_at
+
+
+class LockLostError(RuntimeError):
+    """Raised at a synchronous checkpoint when the lock is gone or no longer ours."""
+
+
 class WorkflowOrchestrator:
     """Autonomous P00-P07 state machine with approval gate, fail-run safety, and SSE visibility."""
 
@@ -101,7 +193,11 @@ class WorkflowOrchestrator:
         delivery: DeliveryAdapter,
         broker: EventBroker,
         skill_writer: SkillWriterAdapter | None = None,
+        heartbeat_interval_seconds: float = 15.0,
+        feishu_channel=None,
+        on_node_begin: Callable[[str, str], None] | None = None,
     ) -> None:
+        self.feishu_channel = feishu_channel
         self.cfg = cfg
         self.db = db
         self.fs_store = fs_store
@@ -112,6 +208,82 @@ class WorkflowOrchestrator:
         self.delivery = delivery
         self.broker = broker
         self.skill_writer = skill_writer or SkillWriterAdapter(cfg)
+        # Optional hook called right after a node starts: (run_id, node_id).
+        # Verification harnesses use it to park a run mid-pipeline; production
+        # never sets it.
+        self.on_node_begin = on_node_begin
+        self.heartbeat = HeartbeatManager(
+            self.db.renew_workflow_lock,
+            interval_seconds=heartbeat_interval_seconds,
+        )
+
+    def _start_heartbeat(self, run_id: str) -> None:
+        self.heartbeat.start(run_id)
+
+    def _stop_heartbeat(self) -> None:
+        self.heartbeat.stop()
+
+    def _ensure_lock(self, run: WorkflowRunRecord) -> None:
+        """Synchronous lock checkpoint before a side effect: renew or fail the run."""
+        if not self.db.renew_workflow_lock(run.run_id):
+            raise LockLostError(f"执行期间失去独占锁：{run.run_id}（锁缺失或已易主）")
+
+    def recover_interrupted_runs(self, *, now: str | None = None, stale_after_seconds: int = 300) -> list[str]:
+        """Reap runs whose executor is gone (stale heartbeat) and reconcile ask cards.
+
+        Called at serve startup and every recovery interval; conditional terminal
+        entry means the reaper, a zombie executor and a second serve process can
+        all race safely — only one application wins per run.
+        """
+        recovered: list[str] = []
+        for row in self.db.list_stale_running_runs(now=now, stale_after_seconds=stale_after_seconds):
+            run_id = row["run_id"]
+            run = self.db.get_workflow_run(run_id)
+            if run is None or run.status != RunStatus.RUNNING:
+                continue
+            failed_node = next(
+                (n.node_id for n in run.nodes if n.status not in {NodeStatus.PASS, NodeStatus.SKIPPED, NodeStatus.FAILED}),
+                None,
+            )
+            reason = "执行进程中断（服务重启或执行者消失）"
+            for n in run.nodes:
+                if n.status in {NodeStatus.PENDING, NodeStatus.RUNNING, NodeStatus.AWAITING_APPROVAL}:
+                    if failed_node and n.node_id == failed_node:
+                        n.status = NodeStatus.FAILED
+                        n.error = reason
+                        n.summary = f"执行被中断：{reason}"
+                    else:
+                        n.status = NodeStatus.SKIPPED
+                        n.summary = "因执行被中断而跳过"
+            applied = self.db.finish_run_terminal(
+                run_id,
+                status="FAILED",
+                card_state="failed",
+                error=reason,
+                failed_node=failed_node or "P00_PREPARE",
+                result_summary=f"{failed_node} 执行被中断" if failed_node else "执行被中断（无失败节点）",
+                source="reaper",
+                audit_event=(
+                    "run_failed",
+                    f"执行被中断：{reason}",
+                    {"failed_node": failed_node, "reason": reason, "recovered": True},
+                ),
+                now=now,
+            )
+            if not applied:
+                continue
+            self._finalize_terminal_artifacts(
+                run,
+                status=RunStatus.FAILED,
+                error=reason,
+                receipt_name=f"{run_id}-failed",
+                event_type="run_failed",
+                extra={"failed_node": failed_node, "reason": reason, "recovered": True},
+                continue_on_finalized=True,
+            )
+            recovered.append(run_id)
+        self.db.reconcile_decision_cards(now=now)
+        return recovered
 
     @staticmethod
     def resolve_phase(phase: str, now_utc: datetime | None = None) -> str:
@@ -135,9 +307,13 @@ class WorkflowOrchestrator:
         # Smart mode: routine notes & trial rules auto-pass; only Skill creation/updates, high-risk, or large batches pause
         reasons: list[str] = []
         for w in planned_writes:
+            # The same predicate the Feishu card and the portal use: a write the
+            # card calls sensitive is sensitive for the gate, too.
+            if not is_sensitive_write(w):
+                continue
             if w.target_kind == "skill_improvement":
                 reasons.append(w.approval_reason or f"涉及 Skill 变更：{w.title}")
-            elif w.requires_approval or w.action in {"delete", "overwrite_core"}:
+            else:
                 reasons.append(w.approval_reason or f"重要变更：{w.title}")
         if len(planned_writes) > high_write_threshold:
             reasons.append(f"本批建议写入共 {len(planned_writes)} 项（超过自动放行阈值 {high_write_threshold}）")
@@ -172,6 +348,8 @@ class WorkflowOrchestrator:
         node.status = NodeStatus.RUNNING
         node.started_at = utc_now_iso()
         self.db.save_workflow_run(run)
+        if self.on_node_begin is not None:
+            self.on_node_begin(run.run_id, node_id)
         self._emit_run("node_update", run, {"active_node": node_id})
         return time.perf_counter()
 
@@ -205,21 +383,393 @@ class WorkflowOrchestrator:
         )
         node.receipt_hash = rhash[:16]
         self.db.save_workflow_run(run)
+        # Node-end lock renewal: non-fatal here; the next synchronous checkpoint
+        # (or the heartbeat watchdog semantics) treats actual loss as a fail-run.
+        try:
+            self.db.renew_workflow_lock(run.run_id)
+        except Exception:
+            logger.warning("lock renewal at node end failed for %s", run.run_id, exc_info=True)
         self._emit_run("node_update", run, {"active_node": node_id})
 
-    def _fail_run(self, run: WorkflowRunRecord, failed_node_id: str, reason: str, t0: float) -> WorkflowRunRecord:
+    def _trace_dropped_plan_items(self, run: WorkflowRunRecord, plan_info: PlanDiagnostics) -> None:
+        """Put every planned-write item that did not make it into the plan into the audit trail and the log."""
+        invalid = len(plan_info.dropped_items) - plan_info.over_limit_count
+        self.db.append_audit_event(
+            entity_type="workflow_run",
+            entity_id=run.run_id,
+            event_type="plan_items_dropped",
+            actor="p03_plan",
+            summary=(
+                f"{len(plan_info.dropped_items)} 个计划项未列入写入计划"
+                f"（{invalid} 项未通过校验，{plan_info.over_limit_count} 项超出单批上限）"
+            ),
+            payload=plan_info.to_dict(),
+        )
+        logger.warning(
+            "Run %s: %s planned-write item(s) not planned (%s invalid, %s over limit): %s",
+            run.run_id,
+            len(plan_info.dropped_items),
+            invalid,
+            plan_info.over_limit_count,
+            [(item["index"], item["reasons"]) for item in plan_info.dropped_items],
+        )
+
+    def _trace_unavailable_plan(self, run: WorkflowRunRecord, exc: PlanUnavailableError) -> None:
+        """Leave the per-item evidence on the P03 node and in the audit trail before the run fails."""
+        self._get_node(run, "P03_ROUTE_PLAN").payload = {
+            "plan_source": exc.diagnostics.source,
+            "plan_diagnostics": exc.diagnostics.to_dict(),
+            "plan_error": str(exc),
+        }
+        if exc.diagnostics.dropped_items:
+            self._trace_dropped_plan_items(run, exc.diagnostics)
+        logger.warning("Run %s: P03 write plan unavailable: %s", run.run_id, exc)
+
+    def _trace_unavailable_review(self, run: WorkflowRunRecord, exc: ReviewUnavailableError) -> None:
+        """Leave the reason on the P02 node and in the audit trail before the run fails."""
+        diagnostics = exc.diagnostics
+        self._get_node(run, "P02_REVIEW").payload = {
+            "review_source": diagnostics.source,
+            "review_diagnostics": diagnostics.to_dict(),
+            "review_error": str(exc),
+        }
+        self.db.append_audit_event(
+            entity_type="workflow_run",
+            entity_id=run.run_id,
+            event_type="review_unavailable",
+            actor="p02_review",
+            summary=(
+                f"{REVIEW_SOURCE_LABELS.get(diagnostics.source, diagnostics.source)}的审查结果不可用，本批不审查、不写入"
+            ),
+            payload={**diagnostics.to_dict(), "message": str(exc)},
+        )
+        logger.warning("Run %s: P02 review unavailable: %s", run.run_id, exc)
+
+    def _stored_sessions(self, session_keys: list[str]) -> dict[str, SessionRecord]:
+        """Source session records of a planned write, looked up where runs persist them."""
+        return {record.session_key: record for key in session_keys if (record := self.db.get_session(key))}
+
+    # ---------------- P02: read-only mistake & dissent candidates ----------------
+
+    @staticmethod
+    def _normalize_candidate_mistake(raw: Any) -> dict[str, Any] | None:
+        """One mistake a review found, normalized into the shape the observation pool uses."""
+        if not isinstance(raw, dict) or not raw.get("root_cause_key"):
+            return None
+        key = normalize_root_cause_key(str(raw["root_cause_key"]))
+        if not key:
+            return None
+        grade = str(raw.get("severity_grade") or "yellow_caught")
+        if grade not in SEVERITY_RANK:
+            grade = "yellow_caught"
+        caught_by = str(raw.get("caught_by") or "self")
+        if caught_by not in {"user", "tool", "self"}:
+            caught_by = "self"
+        return {
+            "root_cause_key": key,
+            "severity_grade": grade,
+            "title": str(raw.get("title") or key),
+            "phenomenon": str(raw.get("phenomenon") or ""),
+            "truth": str(raw.get("truth") or ""),
+            "thinking_root_cause": str(raw.get("thinking_root_cause") or ""),
+            "caught_by": caught_by,
+            "session_key": str(raw.get("session_key") or ""),
+        }
+
+    def _candidate_mistakes(self, raw_mistakes: list[Any]) -> list[dict[str, Any]]:
+        """The mistakes this review found, normalized. Nothing is written to the pool here."""
+        candidates: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw in raw_mistakes:
+            candidate = self._normalize_candidate_mistake(raw)
+            if candidate is None:
+                continue
+            key = candidate["root_cause_key"]
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(candidate)
+        return candidates
+
+    @staticmethod
+    def _candidate_dissents(raw_dissents: list[Any]) -> list[dict[str, Any]]:
+        """The counter-evidence this review found, normalized. Nothing is written here."""
+        candidates: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for raw in raw_dissents:
+            if not isinstance(raw, dict) or not raw.get("target_id") or not raw.get("counter_claim"):
+                continue
+            target_type = str(raw.get("target_type") or "rule")
+            if target_type not in {"rule", "knowledge_doc", "skill"}:
+                target_type = "rule"
+            entry = {
+                "target_type": target_type,
+                "target_id": str(raw["target_id"]),
+                "counter_claim": str(raw["counter_claim"]),
+                "condition_scope": str(raw.get("condition_scope") or ""),
+                "evidence_pointer": str(raw.get("evidence_pointer") or ""),
+                "session_key": str(raw.get("session_key") or ""),
+            }
+            fingerprint = (entry["target_type"], entry["target_id"], entry["counter_claim"])
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            candidates.append(entry)
+        return candidates
+
+    @staticmethod
+    def _qualifies_for_promotion(severity_grade: str, occurrence_count: int) -> bool:
+        """The two-track rule: a red silent mistake promotes at once, a self-caught one after three."""
+        if severity_grade == "red_silent":
+            return True
+        return severity_grade == "yellow_caught" and occurrence_count >= 3
+
+    def _eligible_promotions(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """The mistakes that may become rules this batch — computed without writing anything.
+
+        Two sources: the observations already in the pool that qualify, and the mistakes this
+        review found whose *projected* occurrence count qualifies them (the count they would
+        reach once P04 persists them).
+        """
+        eligible: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for obs in self.db.list_mistake_observations(status="observing", limit=200):
+            key = str(obs.get("root_cause_key") or "")
+            if not key or key in seen:
+                continue
+            if not self._qualifies_for_promotion(
+                str(obs.get("severity_grade") or ""), int(obs.get("occurrence_count") or 1)
+            ):
+                continue
+            seen.add(key)
+            eligible.append(dict(obs))
+
+        for candidate in candidates:
+            key = candidate["root_cause_key"]
+            if key in seen:
+                continue
+            existing = self.db.get_mistake_observation_by_root_cause_key(key)
+            if existing and str(existing.get("status")) != "observing":
+                # Already promoted or archived: it never re-enters the promotion list.
+                continue
+            grade = candidate["severity_grade"]
+            count = 1
+            session_keys: list[str] = []
+            obs_id: str | None = None
+            if existing:
+                obs_id = str(existing.get("obs_id") or "") or None
+                existing_grade = str(existing.get("severity_grade") or "")
+                if SEVERITY_RANK.get(existing_grade, 1) > SEVERITY_RANK.get(grade, 1):
+                    # The pool only ever upgrades a severity, never downgrades it.
+                    grade = existing_grade
+                session_keys = [str(k) for k in (existing.get("session_keys") or [])]
+                count = int(existing.get("occurrence_count") or 1)
+                # The same session seen again does not add an occurrence.
+                if candidate["session_key"] and candidate["session_key"] in session_keys:
+                    count += 0
+                else:
+                    count += 1
+                if candidate["session_key"]:
+                    session_keys = list(dict.fromkeys([*session_keys, candidate["session_key"]]))
+            if not self._qualifies_for_promotion(grade, count):
+                continue
+            seen.add(key)
+            eligible.append(
+                {
+                    "obs_id": obs_id,
+                    "root_cause_key": key,
+                    "severity_grade": grade,
+                    "title": candidate["title"] or (existing or {}).get("title") or key,
+                    "phenomenon": candidate["phenomenon"] or (existing or {}).get("phenomenon") or "",
+                    "truth": candidate["truth"] or (existing or {}).get("truth") or "",
+                    "thinking_root_cause": candidate["thinking_root_cause"]
+                    or (existing or {}).get("thinking_root_cause")
+                    or "",
+                    "caught_by": candidate["caught_by"],
+                    "occurrence_count": count,
+                    "session_keys": session_keys,
+                    "status": "observing",
+                    "is_candidate": True,
+                }
+            )
+        return eligible
+
+    def _record_partial_writes(
+        self,
+        run: WorkflowRunRecord,
+        write_receipts: list[dict[str, Any]],
+        written_paths: list[str],
+        error: BaseException,
+    ) -> None:
+        """Leave the receipts of a half-done batch on the P04 node before the run fails."""
+        node = self._get_node(run, "P04_WRITE_VERIFY")
+        node.payload = {
+            **(node.payload or {}),
+            "partial_write_receipts": list(write_receipts),
+            "partial_written_paths": list(written_paths),
+            "partial_write_error": str(error),
+        }
+
+    def _promote_observation(
+        self, rule_id: str, obs_id: Any, root_cause_key: Any
+    ) -> str | None:
+        """Link a freshly registered rule to the mistake observation it came from.
+
+        The rule carries either the observation id or the root cause key; both are
+        accepted, because a model plan may know the key but not the generated id.
+        Returns the observation id that was promoted, if any.
+        """
+        target_obs_id = str(obs_id).strip() if obs_id else ""
+        if not target_obs_id:
+            key = normalize_root_cause_key(str(root_cause_key or ""))
+            if key:
+                existing = self.db.get_mistake_observation_by_root_cause_key(key)
+                if existing:
+                    target_obs_id = str(existing.get("obs_id") or "")
+        if not target_obs_id:
+            return None
+        updated = self.db.update_mistake_observation_status(
+            target_obs_id, "promoted", promoted_rule_id=rule_id
+        )
+        return target_obs_id if updated else None
+
+    def _route_knowledge_doc(
+        self,
+        run: WorkflowRunRecord,
+        item: PlannedWrite,
+        sessions_by_key: dict[str, SessionRecord],
+        candidates: RoutingCandidates | None,
+    ) -> RouteDecision:
+        """Validate a knowledge document's routing declaration against the mounted Wiki contract.
+
+        Only the dry-run planner's plans fall back to evidence-based routing; a model plan must
+        declare where every knowledge document lives.
+        """
+        project_hint: list[str] = []
+        workspaces: list[str] = []
+        for sk in item.source_session_keys:
+            record = sessions_by_key.get(sk)
+            if record:
+                project_hint.extend([record.project, record.workspace])
+                if record.workspace:
+                    workspaces.append(record.workspace)
+        return self.knowledge.wiki_gate.evaluate_route(
+            relative_path=item.relative_path,
+            title=item.title,
+            summary=item.summary,
+            content=item.content_preview,
+            wiki_route=item.wiki_route,
+            source_workspaces=workspaces,
+            project_hint=" ".join(project_hint),
+            allow_evidence_fallback=run.runner_mode == "dry_run",
+            candidates=candidates,
+        )
+
+    def _mark_remaining_nodes_skipped(
+        self,
+        run: WorkflowRunRecord,
+        *,
+        reason: str,
+        node_ids: Iterable[str] | None = None,
+    ) -> list[str]:
+        """Mark the nodes that will never run as SKIPPED and say why.
+
+        With ``node_ids`` the given nodes are marked; without it every node that
+        has not reached a terminal status yet is marked. Nodes that already
+        finished keep their status: a failure never rewrites history.
+        """
+        targets = (
+            list(node_ids)
+            if node_ids is not None
+            else [
+                n.node_id
+                for n in run.nodes
+                if n.status in {NodeStatus.PENDING, NodeStatus.RUNNING, NodeStatus.AWAITING_APPROVAL}
+            ]
+        )
+        skipped: list[str] = []
+        for nid in targets:
+            node = self._get_node(run, nid)
+            if node.status in {NodeStatus.PASS, NodeStatus.FAILED, NodeStatus.SKIPPED}:
+                continue
+            node.status = NodeStatus.SKIPPED
+            node.summary = reason
+            skipped.append(nid)
+        return skipped
+
+    def _finalize_terminal_artifacts(
+        self,
+        run: WorkflowRunRecord,
+        *,
+        status: RunStatus,
+        receipt_name: str,
+        event_type: str,
+        error: str | None = None,
+        extra: dict[str, Any] | None = None,
+        release_sessions: bool = True,
+        save_row: bool = True,
+        continue_on_finalized: bool = False,
+        notify: Callable[[], None] | None = None,
+    ) -> WorkflowRunRecord:
+        """Close a terminal run: status, sessions, stored row, receipt and the SSE event.
+
+        The three terminal paths (fail-run, the reaper and a cancellation) differ
+        only in the values they pass; the write-back sequence is identical, so it
+        lives here instead of being repeated three times.
+
+        ``continue_on_finalized`` decides what happens when the stored row is
+        already final with a different status: the reaper still wants its receipt
+        and event, the fail-run path reports the stored run instead.
+        """
+        run.status = status
+        run.error = error if error is not None else run.error
+        run.finished_at = utc_now_iso()
+        run.lock_released = True
+        if release_sessions:
+            # Admitted sessions go back to the queue: a run that ended without
+            # settling them must never strand them.
+            for sk in run.admitted_sessions:
+                self.db.update_session_status(sk, SessionStatus.PENDING)
+        if save_row:
+            try:
+                self.db.save_workflow_run(run)
+            except RunAlreadyFinalizedError:
+                stored = self.db.get_workflow_run(run.run_id)
+                if stored is None:
+                    stored = run
+                if not continue_on_finalized:
+                    return stored
+                run = stored
+        if notify is not None:
+            notify()
+        self.fs_store.write_receipt("runs", receipt_name, run.model_dump(mode="json"))
+        self._emit_run(event_type, run, extra)
+        return run
+
+    def _fail_run(
+        self,
+        run: WorkflowRunRecord,
+        failed_node_id: str,
+        reason: str,
+        t0: float,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> WorkflowRunRecord:
         node = self._get_node(run, failed_node_id)
         node.status = NodeStatus.FAILED
         node.finished_at = utc_now_iso()
         node.duration_ms = max(1, int((time.perf_counter() - t0) * 1000))
         node.error = reason
         node.summary = f"节点执行失败：{reason}"
+        if extra_payload:
+            # What the failed call was: the stage, the threshold, the attempts and the exception
+            # type. Never the gateway address, never the reply.
+            node.payload = {**node.payload, **extra_payload}
 
         # Mark all unexecuted downstream nodes explicitly as SKIPPED
-        for other in run.nodes:
-            if other.status in {NodeStatus.PENDING, NodeStatus.AWAITING_APPROVAL}:
-                other.status = NodeStatus.SKIPPED
-                other.summary = f"因前置节点 {failed_node_id} 失败而跳过"
+        self._mark_remaining_nodes_skipped(
+            run, reason=f"因前置节点 {failed_node_id} 失败而跳过"
+        )
 
         run.status = RunStatus.FAILED
         run.error = reason
@@ -230,30 +780,49 @@ class WorkflowOrchestrator:
             f"- **原因**：{reason}\n"
             f"- **锁状态**：已按 `fail-run` 契约安全释放独占锁\n"
         )
-        # Return admitted sessions back to pending so a failed run never strands them
-        for sk in run.admitted_sessions:
-            self.db.update_session_status(sk, SessionStatus.PENDING)
-        self.db.release_workflow_lock(run.run_id)
-        run.lock_released = True
-        self.db.save_workflow_run(run)
-        self.db.append_audit_event(
-            entity_type="workflow_run",
-            entity_id=run.run_id,
-            event_type="run_failed",
-            actor=failed_node_id,
-            summary=f"节点 {failed_node_id} 失败：{reason}",
-            payload={"failed_node": failed_node_id, "reason": reason},
+        payload = {"failed_node": failed_node_id, "reason": reason}
+        if extra_payload:
+            payload.update(extra_payload)
+        applied = self.db.finish_run_terminal(
+            run.run_id,
+            status="FAILED",
+            card_state="failed",
+            error=reason,
+            failed_node=failed_node_id,
+            result_summary=f"{failed_node_id} 失败：{reason}",
+            source="orchestrator",
+            audit_event=("run_failed", f"节点 {failed_node_id} 失败：{reason}", payload),
         )
-        if self.cfg.delivery.feishu_cli.enabled:
-            self.delivery.send_feishu_card(
+        if not applied:
+            # Already finalized (e.g. reaped as interrupted): the stored run is the truth.
+            stored = self.db.get_workflow_run(run.run_id)
+            if stored is not None:
+                return stored
+
+        def _alert() -> None:
+            if not (applied and self.cfg.delivery.feishu_cli.enabled):
+                return
+            self.delivery.send_feishu_text_notice(
                 title=f"AI 飞轮运行异常（{run.batch_date or run.run_id}）",
                 markdown=f"- 失败环节：`{failed_node_id}`\n- 原因：{reason}\n- 已安全释放锁，请检查详情。",
                 kind="alert",
                 idempotency_key=f"flywheel-fail-{run.run_id}",
             )
-        self.fs_store.write_receipt("runs", f"{run.run_id}-failed", run.model_dump(mode="json"))
-        self._emit_run("run_failed", run, {"failed_node": failed_node_id, "reason": reason})
-        return run
+
+        return self._finalize_terminal_artifacts(
+            run,
+            status=RunStatus.FAILED,
+            error=reason,
+            receipt_name=f"{run.run_id}-failed",
+            event_type="run_failed",
+            extra={"failed_node": failed_node_id, "reason": reason},
+            notify=_alert,
+        )
+
+    @staticmethod
+    def new_run_id() -> str:
+        """The id of a run that has not been created yet."""
+        return f"run-{uuid.uuid4().hex[:10]}"
 
     def start_run(
         self,
@@ -263,21 +832,21 @@ class WorkflowOrchestrator:
         session_keys: list[str] | None = None,
         auto_approve_override: bool | None = None,
         simulate_fail_node: str | None = None,
+        run_id: str | None = None,
     ) -> WorkflowRunRecord:
         if not self.cfg.safety_valves.workflow_enabled:
             raise RuntimeError("Workflow execution is disabled by safety valve WORKFLOW_ENABLED=false.")
 
-        run_id = f"run-{uuid.uuid4().hex[:10]}"
+        # A caller that already holds the lock for this id (the background
+        # trigger takes the lock before handing the pipeline to a thread) may
+        # pass the id in; taking the lock again for the same id just refreshes it.
+        run_id = run_id or self.new_run_id()
         if not self.db.acquire_workflow_lock(run_id):
             lock = self.db.get_workflow_lock()
             raise WorkflowLockError(f"Another workflow run already holds the lock: {lock}")
+        self._start_heartbeat(run_id)
 
-        if self.cfg.runner.mode == "api" and self.cfg.runner.api.base_url and self.cfg.runner.api.model and self.cfg.safety_valves.cli_execution_enabled:
-            runner_mode = f"api:{self.cfg.runner.api.model}"
-        elif self.cfg.runner.mode == "cli" and self.cfg.runner.cli.command and self.cfg.safety_valves.cli_execution_enabled:
-            runner_mode = "cli"
-        else:
-            runner_mode = "dry_run"
+        runner_mode = resolve_runner_mode(self.cfg)
         resolved_phase = self.resolve_phase(phase)
         if resolved_phase == "both" and not self.cfg.workflow.friday_weekly_enabled:
             resolved_phase = "daily"
@@ -334,12 +903,17 @@ class WorkflowOrchestrator:
                     summary=f"规则初筛自动跳过 {triage_report['skipped']} 条临时/碎片会话",
                     payload=triage_report,
                 )
-            pending = self.db.list_sessions(status=SessionStatus.PENDING.value, limit=50)
             if session_keys:
-                selected_sessions = [s for s in self.db.list_sessions(limit=200) if s.session_key in set(session_keys)]
+                # Explicitly named sessions are fetched one by one: filtering a recency-limited
+                # page would silently drop the ones that are not among the most recent.
+                wanted = list(dict.fromkeys(str(sk) for sk in session_keys))
+                selected_sessions = [
+                    record for sk in wanted if (record := self.db.get_session(sk)) is not None
+                ]
             else:
-                priority_order = {"P0_CORE": 0, "P1_SIGNAL": 1, "P1_GENERAL": 2, "P2_META": 3}
-                selected_sessions = sorted(pending, key=lambda s: priority_order.get(s.priority, 9))
+                # The priority order lives in SQL, so a P0_CORE session beyond the recency
+                # window is never starved by a flood of P1_GENERAL sessions.
+                selected_sessions = self.db.list_pending_sessions_prioritized(limit=50)
             self._finish_node(
                 run,
                 "P00_PREPARE",
@@ -368,6 +942,11 @@ class WorkflowOrchestrator:
                 raise RuntimeError("Simulated P01 failure")
             max_sess = self.cfg.workflow.max_sessions_per_run
             max_chars = self.cfg.workflow.max_chars_per_run
+            if runner_mode != "dry_run":
+                # The model reviewers only see the first P02_MAX_SESSIONS. Admitting more would
+                # leave the surplus unreviewed, so it stays `pending` for the next batch instead
+                # of being admitted, skipped by P02 and silently settled by P05.
+                max_sess = min(max_sess, P02_MAX_SESSIONS)
             admitted: list[tuple[Any, str]] = []
             used_chars = 0
             for sess in selected_sessions[:max_sess]:
@@ -398,70 +977,54 @@ class WorkflowOrchestrator:
             runner = build_runner(self.cfg, self.fs_store)
             open_retros = self.db.list_retro_items(status=RetroStatus.OPEN.value, limit=50)
             existing_skills = self.activation.probe_local_skills()
-            review_findings = runner.review_sessions(
-                admitted,
-                open_retros,
-                existing_skills=existing_skills,
-                phase=resolved_phase,
-            )
-
-            # v3: Persist extracted mistakes into Mistake Observation Pool & evaluate two-track promotion
-            persisted_mistakes: list[dict[str, Any]] = []
-            eligible_promotions: list[dict[str, Any]] = []
-            seen_promo_keys: set[str] = set()
-            for raw_m in review_findings.get("mistakes") or []:
-                if not isinstance(raw_m, dict) or not raw_m.get("root_cause_key"):
-                    continue
-                obs, _created = self.db.upsert_mistake_observation(
-                    root_cause_key=str(raw_m["root_cause_key"]),
-                    title=str(raw_m.get("title") or raw_m["root_cause_key"]),
-                    severity_grade=str(raw_m.get("severity_grade") or "yellow_caught"),
-                    phenomenon=str(raw_m.get("phenomenon") or ""),
-                    truth=str(raw_m.get("truth") or ""),
-                    thinking_root_cause=str(raw_m.get("thinking_root_cause") or ""),
-                    caught_by=str(raw_m.get("caught_by") or "self"),
-                    session_key=str(raw_m.get("session_key") or ""),
+            try:
+                review_findings = runner.review_sessions(
+                    admitted,
+                    open_retros,
+                    existing_skills=existing_skills,
+                    phase=resolved_phase,
                 )
-                persisted_mistakes.append(obs)
-                if (
-                    obs["status"] == "observing"
-                    and (
-                        obs["severity_grade"] == "red_silent"
-                        or (obs["severity_grade"] == "yellow_caught" and int(obs["occurrence_count"]) >= 3)
-                    )
-                    and obs["root_cause_key"] not in seen_promo_keys
-                ):
-                    seen_promo_keys.add(obs["root_cause_key"])
-                    eligible_promotions.append(obs)
+            except ReviewUnavailableError as exc:
+                # The configured reviewer produced nothing usable: fail the run, never swap in another reviewer.
+                self._trace_unavailable_review(run, exc)
+                raise
+            # A runner that does not say where its review came from is reported as undeclared, never guessed.
+            review_source = review_findings.get("review_source") or REVIEW_SOURCE_UNDECLARED
 
-            # v3: Persist extracted dissents / counter-evidence without overwriting existing rules
-            persisted_dissents: list[dict[str, Any]] = []
-            for raw_d in review_findings.get("dissents") or []:
-                if not isinstance(raw_d, dict) or not raw_d.get("target_id") or not raw_d.get("counter_claim"):
-                    continue
-                d_rec = self.db.add_dissent_record(
-                    target_type=str(raw_d.get("target_type") or "rule"),
-                    target_id=str(raw_d["target_id"]),
-                    counter_claim=str(raw_d["counter_claim"]),
-                    condition_scope=str(raw_d.get("condition_scope") or ""),
-                    evidence_pointer=str(raw_d.get("evidence_pointer") or ""),
-                    session_key=str(raw_d.get("session_key") or ""),
-                )
-                persisted_dissents.append(d_rec)
-
+            # v3: P02 stays read-only. The mistakes and dissents it found are candidates only:
+            # they enter the observation pool in P04, i.e. after the batch was approved.
+            candidate_mistakes = self._candidate_mistakes(review_findings.get("mistakes") or [])
+            candidate_dissents = self._candidate_dissents(review_findings.get("dissents") or [])
+            eligible_promotions = self._eligible_promotions(candidate_mistakes)
+            sent_session_keys = [
+                str(key)
+                for key in (review_findings.get("sent_session_keys") or [])
+                if str(key)
+            ]
+            review_findings["candidate_mistakes"] = candidate_mistakes
+            review_findings["candidate_dissents"] = candidate_dissents
             review_findings["eligible_promotions"] = eligible_promotions
-            review_findings["persisted_mistake_count"] = len(persisted_mistakes)
-            review_findings["persisted_dissent_count"] = len(persisted_dissents)
+            review_findings["sent_session_keys"] = sent_session_keys
+            review_findings["candidate_mistake_count"] = len(candidate_mistakes)
+            review_findings["candidate_dissent_count"] = len(candidate_dissents)
 
             wf_candidates = len(review_findings.get("repeated_workflows", []))
+            logger.info(
+                "Run %s: P02 review from %s (%s finding(s) for %s session(s) sent)",
+                run.run_id,
+                review_source,
+                len(review_findings.get("findings") or []),
+                (review_findings.get("review_diagnostics") or {}).get("sessions_sent", "?"),
+            )
             self._finish_node(
                 run,
                 "P02_REVIEW",
                 t0,
                 summary=(
+                    f"审查来源：{REVIEW_SOURCE_LABELS.get(review_source, review_source)}；"
                     f"完成 {review_findings.get('sessions_reviewed', 0)} 段对话回顾"
-                    f"（入池错题 {len(persisted_mistakes)} 条、可晋升 {len(eligible_promotions)} 条、"
-                    f"分歧 {len(persisted_dissents)} 条、流程候选 {wf_candidates} 处）"
+                    f"（候选错题 {len(candidate_mistakes)} 条、可晋升 {len(eligible_promotions)} 条、"
+                    f"候选分歧 {len(candidate_dissents)} 条、流程候选 {wf_candidates} 处）"
                 ),
                 internal_checks=[
                     {"name": "对话事实回顾", "status": "PASS"},
@@ -469,15 +1032,22 @@ class WorkflowOrchestrator:
                         "name": "错题观察池双轨准入与分歧保留",
                         "status": "PASS",
                         "detail": {
-                            "mistakes": len(persisted_mistakes),
+                            "mistakes": len(candidate_mistakes),
                             "eligible_promotions": len(eligible_promotions),
-                            "dissents": len(persisted_dissents),
+                            "dissents": len(candidate_dissents),
+                            "written": False,
                         },
                     },
                     {"name": "重复流程与 Skill 线索扫描", "status": "PASS", "detail": {"candidates": wf_candidates}},
                     {"name": "问题线索关联", "status": "PASS", "detail": {"open_retros": len(open_retros)}},
                 ],
-                payload=review_findings,
+                payload={
+                    **review_findings,
+                    "review_source": review_source,
+                    # What the model call cost: attempts, duration, served model, token usage.
+                    "call_telemetry": (review_findings.get("review_diagnostics") or {}).get("call_telemetry")
+                    or review_findings.get("call_telemetry"),
+                },
             )
 
             # ---------------- P03 ROUTE & PLAN ----------------
@@ -495,56 +1065,190 @@ class WorkflowOrchestrator:
                 if self.cfg.knowledge_sink.allowed_write_prefixes
                 else "lessons/"
             )
-            planned_writes = runner.plan_writes(
-                review_findings,
-                existing_rules,
-                max_write_set=max_ws,
-                default_doc_prefix=default_prefix,
-                existing_skills=existing_skills,
-                phase=resolved_phase,
+            # The routing candidate set (page types and projects read off the mounted Wiki) goes to the planner.
+            routing_candidates = (
+                self.knowledge.wiki_gate.routing_candidates() if self.knowledge.wiki_gate.applicable else None
             )
-            # If a schema-governed Wiki is mounted, normalize knowledge_doc writes to pass WikiGate cleanly
+            try:
+                plan_outcome = runner.plan_writes_detailed(
+                    review_findings,
+                    existing_rules,
+                    max_write_set=max_ws,
+                    default_doc_prefix=default_prefix,
+                    existing_skills=existing_skills,
+                    phase=resolved_phase,
+                    routing_candidates=routing_candidates,
+                )
+            except PlanUnavailableError as exc:
+                # The configured planner produced nothing usable: fail the run, never swap in another planner.
+                self._trace_unavailable_plan(run, exc)
+                raise
+            planned_writes = plan_outcome.planned_writes
+            plan_info = plan_outcome.diagnostics
+            # On a schema-governed Wiki every knowledge_doc is routed before it is adapted: the planner's
+            # declaration, validated against workspace and draft evidence and never corrected, says whether
+            # it is written and where. A document without a consistent route is dropped here and surfaced
+            # instead of being guessed into a project or failing the whole batch in P04.
+            unrouted_docs: list[dict[str, Any]] = []
+            routed_docs: list[dict[str, Any]] = []
             if self.knowledge.wiki_gate.applicable:
                 used_norm_paths: set[str] = set()
                 sess_by_key = {s.session_key: s for s, _ in admitted}
+                routed_writes: list[PlannedWrite] = []
                 for w in planned_writes:
                     if w.target_kind != "knowledge_doc":
+                        routed_writes.append(w)
                         continue
-                    hint_parts = []
-                    for sk in w.source_session_keys:
-                        sr = sess_by_key.get(sk)
-                        if sr:
-                            hint_parts.extend([sr.project, sr.workspace])
-                    new_rel, new_md = self.knowledge.wiki_gate.normalize_planned_document(
-                        w.relative_path,
-                        w.title,
-                        w.summary,
-                        w.content_preview,
-                        source_sessions=w.source_session_keys,
-                        project_hint=" ".join(hint_parts),
+                    decision = self._route_knowledge_doc(run, w, sess_by_key, routing_candidates)
+                    adapted = (
+                        self.knowledge.wiki_gate.normalize_planned_document(
+                            w.relative_path,
+                            w.title,
+                            w.summary,
+                            w.content_preview,
+                            source_sessions=w.source_session_keys,
+                            route=decision,
+                        )
+                        if decision.routed
+                        else None
                     )
+                    if adapted is None:
+                        unrouted_docs.append(
+                            {
+                                "title": w.title,
+                                "relative_path": w.relative_path,
+                                "source_session_keys": list(w.source_session_keys),
+                                "reason": decision.detail or LANDING_FAILED_REASON,
+                                "reason_code": decision.reason_code or "landing_failed",
+                                "declared": decision.declared,
+                                "evidence": decision.evidence,
+                            }
+                        )
+                        continue
+                    new_rel, new_md = adapted
                     if new_rel in used_norm_paths:
                         stem = new_rel[:-3] if new_rel.endswith(".md") else new_rel
                         new_rel = f"{stem}-{len(used_norm_paths) + 1}.md"
                     used_norm_paths.add(new_rel)
                     w.relative_path = new_rel
                     w.content_preview = new_md
+                    routed_writes.append(w)
+                    routed_docs.append(
+                        {
+                            "title": w.title,
+                            "relative_path": new_rel,
+                            "source_session_keys": list(w.source_session_keys),
+                            "route": decision.to_dict(),
+                        }
+                    )
+                planned_writes = routed_writes
             run.planned_writes = planned_writes
+            if plan_info.dropped_items:
+                self._trace_dropped_plan_items(run, plan_info)
+            if plan_info.deferred_skill_candidates:
+                self.db.append_audit_event(
+                    entity_type="workflow_run",
+                    entity_id=run.run_id,
+                    event_type="skill_candidates_deferred",
+                    actor="p03_plan",
+                    summary=f"{len(plan_info.deferred_skill_candidates)} 个重复流程候选未生成 Skill 计划",
+                    payload={
+                        "plan_source": plan_info.source,
+                        "candidates": plan_info.deferred_skill_candidates,
+                    },
+                )
+            unrouted_reasons = Counter(doc["reason_code"] for doc in unrouted_docs)
+            if routed_docs:
+                self.db.append_audit_event(
+                    entity_type="workflow_run",
+                    entity_id=run.run_id,
+                    event_type="planned_doc_routed",
+                    actor="wiki_gate",
+                    summary=(
+                        f"{len(routed_docs)} 篇笔记已确定归属："
+                        + "；".join(f"{doc['title']} → {doc['route']['project']}" for doc in routed_docs[:6])
+                    ),
+                    payload={"routed_docs": routed_docs},
+                )
+            if unrouted_docs:
+                self.db.append_audit_event(
+                    entity_type="workflow_run",
+                    entity_id=run.run_id,
+                    event_type="planned_doc_unrouted",
+                    actor="wiki_gate",
+                    summary=(
+                        f"{len(unrouted_docs)} 篇笔记未列入写入计划：{_unrouted_reason_breakdown(unrouted_reasons)}"
+                    ),
+                    payload={"unrouted_docs": unrouted_docs},
+                )
             skill_plans = sum(1 for w in planned_writes if w.target_kind == "skill_improvement")
+            unrouted_note = (
+                f"；{len(unrouted_docs)} 篇笔记因无法归属项目未列入计划（{_unrouted_reason_breakdown(unrouted_reasons)}）"
+                if unrouted_docs
+                else ""
+            )
+            invalid_items = len(plan_info.dropped_items) - plan_info.over_limit_count
+            dropped_note = ""
+            if plan_info.dropped_items:
+                over_note = f"、{plan_info.over_limit_count} 项超出单批上限" if plan_info.over_limit_count else ""
+                dropped_note = (
+                    f"；计划项共 {plan_info.returned_count} 项，{len(plan_info.dropped_items)} 项未列入"
+                    f"（{invalid_items} 项未通过校验{over_note}）"
+                )
+            deferred_count = len(plan_info.deferred_skill_candidates)
+            deferred_note = f"；{deferred_count} 个重复流程候选未生成 Skill 计划" if deferred_count else ""
             self._finish_node(
                 run,
                 "P03_ROUTE_PLAN",
                 t0,
                 summary=(
+                    f"计划来源：{PLAN_SOURCE_LABELS.get(plan_info.source, plan_info.source)}；"
                     f"查重比对 {len(existing_rules)} 条规则与 {len(existing_skills)} 个技能，"
                     f"整理出 {len(planned_writes)} 项建议（含 {skill_plans} 项 Skill 封装/优化）"
+                    f"{dropped_note}{unrouted_note}{deferred_note}"
                 ),
                 internal_checks=[
                     {"name": "规则与技能查重", "status": "PASS"},
                     {"name": "Skill 路由判定", "status": "PASS", "detail": {"skill_plans": skill_plans}},
                     {"name": "单批数量上限校验", "status": "PASS", "detail": {"planned": len(planned_writes), "limit": max_ws}},
+                    {
+                        "name": "写入计划项校验",
+                        "status": "PASS" if not invalid_items else "WARN",
+                        "detail": {
+                            "source": plan_info.source,
+                            "returned": plan_info.returned_count,
+                            "invalid": invalid_items,
+                            "over_limit": plan_info.over_limit_count,
+                            "completed_fields": dict(plan_info.completed_fields),
+                        },
+                    },
+                    *(
+                        [
+                            {
+                                "name": "知识文档路由校验",
+                                "status": "PASS",
+                                "detail": {
+                                    "routed": len(routed_docs),
+                                    "declared": sum(1 for d in routed_docs if d["route"]["source"] == ROUTE_DECLARED),
+                                    "evidence": sum(1 for d in routed_docs if d["route"]["source"] == ROUTE_EVIDENCE),
+                                    "unrouted": len(unrouted_docs),
+                                },
+                            }
+                        ]
+                        if self.knowledge.wiki_gate.applicable
+                        else []
+                    ),
                 ],
-                payload={"planned_count": len(planned_writes), "skill_plans": skill_plans},
+                payload={
+                    "planned_count": len(planned_writes),
+                    "skill_plans": skill_plans,
+                    "routed_docs": routed_docs,
+                    "unrouted_docs": unrouted_docs,
+                    "plan_source": plan_info.source,
+                    "plan_diagnostics": plan_info.to_dict(),
+                    # What the model call cost: attempts, duration, served model, token usage.
+                    "call_telemetry": plan_info.call_telemetry,
+                },
             )
 
             # Check Approval Gate (supports smart | always | auto)
@@ -604,22 +1308,28 @@ class WorkflowOrchestrator:
                     status="sent",
                 )
                 if self.cfg.delivery.feishu_cli.enabled:
-                    fres = self.delivery.send_feishu_card(
-                        title=f"AI 飞轮待审批（{run.batch_date} #{run.batch_seq:02d}）",
-                        markdown=card_body,
-                        kind="ask",
-                        idempotency_key=f"flywheel-ask-{run.run_id}",
-                    )
-                    if fres["status"] != "SKIPPED":
-                        self.db.record_card_delivery(
-                            delivery_id=f"del-{card_id}-feishu",
-                            card_id=card_id,
-                            channel="feishu_cli",
-                            status=fres["status"],
-                            external_ref=fres.get("external_ref"),
-                            last_error=fres.get("error"),
+                    if self.feishu_channel is not None:
+                        self.feishu_channel.first_send(
+                            card_id=card_id, run=run, reasons=pause_reasons, portal_url=portal_url
                         )
+                    else:
+                        fres = self.delivery.send_feishu_text_notice(
+                            title=f"AI 飞轮待审批（{run.batch_date} #{run.batch_seq:02d}）",
+                            markdown=card_body,
+                            kind="ask",
+                            idempotency_key=f"flywheel-ask-{run.run_id}",
+                        )
+                        if fres["status"] != "SKIPPED":
+                            self.db.record_card_delivery(
+                                delivery_id=f"del-{card_id}-feishu_cli",
+                                card_id=card_id,
+                                channel="feishu_cli",
+                                status=fres["status"],
+                                external_ref=fres.get("external_ref"),
+                                last_error=fres.get("error"),
+                            )
                 self._emit_run("awaiting_approval", run)
+                self._stop_heartbeat()
                 return run
 
             if planned_writes:
@@ -635,14 +1345,41 @@ class WorkflowOrchestrator:
             return self._execute_post_approval(run, simulate_fail_node=simulate_fail_node)
 
         except Exception as exc:
-            return self._fail_run(run, active_node, str(exc), t0)
+            return self._fail_run(
+                run, active_node, str(exc), t0, extra_payload=_model_call_failure_payload(exc)
+            )
+        finally:
+            self._stop_heartbeat()
 
     def approve_and_resume(
         self,
         run_id: str,
         approved_indices: list[int] | None = None,
         simulate_fail_node: str | None = None,
+        *,
+        source: str = "portal",
+        selected_option: str = "同意并写入",
     ) -> WorkflowRunRecord:
+        run = self.claim_approval_for_resume(
+            run_id, approved_indices=approved_indices, source=source, selected_option=selected_option
+        )
+        return self.resume_claimed_run(run, simulate_fail_node=simulate_fail_node)
+
+    def claim_approval_for_resume(
+        self,
+        run_id: str,
+        approved_indices: list[int] | None = None,
+        *,
+        source: str = "portal",
+        selected_option: str = "同意并写入",
+    ) -> WorkflowRunRecord:
+        """The fast half of an approval: validate, claim atomically, return the fresh run.
+
+        The claim is one transaction and one lock acquisition; the pipeline that
+        follows is slow, so a caller that wants to answer the HTTP request
+        immediately (the background trigger) can claim first and resume on a
+        worker thread.
+        """
         run = self.db.get_workflow_run(run_id)
         if not run:
             raise KeyError(f"Workflow run not found: {run_id}")
@@ -651,56 +1388,82 @@ class WorkflowOrchestrator:
 
         if approved_indices is not None:
             keep = set(approved_indices)
-            for idx, item in enumerate(run.planned_writes):
-                item.approved = idx in keep
+            mask = [idx in keep for idx in range(len(run.planned_writes))]
         else:
-            for item in run.planned_writes:
-                item.approved = True
+            mask = [True] * len(run.planned_writes)
 
-        run.status = RunStatus.RUNNING
-        self.db.save_workflow_run(run)
-        self.db.update_decision_card_state(run_id, state="decided", selected_option="同意并写入")
-        self.db.append_audit_event(
-            entity_type="workflow_run",
-            entity_id=run_id,
-            event_type="approved",
-            actor="user",
-            summary=f"人工批准放行 {sum(1 for w in run.planned_writes if w.approved)}/{len(run.planned_writes)} 项建议",
+        res = self.db.claim_approval(
+            run_id, approved_mask=mask, selected_option=selected_option, source=source
         )
-        return self._execute_post_approval(run, simulate_fail_node=simulate_fail_node)
+        if not res["claimed"]:
+            if res["reason"] == "lock_busy":
+                raise ApprovalLockBusy(
+                    f"另一个运行 {res['lock_run_id']} 持有独占锁，预计 {res['lock_expires_at']} 后可重试",
+                    lock_run_id=res["lock_run_id"],
+                    lock_expires_at=res["lock_expires_at"],
+                )
+            raise ValueError(f"Run {run_id} is no longer awaiting approval.")
 
-    def reject_run(self, run_id: str, reason: str = "用户取消放行") -> WorkflowRunRecord:
+        # The claim transaction's writes are the single source of truth.
+        return self.db.get_workflow_run(run_id) or run
+
+    def resume_claimed_run(
+        self, run: WorkflowRunRecord, simulate_fail_node: str | None = None
+    ) -> WorkflowRunRecord:
+        """The slow half of an approval: the post-approval pipeline, under the heartbeat."""
+        self._start_heartbeat(run.run_id)
+        try:
+            return self._execute_post_approval(run, simulate_fail_node=simulate_fail_node)
+        finally:
+            self._stop_heartbeat()
+
+    def reject_run(
+        self,
+        run_id: str,
+        reason: str = "用户取消放行",
+        *,
+        source: str = "portal",
+    ) -> WorkflowRunRecord:
         run = self.db.get_workflow_run(run_id)
         if not run:
             raise KeyError(f"Workflow run not found: {run_id}")
         if run.status != RunStatus.AWAITING_APPROVAL:
             raise ValueError(f"Run {run_id} is not awaiting approval.")
 
-        # Return sessions to pending so nothing is lost
-        for sk in run.admitted_sessions:
-            self.db.update_session_status(sk, SessionStatus.PENDING)
-        for nid in ("P04_WRITE_VERIFY", "P05_SETTLE", "P06_REPORT", "P07_DELIVER"):
-            node = self._get_node(run, nid)
-            node.status = NodeStatus.SKIPPED
-            node.summary = f"审核拒绝放行：{reason}"
-
-        run.status = RunStatus.PARTIAL
-        run.error = reason
-        run.finished_at = utc_now_iso()
-        run.digest_markdown = f"## AI Flywheel 运行已取消放行（{run.run_id}）\n\n- 原因：{reason}\n- 已安全释放锁并将入队会话恢复为 `pending`。\n"
-        self.db.release_workflow_lock(run.run_id)
-        run.lock_released = True
-        self.db.save_workflow_run(run)
-        self.db.update_decision_card_state(run.run_id, state="closed", selected_option="取消本次写入")
-        self.db.append_audit_event(
-            entity_type="workflow_run",
-            entity_id=run.run_id,
-            event_type="rejected",
-            actor="user",
-            summary=f"取消本次写入并释放锁：{reason}",
+        self._mark_remaining_nodes_skipped(
+            run,
+            node_ids=("P04_WRITE_VERIFY", "P05_SETTLE", "P06_REPORT", "P07_DELIVER"),
+            reason=f"审核拒绝放行：{reason}",
         )
-        self._emit_run("run_rejected", run, {"reason": reason})
-        return run
+        nodes_json = json.dumps([n.model_dump(mode="json") for n in run.nodes], ensure_ascii=False)
+        digest_markdown = (
+            f"## AI Flywheel 运行已取消放行（{run.run_id}）\n\n"
+            f"- 原因：{reason}\n- 已安全释放锁并将入队会话恢复为 `pending`。\n"
+        )
+        ok = self.db.claim_rejection(
+            run_id,
+            reason=reason,
+            source=source,
+            nodes_json=nodes_json,
+            digest_markdown=digest_markdown,
+        )
+        if not ok:
+            raise ValueError(f"Run {run_id} is no longer awaiting approval.")
+
+        fresh = self.db.get_workflow_run(run_id) or run
+        # The claim transaction already wrote the terminal row, released the lock
+        # and put the admitted sessions back to pending; only the receipt and the
+        # event are left.
+        return self._finalize_terminal_artifacts(
+            fresh,
+            status=RunStatus.CANCELLED,
+            error=reason,
+            receipt_name=f"{run_id}-cancelled",
+            event_type="run_rejected",
+            extra={"reason": reason},
+            release_sessions=False,
+            save_row=False,
+        )
 
     def _execute_post_approval(
         self, run: WorkflowRunRecord, simulate_fail_node: str | None = None
@@ -710,6 +1473,7 @@ class WorkflowOrchestrator:
         written_paths: list[str] = []
         created_rules: list[str] = []
         written_skills: list[str] = []
+        skipped_docs: list[dict[str, Any]] = []
         try:
             # ---------------- P04 WRITE & VERIFY ----------------
             t0 = self._begin_node(run, "P04_WRITE_VERIFY")
@@ -718,59 +1482,152 @@ class WorkflowOrchestrator:
 
             approved_items = [w for w in run.planned_writes if w.approved]
             write_receipts: list[dict[str, Any]] = []
-            for item in approved_items:
-                if item.target_kind == "knowledge_doc" and item.relative_path:
-                    rel_to_write = item.relative_path
-                    content_to_write = item.content_preview
-                    if self.knowledge.wiki_gate.applicable:
-                        rel_to_write, content_to_write = self.knowledge.wiki_gate.normalize_planned_document(
+            p02_payload = self._get_node(run, "P02_REVIEW").payload
+            if not isinstance(p02_payload, dict):
+                p02_payload = {}
+            candidate_mistakes = [
+                c for c in (p02_payload.get("candidate_mistakes") or []) if isinstance(c, dict)
+            ]
+            candidate_dissents = [
+                c for c in (p02_payload.get("candidate_dissents") or []) if isinstance(c, dict)
+            ]
+            persisted_observations: list[dict[str, Any]] = []
+            index_error: Exception | None = None
+            try:
+                # P04 is the first node allowed to change the mistake pool and the dissent
+                # records: the batch was approved, so the candidates P02 found become durable.
+                self._ensure_lock(run)
+                for candidate in candidate_mistakes:
+                    self._ensure_lock(run)
+                    obs, _created = self.db.upsert_mistake_observation(
+                        root_cause_key=str(candidate.get("root_cause_key") or ""),
+                        title=str(candidate.get("title") or ""),
+                        severity_grade=str(candidate.get("severity_grade") or "yellow_caught"),
+                        phenomenon=str(candidate.get("phenomenon") or ""),
+                        truth=str(candidate.get("truth") or ""),
+                        thinking_root_cause=str(candidate.get("thinking_root_cause") or ""),
+                        caught_by=str(candidate.get("caught_by") or "self"),
+                        session_key=str(candidate.get("session_key") or ""),
+                    )
+                    persisted_observations.append(obs)
+                for candidate in candidate_dissents:
+                    self._ensure_lock(run)
+                    self.db.add_dissent_record(
+                        target_type=str(candidate.get("target_type") or "rule"),
+                        target_id=str(candidate.get("target_id") or ""),
+                        counter_claim=str(candidate.get("counter_claim") or ""),
+                        condition_scope=str(candidate.get("condition_scope") or ""),
+                        evidence_pointer=str(candidate.get("evidence_pointer") or ""),
+                        session_key=str(candidate.get("session_key") or ""),
+                    )
+                for item in approved_items:
+                    self._ensure_lock(run)  # synchronous checkpoint before each write
+                    if item.target_kind == "knowledge_doc":
+                        if not item.relative_path:
+                            raise ValueError(
+                                f"知识文档写入项缺少 relative_path，无法落盘：{item.title}"
+                            )
+                        rel_to_write = item.relative_path
+                        content_to_write = item.content_preview
+                        if self.knowledge.wiki_gate.applicable:
+                            # P03 already routed every knowledge document; this re-check only catches a plan
+                            # that went stale between P03 and P04 (saved before routing, or edited since).
+                            decision = self._route_knowledge_doc(
+                                run, item, self._stored_sessions(item.source_session_keys), None
+                            )
+                            adapted = (
+                                self.knowledge.wiki_gate.normalize_planned_document(
+                                    rel_to_write,
+                                    item.title,
+                                    item.summary,
+                                    content_to_write,
+                                    source_sessions=item.source_session_keys,
+                                    route=decision,
+                                )
+                                if decision.routed
+                                else None
+                            )
+                            if adapted is None:
+                                # A stale plan must not fail the batch here
+                                skipped_docs.append(
+                                    {
+                                        "relative_path": item.relative_path,
+                                        "title": item.title,
+                                        "status": "SKIPPED_UNROUTED_PROJECT",
+                                        "reason": decision.detail or LANDING_FAILED_REASON,
+                                        "reason_code": decision.reason_code or "landing_failed",
+                                    }
+                                )
+                                write_receipts.append(skipped_docs[-1])
+                                continue
+                            rel_to_write, content_to_write = adapted
+                        res = self.knowledge.write_document_verified(
                             rel_to_write,
-                            item.title,
-                            item.summary,
                             content_to_write,
-                            source_sessions=item.source_session_keys,
+                            action=item.action,
+                            sync_fts=False,  # the batch rebuilds the search index once, at the end
                         )
-                    res = self.knowledge.write_document_verified(
-                        rel_to_write,
-                        content_to_write,
-                        action=item.action,
-                    )
-                    written_paths.append(res["relative_path"])
-                    write_receipts.append(res)
-                elif item.target_kind == "flywheel_rule":
-                    normalized_payload = normalize_rule_payload(item)
-                    obs_id = normalized_payload.pop("obs_id", None)
-                    root_cause_key = normalized_payload.pop("root_cause_key", None)
-                    req = CreateRuleRequest.model_validate(normalized_payload)
-                    rule = self.activation.register_rule(req, root_cause_key=root_cause_key)
-                    if obs_id:
-                        self.db.update_mistake_observation_status(
-                            str(obs_id), "promoted", promoted_rule_id=rule.rule_id
+                        written_paths.append(res["relative_path"])
+                        write_receipts.append(res)
+                    elif item.target_kind == "flywheel_rule":
+                        normalized_payload = normalize_rule_payload(item)
+                        obs_id = normalized_payload.pop("obs_id", None)
+                        root_cause_key = normalized_payload.pop("root_cause_key", None)
+                        req = CreateRuleRequest.model_validate(normalized_payload)
+                        rule = self.activation.register_rule(req, root_cause_key=root_cause_key)
+                        promoted_obs = self._promote_observation(rule.rule_id, obs_id, root_cause_key)
+                        created_rules.append(rule.rule_id)
+                        write_receipts.append(
+                            {
+                                "rule_id": rule.rule_id,
+                                "title": rule.title,
+                                "status": rule.status.value,
+                                **({"promoted_observation_id": promoted_obs} if promoted_obs else {}),
+                            }
                         )
-                    created_rules.append(rule.rule_id)
-                    write_receipts.append({"rule_id": rule.rule_id, "title": rule.title, "status": rule.status.value})
-                elif item.target_kind == "skill_improvement":
-                    if not self.cfg.safety_valves.skill_write_enabled:
-                        write_receipts.append({"skill": item.title, "status": "SKIPPED_BY_SAFETY_VALVE"})
-                        continue
-                    sres = self.skill_writer.write_skill_verified(
-                        item.relative_path,
-                        item.content_preview,
-                        action=item.action,
-                        run_id=run.run_id,
-                        fallback_title=item.title,
-                    )
-                    written_skills.append(sres["relative_path"])
-                    write_receipts.append(sres)
-                    self.db.upsert_skill_asset(
-                        skill_name=sres["skill_name"],
-                        source_dir=str(self.skill_writer.root),
-                        description=item.summary or item.title,
-                        origin="flywheel_created" if sres["action"] == "create" else "flywheel_updated",
-                        sha256=sres["sha256"],
-                        last_run_id=run.run_id,
-                        backup_path=sres.get("backup_path"),
-                    )
+                    elif item.target_kind == "skill_improvement":
+                        if not self.cfg.safety_valves.skill_write_enabled:
+                            write_receipts.append({"skill": item.title, "status": "SKIPPED_BY_SAFETY_VALVE"})
+                            continue
+                        sres = self.skill_writer.write_skill_verified(
+                            item.relative_path,
+                            item.content_preview,
+                            action=item.action,
+                            run_id=run.run_id,
+                            fallback_title=item.title,
+                        )
+                        written_skills.append(sres["relative_path"])
+                        write_receipts.append(sres)
+                        self.db.upsert_skill_asset(
+                            skill_name=sres["skill_name"],
+                            source_dir=str(self.skill_writer.root),
+                            description=item.summary or item.title,
+                            origin="flywheel_created" if sres["action"] == "create" else "flywheel_updated",
+                            sha256=sres["sha256"],
+                            last_run_id=run.run_id,
+                            backup_path=sres.get("backup_path"),
+                        )
+                    else:
+                        raise ValueError(
+                            f"未知的写入目标类型，无法执行写入：{item.target_kind}"
+                        )
+            except Exception as exc:
+                # A half-done batch must leave its receipts behind: the next run needs to know
+                # which documents were already written before the failure.
+                self._record_partial_writes(run, write_receipts, written_paths, exc)
+                raise
+            finally:
+                if written_paths:
+                    # One index rebuild for the whole batch, not one per document.
+                    try:
+                        self.knowledge.sync_fts_index()
+                    except Exception as exc:  # noqa: BLE001
+                        # A failed rebuild must not mask the write failure that is already
+                        # on its way out; it is raised on its own below.
+                        index_error = exc
+            if index_error is not None:
+                self._record_partial_writes(run, write_receipts, written_paths, index_error)
+                raise index_error
 
             self._finish_node(
                 run,
@@ -779,13 +1636,34 @@ class WorkflowOrchestrator:
                 summary=(
                     f"写入 {len(written_paths)} 篇笔记、注册 {len(created_rules)} 条规则、"
                     f"更新/新建 {len(written_skills)} 个 Skill（全部校验通过）"
+                    + (f"；{len(skipped_docs)} 篇笔记因无法归属项目跳过" if skipped_docs else "")
+                    + (
+                        f"；错题观察池入池 {len(persisted_observations)} 条"
+                        if persisted_observations
+                        else ""
+                    )
                 ),
                 internal_checks=[
                     {"name": "路径安全与白名单校验", "status": "PASS"},
                     {"name": "落盘回读一致性校验", "status": "PASS", "detail": {"docs": len(written_paths), "skills": len(written_skills)}},
+                    {
+                        "name": "错题观察池与分歧记录写入（审批后）",
+                        "status": "PASS",
+                        "detail": {
+                            "observations": len(persisted_observations),
+                            "dissents": len(candidate_dissents),
+                        },
+                    },
                 ],
                 artifacts=written_paths + created_rules + written_skills,
-                payload={"write_receipts": write_receipts},
+                payload={
+                    "write_receipts": write_receipts,
+                    "skipped_unrouted_docs": skipped_docs,
+                    "persisted_observation_ids": [
+                        str(o.get("obs_id")) for o in persisted_observations if o.get("obs_id")
+                    ],
+                    "persisted_dissent_count": len(candidate_dissents),
+                },
             )
 
             # ---------------- P05 SETTLE ----------------
@@ -794,17 +1672,37 @@ class WorkflowOrchestrator:
             if simulate_fail_node == "P05_SETTLE":
                 raise RuntimeError("Simulated P05 failure")
             p02_node = self._get_node(run, "P02_REVIEW")
-            p02_findings = (p02_node.payload or {}).get("findings", []) if isinstance(p02_node.payload, dict) else []
+            p02_payload = p02_node.payload if isinstance(p02_node.payload, dict) else {}
+            p02_findings = p02_payload.get("findings", []) or []
             not_worthy_keys = {
                 str(f.get("session_key"))
                 for f in p02_findings
                 if isinstance(f, dict) and f.get("worthy") is False and f.get("session_key")
             }
+            # Only the sessions the review actually read may be settled. A session that
+            # was admitted but never sent to the reviewer stays pending: it still owes the
+            # flywheel a card, and a later batch must pick it up again.
+            sent_keys = p02_payload.get("sent_session_keys")
+            if isinstance(sent_keys, list) and sent_keys:
+                reviewed_keys = {str(k) for k in sent_keys if k}
+            else:
+                reviewed_keys = set(run.admitted_sessions)
+            settled_sessions: list[str] = []
+            returned_sessions: list[str] = []
             for sk in run.admitted_sessions:
+                self._ensure_lock(run)  # synchronous checkpoint before each settlement
+                if sk not in reviewed_keys:
+                    self.db.update_session_status(sk, SessionStatus.PENDING)
+                    returned_sessions.append(sk)
+                    continue
                 if sk in not_worthy_keys:
                     self.db.update_session_status(sk, SessionStatus.ARCHIVED)
                 else:
                     self.db.update_session_status(sk, SessionStatus.PROCESSED)
+                settled_sessions.append(sk)
+            # The retro items of the settled sessions are closed with this run; the ones of
+            # the returned sessions stay open, because those sessions are not done yet.
+            settled_retros = self.db.resolve_retros_for_sessions(settled_sessions, run.run_id)
             dream_report: dict[str, Any] | None = None
             if run.phase in {"both", "weekly"}:
                 dream_report = run_dream_consolidation(self.cfg, self.db, run_id=run.run_id)
@@ -820,16 +1718,25 @@ class WorkflowOrchestrator:
                 "P05_SETTLE",
                 t0,
                 summary=(
-                    f"幂等结算 {len(run.admitted_sessions)} 个会话为 processed，"
-                    f"核心索引卡已刷新（{core_card_info['lines']} 行）{dream_note}"
+                    f"幂等结算 {len(settled_sessions)} 个会话为 processed"
+                    + (
+                        f"、{len(returned_sessions)} 个未审查会话退回 pending"
+                        if returned_sessions
+                        else ""
+                    )
+                    + f"，关闭 {settled_retros} 条待复盘项"
+                    + f"，核心索引卡已刷新（{core_card_info['lines']} 行）{dream_note}"
                 ),
                 internal_checks=[
                     {"name": "会话队列幂等回写", "status": "PASS"},
+                    {"name": "待复盘项结算", "status": "PASS", "detail": {"resolved_retros": settled_retros}},
                     {"name": "核心索引卡 FLYWHEEL-CORE.md 刷新", "status": "PASS", "detail": {"lines": core_card_info["lines"], "bytes": core_card_info["bytes"]}},
                     {"name": "P05 保留独占锁至 P07 终态校验", "status": "PASS"},
                 ],
                 payload={
-                    "settled_sessions": run.admitted_sessions,
+                    "settled_sessions": settled_sessions,
+                    "returned_sessions": returned_sessions,
+                    "settled_retro_count": settled_retros,
                     "created_rules": created_rules,
                     "core_card": {"path": core_card_info["path"], "lines": core_card_info["lines"]},
                     "dream": dream_report,
@@ -844,7 +1751,12 @@ class WorkflowOrchestrator:
             digest_lines = [
                 f"## 沉淀总结（{run.run_id}）",
                 "",
-                f"- **处理对话数**：{len(run.admitted_sessions)} 段",
+                f"- **处理对话数**：{len(settled_sessions)} 段"
+                + (
+                    f"（{len(returned_sessions)} 段未审查，退回队列）"
+                    if returned_sessions
+                    else ""
+                ),
                 f"- **沉淀笔记**：{', '.join(f'`{p}`' for p in written_paths) if written_paths else '无新增'}",
                 f"- **新增避坑规则**：{', '.join(f'`{r}`' for r in created_rules) if created_rules else '无新增'}",
                 f"- **新建 / 优化 Skill**：{', '.join(f'`{s}`' for s in written_skills) if written_skills else '无新增'}",
@@ -884,6 +1796,7 @@ class WorkflowOrchestrator:
             t0 = self._begin_node(run, "P07_DELIVER")
             if simulate_fail_node == "P07_DELIVER":
                 raise RuntimeError("Simulated P07 delivery failure")
+            self._ensure_lock(run)  # synchronous checkpoint before external delivery
             delivery_res = self.delivery.deliver(run, written_paths)
             self._finish_node(
                 run,
@@ -901,22 +1814,31 @@ class WorkflowOrchestrator:
                 payload=delivery_res,
             )
 
+            applied = self.db.finish_run_terminal(
+                run.run_id,
+                status="PASS",
+                card_state="done",
+                result_summary=f"笔记 {len(written_paths)} 篇，规则 {len(created_rules)} 条，Skill {len(written_skills)} 个",
+                source="orchestrator",
+                audit_event=(
+                    "run_completed",
+                    f"批次完成：笔记 {len(written_paths)} 篇，规则 {len(created_rules)} 条，Skill {len(written_skills)} 个",
+                    {"docs": written_paths, "rules": created_rules, "skills": written_skills},
+                ),
+            )
+            if not applied:
+                # Already finalized (e.g. reaped mid-execution): stored state wins.
+                stored = self.db.get_workflow_run(run.run_id)
+                if stored is not None:
+                    return stored
             run.status = RunStatus.PASS
             run.finished_at = utc_now_iso()
-            self.db.release_workflow_lock(run.run_id)
             run.lock_released = True
             self.db.save_workflow_run(run)
-            self.db.update_decision_card_state(run.run_id, state="done")
-            self.db.append_audit_event(
-                entity_type="workflow_run",
-                entity_id=run.run_id,
-                event_type="run_completed",
-                actor="orchestrator",
-                summary=f"批次完成：笔记 {len(written_paths)} 篇，规则 {len(created_rules)} 条，Skill {len(written_skills)} 个",
-                payload={"docs": written_paths, "rules": created_rules, "skills": written_skills},
-            )
             self.fs_store.write_receipt("runs", f"{run.run_id}-final", run.model_dump(mode="json"))
             self._emit_run("run_completed", run)
             return run
         except Exception as exc:
-            return self._fail_run(run, active_node, str(exc), t0)
+            return self._fail_run(
+                run, active_node, str(exc), t0, extra_payload=_model_call_failure_payload(exc)
+            )

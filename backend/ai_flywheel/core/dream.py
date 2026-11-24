@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
 
 from ai_flywheel.config import FlywheelConfig
-from ai_flywheel.core.privacy import shanghai_today_ymd
+from ai_flywheel.core.time_utils import shanghai_iso_week_key, shanghai_today_ymd
 from ai_flywheel.models import RuleRecord, RuleStatus
 from ai_flywheel.storage.db import FlywheelDB
 
@@ -19,9 +19,8 @@ def _jaccard(a: list[str], b: list[str]) -> float:
 
 
 def _shanghai_iso_week_key(now_utc: datetime | None = None) -> str:
-    dt = (now_utc or datetime.now(timezone.utc)).astimezone(timezone(timedelta(hours=8)))
-    iso_year, iso_week, _ = dt.isocalendar()
-    return f"{iso_year}-W{iso_week:02d}"
+    """The ISO week of the Shanghai date; the weekly distillation key."""
+    return shanghai_iso_week_key(now_utc)
 
 
 def find_overlapping_rule_pairs(rules: list[RuleRecord], threshold: float = 0.7) -> list[dict[str, Any]]:
@@ -50,6 +49,7 @@ def run_dream_consolidation(
     run_id: str = "",
     dormant_days: int = 14,
     stale_skill_days: int = 21,
+    now_utc: datetime | None = None,
 ) -> dict[str, Any]:
     """Friday Dream Consolidation: tiered subtraction, expiry sweep, dissent convergence hints, and weekly ledger.
 
@@ -58,13 +58,17 @@ def run_dream_consolidation(
       - Mark expired knowledge cards (`valid_until < today`) as `needs_recheck`.
       - Persist weekly `flywheel_metrics_snapshots` row.
 
-    Tier 2 (proposed for JT confirmation via Feishu/portal decision card, never auto-deleted):
+    Tier 2 (proposed for maintainer confirmation via Feishu/portal decision card, never auto-deleted):
       - Duplicate/overlapping active rules (trigger Jaccard >= 0.7).
       - Stale flywheel-created Skills (`invoke_count == 0` for >= 21 days) or failing Skills (`fail_count >= 3`).
       - Open dissents waiting to converge into conditional rules.
+
+    ``now_utc`` overrides the current time; without it the store's clock decides,
+    so a test with an injected clock sees the same "today" as the store does.
     """
-    today = shanghai_today_ymd()
-    period_key = _shanghai_iso_week_key()
+    now = now_utc or db.now_datetime()
+    today = shanghai_today_ymd(now)
+    period_key = _shanghai_iso_week_key(now)
 
     # Tier 1a: Auto-dormant zero-hit stale trial rules
     dormant_rules = db.mark_dormant_stale_rules(days=dormant_days)
@@ -77,7 +81,7 @@ def run_dream_consolidation(
     merge_candidates = find_overlapping_rule_pairs(all_rules, threshold=0.7)
 
     # Tier 2b: Anti-Skill-Theater check (stale unused or repeatedly failing skills)
-    cutoff_skill = (datetime.now(timezone.utc) - timedelta(days=stale_skill_days)).isoformat()
+    cutoff_skill = (now - timedelta(days=stale_skill_days)).isoformat()
     skill_alerts: list[dict[str, Any]] = []
     for sk in db.list_skill_assets():
         inv = int(sk.get("invoke_count") or 0)

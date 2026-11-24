@@ -62,6 +62,10 @@ class RunStatus(str, Enum):
     AWAITING_APPROVAL = "AWAITING_APPROVAL"
     PASS = "PASS"
     PARTIAL = "PARTIAL"
+    # A run the maintainer cancelled at the approval gate: nothing was written.
+    # Distinct from PARTIAL, which means "partly done" — the two must not be
+    # interchangeable, or a cancellation reads like a half-finished batch.
+    CANCELLED = "CANCELLED"
     FAILED = "FAILED"
 
 
@@ -260,10 +264,44 @@ class PlannedWrite(BaseModel):
     content_preview: str = ""
     rule_payload: dict[str, Any] | None = None
     skill_route: dict[str, Any] | None = None
+    # The planner's routing declaration for a knowledge_doc (page_type, project, reason), carried
+    # untouched for the Wiki gate to validate. The dry-run planner has no model and never sets it.
+    wiki_route: dict[str, Any] | None = None
     requires_approval: bool = False
     approval_reason: str = ""
     source_session_keys: list[str] = Field(default_factory=list)
     approved: bool = True
+
+
+# The write actions that always need a human: they destroy or replace core content.
+SENSITIVE_ACTIONS = frozenset({"delete", "overwrite_core"})
+
+
+def is_sensitive_write(write: "PlannedWrite | dict[str, Any]") -> bool:
+    """The one canonical sensitivity predicate for a planned write.
+
+    The portal, the orchestrator's approval gate and the Feishu card all have to
+    agree on which writes are sensitive: if they drift, "approve the routine items
+    only" would approve a Skill rewrite the gate meant to hold back.
+
+    Accepts both a :class:`PlannedWrite` and the plain dict the Feishu card
+    renders, so both sides of the boundary share one implementation.
+    """
+    if isinstance(write, PlannedWrite):
+        target_kind = write.target_kind
+        requires_approval = bool(write.requires_approval)
+        action = write.action
+    elif isinstance(write, dict):
+        target_kind = write.get("target_kind")
+        requires_approval = bool(write.get("requires_approval"))
+        action = write.get("action")
+    else:  # pragma: no cover - defensive: an unknown shape is never "routine"
+        return True
+    return (
+        target_kind == "skill_improvement"
+        or requires_approval
+        or action in SENSITIVE_ACTIONS
+    )
 
 
 class NodeExecution(BaseModel):

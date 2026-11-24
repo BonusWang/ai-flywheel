@@ -1,11 +1,3 @@
-export interface LoopStep {
-  step: number
-  key: string
-  title: string
-  short: string
-  phase: 'frontstage' | 'backstage'
-}
-
 export interface SiteProfile {
   brand: {
     name: string
@@ -16,7 +8,6 @@ export interface SiteProfile {
     mcp_prefix: string
     version: string
   }
-  loop_steps: LoopStep[]
 }
 
 export interface RuleRecord {
@@ -123,6 +114,7 @@ export interface SessionRecord {
   tags: string[]
   priority: string
   status: 'pending' | 'in_progress' | 'processed' | 'archived'
+  metadata?: Record<string, unknown>
   created_at: string
   updated_at: string
 }
@@ -136,10 +128,24 @@ export interface PlannedWrite {
   content_preview: string
   rule_payload: Record<string, unknown> | null
   skill_route?: Record<string, unknown> | null
+  /** The planner's routing declaration for a knowledge doc (page_type, project, reason). */
+  wiki_route?: Record<string, unknown> | null
   requires_approval?: boolean
   approval_reason?: string
   source_session_keys: string[]
   approved: boolean
+}
+
+/** What an existing Skill looks like, read-only, before it is updated. */
+export interface SkillPreview {
+  exists: boolean
+  skill_name: string
+  valid: boolean
+  error: string | null
+  line_count: number
+  headings: string[]
+  eol: string
+  content: string
 }
 
 export interface NodeExecution {
@@ -166,17 +172,27 @@ export interface WorkflowRunRecord {
   phase: string
   runner_mode: string
   approval_mode?: string
-  status: 'PENDING' | 'RUNNING' | 'AWAITING_APPROVAL' | 'PASS' | 'PARTIAL' | 'FAILED'
+  status: 'PENDING' | 'RUNNING' | 'AWAITING_APPROVAL' | 'PASS' | 'PARTIAL' | 'CANCELLED' | 'FAILED'
   admitted_sessions: string[]
   nodes: NodeExecution[]
   planned_writes: PlannedWrite[]
   digest_markdown: string
   error: string | null
   lock_released: boolean
+  /** The revision of this run record; it grows with every saved change. */
+  version?: number
   started_at: string
   finished_at: string | null
   created_at?: string
   updated_at?: string
+}
+
+/** The single exclusive workflow lock. */
+export interface WorkflowLock {
+  run_id: string
+  acquired_at: string
+  expires_at: string | null
+  heartbeat_at: string | null
 }
 
 export interface AuditEventRecord {
@@ -209,7 +225,41 @@ export interface OverviewResponse {
   recent_rules: RuleRecord[]
   recent_retro: RetroItem[]
   safety_valves: Record<string, boolean>
-  workflow_lock: { run_id: string; acquired_at: string } | null
+  workflow_lock: WorkflowLock | null
+}
+
+/** A knowledge card the preflight matched, with its freshness state. */
+export interface KnowledgeHit {
+  doc_path: string
+  title: string
+  description?: string
+  snippet?: string
+  project_id?: string
+  page_type?: string
+  status?: string
+  score?: number
+  freshness_tier?: string
+  valid_until?: string | null
+  is_expired?: boolean
+  freshness_warning?: string
+}
+
+/** A local Skill the preflight suggests. */
+export interface SuggestedSkill {
+  name: string
+  description: string
+  path: string
+  score?: number
+}
+
+/** What `PUT /api/site/config` answers with. */
+export interface ConfigSaveResponse {
+  status: string
+  config: Record<string, any>
+  /** True when some of the saved settings only take effect after a restart. */
+  restart_required: boolean
+  /** Which settings need the restart. */
+  restart_reasons: string[]
 }
 
 export interface PreflightResponse {
@@ -219,8 +269,8 @@ export interface PreflightResponse {
   policy_card: string
   user_preferences_card: string
   matched_rules: RuleRecord[]
-  suggested_skills: Array<{ name: string; description: string; path: string }>
-  knowledge_hits: Array<{ doc_path: string; title: string; snippet: string }>
+  suggested_skills: SuggestedSkill[]
+  knowledge_hits: KnowledgeHit[]
   compact_context: string
   created_at: string
 }

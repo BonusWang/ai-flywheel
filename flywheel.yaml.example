@@ -9,8 +9,10 @@ server:
 profile:
   # Default bundled profile (replicable open-source defaults)
   default_dir: "./profile"
-  # Optional personal override pack (e.g. from your private Home Repo)
-  # override_dir: "E:/github/ai-home/flywheel-profile"
+  # Optional personal override pack (e.g. from a private profile repo).
+  # Keep personal absolute paths out of this public template; supply them in
+  # the gitignored flywheel.yaml instead.
+  # override_dir: "<absolute path to your private profile pack>"
   override_dir: null
 
 # Optional local directories for read-only Skill/Agent probing & P04 approved improvements
@@ -60,12 +62,31 @@ knowledge_sink:
   wiki_bash: "bash"
   wiki_gate_timeout_seconds: 300
   wiki_gate_evidence_dir: ""   # default: <data_dir>/wiki-gate
+  # Name of the environment variable the D2 script reads as its work root.
+  # Empty means the neutral default (FLYWHEEL_WORK_ROOT); set the name your
+  # script expects here (or via FLYWHEEL_D2_WORK_ROOT_ENV).
+  wiki_d2_work_root_env: ""
+
+  # Catch-all project for knowledge documents routed on EVIDENCE, i.e. plans of the zero-config
+  # dry_run planner. api / cli plans declare their route in the P03 plan (page type + project chosen
+  # from the candidates read off the mounted Wiki) and are never redirected here: a note declared
+  # unattributed, or whose declaration the evidence contradicts, is not written and is recorded in a
+  # `planned_doc_unrouted` audit event. Set a project directory name (a folder with 实战笔记/ under
+  # the projects partition) to catch the evidence-routed cards instead.
+  practice_fallback_project: ""
 
 # Autonomous workflow P00-P07 execution engine
 workflow:
   schedule_enabled: false
   daily_cron: "0 20 * * *"
   weekly_exception_cron: "0 20 * * 5"
+  # Approval gate after P03: smart | always | auto
+  #   smart  - pause only for Skill changes, flagged/deleting/overwriting writes,
+  #            or batches above high_write_count_threshold
+  #   always - pause whenever there is anything to write
+  #   auto   - never pause (requires both auto_approve_writes valves)
+  approval_mode: "smart"
+  high_write_count_threshold: 6
   # Default safe mode: pause after P03 for Diff/rule preview approval in Web UI
   auto_approve_writes: false
   max_sessions_per_run: 10
@@ -79,7 +100,16 @@ runner:
     base_url: ""
     api_key: ""
     model: ""
-    timeout_seconds: 120
+    # Wall-clock limit of one model call, in seconds. 240 is the code default.
+    timeout_seconds: 240
+    # Reasoning effort sent to an OpenAI-compatible endpoint ("low" | "medium" | "high").
+    # Empty (the default) omits the parameter from the request, which keeps the runner
+    # portable to endpoints that do not know it. A non-empty value enters the cache key,
+    # so switching it never reuses a reply produced with another effort.
+    reasoning_effort: ""
+    # How many times a timed-out or refused connection is retried at once, without backoff.
+    # 0 disables the retry; 1 means one extra attempt after the first one.
+    transport_retries: 1
   cli:
     # Example for local Codex / Claude CLI:
     # command: "claude"
@@ -99,11 +129,31 @@ delivery:
   webhook:
     enabled: false
     url: ""
+  # Feishu via local lark-cli (bot identity). All ids are open ids (ou_...);
+  # keep personal values in the gitignored flywheel.yaml.
+  feishu_cli:
+    enabled: false
+    command: "lark-cli"
+    identity: "bot"
+    # Private-chat recipient (open id). Interactive cards require it.
+    user_id: ""
+    notify_on_fyi: false
+    # Interactive approval cards (needs lark-cli >= 1.0.64, the Feishu app must
+    # subscribe to card callbacks, and `flywheel feishu-check` must pass).
+    # command / command_args / identity changes require a restart.
+    interactive: false
+    approver_open_ids: []
 
 # Explicit safety valves (inspired by AIHOT): control external actions without changing state machine logic
 safety_valves:
   workflow_enabled: true
+  # Gates every runner that calls a model or a local CLI.
+  # `model_execution_enabled` is the truthful name; leave it unset to let
+  # `cli_execution_enabled` (the older name) decide.
+  model_execution_enabled: null
   cli_execution_enabled: true
+  # The last word on auto-approval: while this is false, `workflow.approval_mode:
+  # auto` runs as `smart` instead of approving on its own.
   auto_approve_writes: false
   git_closure_enabled: false
   public_export_strip_paths: true

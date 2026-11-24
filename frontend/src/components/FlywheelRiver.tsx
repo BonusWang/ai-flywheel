@@ -12,7 +12,8 @@ const KIND_LABEL: Record<string, string> = {
   codex: 'Codex 会话',
   'claude-code': 'Claude Code 会话',
   claude: 'Claude Desktop 会话',
-  portal: '门户沙箱',
+  'portal-sandbox': '门户沙箱',
+  generic: '通用会话',
   rule: '先例规则',
   retro: '复盘异常信号',
 }

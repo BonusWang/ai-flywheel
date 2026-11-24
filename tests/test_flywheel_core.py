@@ -42,7 +42,7 @@ def test_policy_decoupling_and_three_tier_override(tmp_path: Path):
     home_override = tmp_path / "home-repo-profile"
     home_override.mkdir()
     (home_override / "user_preferences.yaml").write_text(
-        "policy_id: user_preferences\naddress_as: JT\n",
+        "policy_id: user_preferences\naddress_as: Maintainer\n",
         encoding="utf-8",
     )
 
@@ -52,14 +52,14 @@ def test_policy_decoupling_and_three_tier_override(tmp_path: Path):
 
     prefs = rt.policies.get_policy("user_preferences")
     assert prefs is not None
-    assert prefs["address_as"] == "JT"
+    assert prefs["address_as"] == "Maintainer"
     assert prefs["_source"] == "profile_override"
 
     # UI edit overrides Home Repo override, and reset restores Home Repo override
-    rt.policies.update_policy("user_preferences", {"address_as": "JT-Custom"})
-    assert rt.policies.get_policy("user_preferences")["address_as"] == "JT-Custom"
+    rt.policies.update_policy("user_preferences", {"address_as": "Maintainer-Custom"})
+    assert rt.policies.get_policy("user_preferences")["address_as"] == "Maintainer-Custom"
     rt.policies.reset_policy("user_preferences")
-    assert rt.policies.get_policy("user_preferences")["address_as"] == "JT"
+    assert rt.policies.get_policy("user_preferences")["address_as"] == "Maintainer"
 
 
 def test_outcome_hard_gates_and_two_tier_activation(isolated_runtime: FlywheelRuntime):

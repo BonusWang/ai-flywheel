@@ -21,20 +21,110 @@ import { StatusBadge } from '../components/StatusBadge'
 import {
   APPROVAL_MODE_LABELS,
   CLIENT_LABELS,
+  FEISHU_LISTENER_STATE_LABELS,
   formatDateYMD,
   formatDuration,
   formatRelativeTime,
+  formatRunnerMode,
   labelOf,
   PHASE_LABELS,
-  RUNNER_MODE_LABELS,
   STAGE_PLAIN_NAMES,
   TRIGGER_LABELS,
 } from '../lib/labels'
-import type { AuditEventRecord, NodeExecution, SessionRecord, WorkflowRunRecord } from '../types'
+import type {
+  AuditEventRecord,
+  NodeExecution,
+  PlannedWrite,
+  SessionRecord,
+  SkillPreview,
+  WorkflowRunRecord,
+} from '../types'
 
 interface Props {
   refreshToken: number
   onGlobalRefresh: () => void
+}
+
+/** The Skill a planned write targets, read off its relative path ("<slug>/SKILL.md"). */
+function skillSlugOf(pw: PlannedWrite): string {
+  const raw = (pw.relative_path || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
+  const parts = raw.split('/').filter(Boolean)
+  if (parts.length >= 2 && parts[parts.length - 1].toLowerCase() === 'skill.md') {
+    return parts[parts.length - 2]
+  }
+  return parts[0] || ''
+}
+
+/**
+ * The existing Skill an update would append to: its size, its section outline and — on
+ * demand — its full text, so the approver can compare the old file with the new section.
+ */
+function SkillUpdatePanel({ pw }: { pw: PlannedWrite }) {
+  const slug = skillSlugOf(pw)
+  const [preview, setPreview] = useState<SkillPreview | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [expanded, setExpanded] = useState(false)
+
+  useEffect(() => {
+    if (!slug) return
+    let cancelled = false
+    setLoading(true)
+    api
+      .skillPreview(slug)
+      .then((data) => {
+        if (!cancelled) setPreview(data)
+      })
+      .catch((e: any) => {
+        if (!cancelled) setError(e.message)
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [slug])
+
+  return (
+    <div className="mt-2 rounded-[var(--radius-control)] border border-line-soft bg-bg-sunk/60 p-2.5 space-y-1.5">
+      <div className="flex flex-wrap items-center justify-between gap-2 text-[11.5px]">
+        <span className="font-semibold text-ink-2">现有文件</span>
+        {loading && <span className="text-ink-4">读取中…</span>}
+        {!loading && preview && (
+          <span className="num text-ink-3">
+            {preview.line_count} 行 · {preview.headings.length} 个小节 · 全部保留
+          </span>
+        )}
+        {!loading && !preview && !error && <span className="text-ink-4">未能读取</span>}
+      </div>
+      {preview && preview.headings.length > 0 && (
+        <ul className="text-[11.5px] text-ink-3 space-y-0.5">
+          {preview.headings.map((heading) => (
+            <li key={heading} className="truncate">
+              <span className="mono text-ink-4">##</span> {heading}
+            </li>
+          ))}
+        </ul>
+      )}
+      {preview && (
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="inline-flex items-center gap-1 text-[11.5px] text-accent-ink hover:underline"
+        >
+          {expanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+          {expanded ? '收起现有全文' : '对照现有全文'}
+        </button>
+      )}
+      {expanded && preview && (
+        <div className="max-h-48 overflow-y-auto rounded-[var(--radius-control)] bg-surface border border-line-soft p-2">
+          <MarkdownView content={preview.content} />
+        </div>
+      )}
+      {error && <div className="text-[11.5px] text-hot">读取现有文件失败：{error}</div>}
+    </div>
+  )
 }
 
 function RunStatusPill({ status }: { status: WorkflowRunRecord['status'] }) {
@@ -67,11 +157,25 @@ function RunStatusPill({ status }: { status: WorkflowRunRecord['status'] }) {
           已失败
         </span>
       )
+    case 'CANCELLED':
+      return (
+        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-[var(--radius-mark)] border border-line-strong bg-bg-sunk text-ink-3 text-[12px] font-semibold min-w-[78px] justify-center">
+          <XCircle className="w-3.5 h-3.5" />
+          已取消
+        </span>
+      )
+    case 'PARTIAL':
+      return (
+        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-[var(--radius-mark)] border border-amber/40 bg-amber-soft text-amber-ink text-[12px] font-semibold min-w-[78px] justify-center">
+          <Minus className="w-3.5 h-3.5" />
+          部分完成
+        </span>
+      )
     default:
       return (
         <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-[var(--radius-mark)] border border-line-strong bg-bg-sunk text-ink-3 text-[12px] font-semibold min-w-[78px] justify-center">
           <Minus className="w-3.5 h-3.5" />
-          已取消
+          未开始
         </span>
       )
   }
@@ -105,6 +209,9 @@ function StageDot({
   } else if (node.status === 'FAILED') {
     ringCls = 'border-hot bg-hot-soft text-hot'
     icon = <X className="w-3 h-3 stroke-[2.6]" />
+  } else if (node.status === 'PARTIAL') {
+    ringCls = 'border-amber bg-amber-soft text-amber-ink'
+    icon = <Minus className="w-3 h-3 stroke-[2.6]" />
   } else if (node.status === 'SKIPPED') {
     ringCls = 'border-line bg-bg-sunk text-ink-4'
     icon = <Minus className="w-3 h-3" />
@@ -125,6 +232,19 @@ function StageDot({
   )
 }
 
+/**
+ * The approver's selection per run.
+ *
+ * `initCount` is how many planned writes the selection was built from. A run
+ * that is still RUNNING has no writes yet; when it reaches AWAITING_APPROVAL
+ * it has N of them. Without the count the selection would stay the empty one
+ * it was initialized with, and "同意并写入" would approve nothing.
+ */
+interface ApprovalSelection {
+  selected: number[]
+  initCount: number
+}
+
 export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }) => {
   const [runs, setRuns] = useState<WorkflowRunRecord[]>([])
   const [sessions, setSessions] = useState<SessionRecord[]>([])
@@ -132,7 +252,7 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
   const [selectedNodeId, setSelectedNodeId] = useState<string>('P00_PREPARE')
   const [detailTab, setDetailTab] = useState<'stages' | 'digest' | 'sessions' | 'events'>('stages')
   const [runEvents, setRunEvents] = useState<AuditEventRecord[]>([])
-  const [approvedMap, setApprovedMap] = useState<Record<string, number[]>>({})
+  const [approvalSel, setApprovalSel] = useState<Record<string, ApprovalSelection>>({})
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -140,6 +260,25 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
   const [newClient, setNewClient] = useState('claude-code')
   const [newTitle, setNewTitle] = useState('')
   const [newSummary, setNewSummary] = useState('')
+  const [feishuLabel, setFeishuLabel] = useState('未配置')
+
+  useEffect(() => {
+    api
+      .feishuCheckStatus()
+      .then((st) => {
+        if (st.listener === null || st.listener === undefined) {
+          setFeishuLabel('未配置')
+          return
+        }
+        if (st.valid) setFeishuLabel('链路已验证，可在飞书卡片上直接审批')
+        else if (st.listener.state === 'ready') setFeishuLabel('监听就绪（自检未通过，审批走文本通知）')
+        else {
+          const stateLabel = labelOf(FEISHU_LISTENER_STATE_LABELS, st.listener.state, '未知')
+          setFeishuLabel(`监听${stateLabel}，审批走文本通知`)
+        }
+      })
+      .catch(() => setFeishuLabel('未配置'))
+  }, [refreshToken])
 
   const loadData = async () => {
     try {
@@ -147,12 +286,19 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
       setRuns(runsRes.runs)
       setSessions(sessRes.sessions)
 
-      // Auto-select all planned writes by default for awaiting runs
-      setApprovedMap((prev) => {
+      // Default to approving every planned write. The selection is rebuilt
+      // whenever the write count changes, so a run that reaches the approval
+      // gate with N writes is approved as a whole instead of nothing.
+      setApprovalSel((prev) => {
         const next = { ...prev }
         for (const r of runsRes.runs) {
-          if (!(r.run_id in next)) {
-            next[r.run_id] = r.planned_writes.map((_, idx) => idx)
+          const count = r.planned_writes.length
+          const cur = next[r.run_id]
+          if (!cur || cur.initCount !== count) {
+            next[r.run_id] = {
+              selected: r.planned_writes.map((_, idx) => idx),
+              initCount: count,
+            }
           }
         }
         return next
@@ -191,10 +337,21 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
     setBusy(true)
     setError(null)
     try {
-      const res = await api.startRun({ phase: 'auto', auto_approve: autoApprove })
-      setExpandedRunId(res.run.run_id)
-      setSelectedNodeId(res.run.status === 'AWAITING_APPROVAL' ? 'P04_WRITE_VERIFY' : 'P06_REPORT')
-      setDetailTab(res.run.status === 'AWAITING_APPROVAL' ? 'stages' : 'digest')
+      // Background: the answer comes at once and the batch follows on the SSE
+      // stream, so a long run no longer holds the request open.
+      const res = await api.startRun(
+        { phase: 'auto', auto_approve: autoApprove },
+        { background: true }
+      )
+      if (res.run) {
+        setExpandedRunId(res.run.run_id)
+        setSelectedNodeId(res.run.status === 'AWAITING_APPROVAL' ? 'P04_WRITE_VERIFY' : 'P06_REPORT')
+        setDetailTab(res.run.status === 'AWAITING_APPROVAL' ? 'stages' : 'digest')
+      } else if (res.run_id) {
+        setExpandedRunId(res.run_id)
+        setSelectedNodeId('P00_PREPARE')
+        setDetailTab('stages')
+      }
       await loadData()
       onGlobalRefresh()
     } catch (e: any) {
@@ -208,8 +365,8 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
     setBusy(true)
     setError(null)
     try {
-      const indices = approvedMap[run.run_id] ?? run.planned_writes.map((_, i) => i)
-      await api.approveRun(run.run_id, indices)
+      const indices = approvalSel[run.run_id]?.selected ?? run.planned_writes.map((_, i) => i)
+      await api.approveRun(run.run_id, indices, { background: true })
       setDetailTab('digest')
       await loadData()
       onGlobalRefresh()
@@ -235,11 +392,14 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
   }
 
   const togglePlannedIdx = (runId: string, idx: number) => {
-    setApprovedMap((prev) => {
-      const cur = prev[runId] ?? []
+    setApprovalSel((prev) => {
+      const cur = prev[runId]?.selected ?? []
       return {
         ...prev,
-        [runId]: cur.includes(idx) ? cur.filter((i) => i !== idx) : [...cur, idx],
+        [runId]: {
+          selected: cur.includes(idx) ? cur.filter((i) => i !== idx) : [...cur, idx],
+          initCount: prev[runId]?.initCount ?? 0,
+        },
       }
     })
   }
@@ -254,7 +414,7 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
         client: newClient,
         session_id: `manual-${Date.now().toString(36)}`,
         title: newTitle.trim(),
-        project: 'general',
+        project: 'generic',
         summary: newSummary.trim() || newTitle.trim(),
         content: `User: ${newTitle.trim()}\nAssistant: ${newSummary.trim() || newTitle.trim()}`,
         tags: ['manual'],
@@ -408,7 +568,7 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
             const isLatest = idx === 0
             const isExpanded = expandedRunId === run.run_id
             const isAwaiting = run.status === 'AWAITING_APPROVAL'
-            const approvedIndices = approvedMap[run.run_id] ?? []
+            const approvedIndices = approvalSel[run.run_id]?.selected ?? []
             const activeNode =
               run.nodes.find((n) => n.node_id === selectedNodeId) || run.nodes[0] || null
             const batchDate = run.batch_date || formatDateYMD(run.started_at)
@@ -532,6 +692,9 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
                             <p className="text-[12px] text-ink-3 mt-0.5">
                               勾选同意的条目将写入知识库或生效为避坑规则；不想保存可以取消。
                             </p>
+                            <p className="text-[11.5px] text-ink-4 mt-0.5" data-testid="feishu-link-status">
+                              飞书审批：{feishuLabel}
+                            </p>
                           </div>
                           <div className="flex items-center gap-2">
                             <button
@@ -557,6 +720,8 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
                         <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
                           {run.planned_writes.map((pw, pIdx) => {
                             const checked = approvedIndices.includes(pIdx)
+                            const isSkillUpdate =
+                              pw.target_kind === 'skill_improvement' && pw.action === 'update'
                             return (
                               <label
                                 key={pIdx}
@@ -603,10 +768,18 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
                                   )}
                                   <p className="text-[12px] text-ink-3 mt-1">{pw.summary}</p>
                                   {pw.content_preview && (
-                                    <div className="mt-2 rounded-[var(--radius-control)] bg-bg-sunk border border-line-soft p-2.5 max-h-32 overflow-y-auto">
-                                      <MarkdownView content={pw.content_preview} />
+                                    <div className="mt-2">
+                                      {isSkillUpdate && (
+                                        <div className="text-[11px] text-ink-4 mb-1">
+                                          新增小节（追加到文件末尾，原有内容不动）
+                                        </div>
+                                      )}
+                                      <div className="rounded-[var(--radius-control)] bg-bg-sunk border border-line-soft p-2.5 max-h-32 overflow-y-auto">
+                                        <MarkdownView content={pw.content_preview} />
+                                      </div>
                                     </div>
                                   )}
+                                  {isSkillUpdate && <SkillUpdatePanel pw={pw} />}
                                 </div>
                               </label>
                             )
@@ -639,7 +812,7 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
                       />
                       <span className="text-[12px] text-ink-4">
                         {labelOf(APPROVAL_MODE_LABELS, run.approval_mode, '智能审批')} ·{' '}
-                        {labelOf(RUNNER_MODE_LABELS, run.runner_mode)} ·{' '}
+                        {formatRunnerMode(run.runner_mode)} ·{' '}
                         <span className="mono">{run.run_id}</span>
                       </span>
                     </div>

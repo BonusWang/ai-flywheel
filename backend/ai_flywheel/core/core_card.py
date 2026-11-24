@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from ai_flywheel.config import FlywheelConfig
-from ai_flywheel.core.privacy import shanghai_today_ymd
+from ai_flywheel.core.time_utils import shanghai_today_ymd
 from ai_flywheel.models import RuleStatus, utc_now_iso
 from ai_flywheel.storage.db import FlywheelDB
 
@@ -108,6 +108,38 @@ def render_core_card(db: FlywheelDB) -> str:
             lines.pop()
         text = "\n".join(lines) + footer
     return text
+
+
+def read_core_card(cfg: FlywheelConfig, db: FlywheelDB) -> dict[str, Any]:
+    """Read the derived core card without touching the disk.
+
+    The file on disk is the card; when it is missing (a fresh install, or a
+    read-only mount) the card is rendered in memory instead. A plain read
+    never rewrites the derived file — that is what an explicit refresh is for.
+    """
+    target = core_card_path(cfg)
+    try:
+        data = target.read_bytes()
+    except OSError:
+        data = None
+    if data is not None:
+        content = data.decode("utf-8", errors="replace")
+        return {
+            "path": str(target),
+            "lines": content.count("\n"),
+            "bytes": len(data),
+            "content": content,
+            "source": "file",
+        }
+    content = render_core_card(db)
+    data = content.replace("\r\n", "\n").encode("utf-8")
+    return {
+        "path": str(target),
+        "lines": content.count("\n"),
+        "bytes": len(data),
+        "content": content,
+        "source": "rendered",
+    }
 
 
 def rebuild_core_card(cfg: FlywheelConfig, db: FlywheelDB) -> dict[str, Any]:

@@ -88,6 +88,18 @@ class KnowledgeSinkConfig(BaseModel):
     wiki_bash: str = "bash"
     wiki_gate_timeout_seconds: int = 300
     wiki_gate_evidence_dir: str = ""
+    # Name of the environment variable the D2 script reads as its work root. Empty means
+    # the neutral default (FLYWHEEL_WORK_ROOT); a deployment whose script expects a
+    # legacy name sets it here (or via the FLYWHEEL_D2_WORK_ROOT_ENV variable).
+    wiki_d2_work_root_env: str = ""
+
+    # Catch-all project for knowledge documents routed on EVIDENCE, i.e. plans of the zero-config
+    # dry_run planner (source session's workspace path first, then project identifiers in the draft).
+    # api / cli plans declare their route in the P03 plan and are never redirected here: a note that
+    # is declared unattributed, or whose declaration is contradicted by the evidence, is skipped and
+    # surfaced. Set this to a project directory name (a folder under the projects partition that
+    # has 实战笔记/) to catch the evidence-routed cards instead.
+    practice_fallback_project: str = ""
 
 
 class WorkflowConfig(BaseModel):
@@ -116,6 +128,14 @@ class ApiRunnerConfig(BaseModel):
     model: str = ""
     timeout_seconds: int = 240
     extra_headers: dict[str, str] = Field(default_factory=dict)
+    # Reasoning effort sent to an OpenAI-compatible endpoint ("low", "medium", "high").
+    # Empty means the parameter is omitted from the request, which keeps the runner portable
+    # to endpoints that do not know it. A non-empty value also enters the cache key: a
+    # different effort asks a different question and must not hit an older reply.
+    reasoning_effort: str = ""
+    # How many times a timed-out or refused connection is retried at once (no backoff).
+    # 0 disables the retry; 1 means one extra attempt after the first one.
+    transport_retries: int = 1
 
 
 class RunnerConfig(BaseModel):
@@ -138,10 +158,32 @@ class WebhookConfig(BaseModel):
 class FeishuCliConfig(BaseModel):
     enabled: bool = False
     command: str = "lark-cli"
+    # Extra argv inserted between the resolved executable and the subcommand
+    # (test doubles inject e.g. ["path/to/fake_lark_cli.py"] with command = python).
+    command_args: list[str] = Field(default_factory=list)
     identity: str = "bot"
     user_id: str = ""
     chat_id: str = ""
     notify_on_fyi: bool = False
+    # Interactive approval cards (feat-feishu-approval-card-loop). Changes to
+    # command / command_args / identity only take effect after a restart.
+    interactive: bool = False
+    approver_open_ids: list[str] = Field(default_factory=list)
+
+    @property
+    def effective_approver_ids(self) -> list[str]:
+        """Deduplicated, order-stable approver set: non-blank approver_open_ids plus a non-blank user_id."""
+        seen: list[str] = []
+        for raw in [*self.approver_open_ids, self.user_id]:
+            val = raw.strip()
+            if val and val not in seen:
+                seen.append(val)
+        return seen
+
+    @property
+    def interaction_ready(self) -> bool:
+        """Interactive mode entry conditions: private-chat recipient, bot identity, non-empty approvers."""
+        return bool(self.enabled and self.interactive and self.user_id and self.identity == "bot" and self.effective_approver_ids)
 
 
 class DeliveryConfig(BaseModel):
@@ -154,10 +196,26 @@ class DeliveryConfig(BaseModel):
 class SafetyValvesConfig(BaseModel):
     workflow_enabled: bool = True
     cli_execution_enabled: bool = True
+    # The truthful name of the model-execution valve: it gates every runner that
+    # calls a model or a local CLI. `None` means "follow cli_execution_enabled",
+    # so a configuration written before this field existed keeps its meaning.
+    model_execution_enabled: bool | None = None
     skill_write_enabled: bool = True
     auto_approve_writes: bool = False
     git_closure_enabled: bool = False
     public_export_strip_paths: bool = True
+
+    @property
+    def effective_model_execution_enabled(self) -> bool:
+        """Whether a runner may call a model or a local CLI.
+
+        `model_execution_enabled` is the name that says what it does; the older
+        `cli_execution_enabled` is kept for backward compatibility and decides
+        whenever the new field is unset.
+        """
+        if self.model_execution_enabled is not None:
+            return bool(self.model_execution_enabled)
+        return bool(self.cli_execution_enabled)
 
 
 class FlywheelConfig(BaseModel):
@@ -222,17 +280,33 @@ class FlywheelConfig(BaseModel):
 
     @property
     def effective_auto_approve(self) -> bool:
+        """Whether writes may be approved without a human.
+
+        The safety valve has the last word: `safety_valves.auto_approve_writes =
+        False` vetoes auto-approval even when the workflow asks for it
+        (`workflow.auto_approve_writes` or `workflow.approval_mode = "auto"`).
+        """
         return bool(
-            (self.workflow.auto_approve_writes and self.safety_valves.auto_approve_writes)
-            or self.workflow.approval_mode == "auto"
+            self.safety_valves.auto_approve_writes
+            and (self.workflow.auto_approve_writes or self.workflow.approval_mode == "auto")
         )
 
     @property
     def effective_approval_mode(self) -> str:
+        """The approval mode this configuration really runs with.
+
+        `auto` needs the safety valve open. With the valve closed an `auto`
+        request is downgraded to `smart` — routine writes pass, sensitive ones
+        still wait for a human — instead of bypassing the gate.
+        """
+        mode = (self.workflow.approval_mode or "always").strip().lower()
+        if mode not in {"smart", "always", "auto"}:
+            mode = "always"
+        if mode == "auto":
+            return "auto" if self.safety_valves.auto_approve_writes else "smart"
         if self.effective_auto_approve:
             return "auto"
-        mode = (self.workflow.approval_mode or "always").strip().lower()
-        return mode if mode in {"smart", "always", "auto"} else "always"
+        return mode
 
 
 def _apply_env_valves(raw: dict[str, Any]) -> dict[str, Any]:
@@ -240,6 +314,7 @@ def _apply_env_valves(raw: dict[str, Any]) -> dict[str, Any]:
     env_map = {
         "FLYWHEEL_WORKFLOW_ENABLED": "workflow_enabled",
         "FLYWHEEL_CLI_EXECUTION_ENABLED": "cli_execution_enabled",
+        "FLYWHEEL_MODEL_EXECUTION_ENABLED": "model_execution_enabled",
         "FLYWHEEL_AUTO_APPROVE_WRITES": "auto_approve_writes",
         "FLYWHEEL_GIT_CLOSURE_ENABLED": "git_closure_enabled",
     }

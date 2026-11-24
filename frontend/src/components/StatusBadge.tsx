@@ -13,6 +13,7 @@ const STATUS_STYLES: Record<string, string> = {
   AWAITING_APPROVAL: 'bg-amber-soft text-amber-ink border-amber/35',
   unverified_active: 'bg-amber-soft text-amber-ink border-amber/30',
   PARTIAL: 'bg-amber-soft text-amber-ink border-amber/30',
+  CANCELLED: 'bg-bg-sunk text-ink-3 border-line-strong',
   pending: 'bg-amber-soft text-amber-ink border-amber/30',
   open: 'bg-amber-soft text-amber-ink border-amber/30',
 
@@ -52,7 +53,8 @@ const LABELS: Record<string, string> = {
   AWAITING_APPROVAL: '待审批',
   PASS: '已通过',
   FAILED: '已失败',
-  PARTIAL: '已取消',
+  PARTIAL: '部分完成',
+  CANCELLED: '已取消',
   RUNNING: '运行中',
   PENDING: '未开始',
   SKIPPED: '已跳过',

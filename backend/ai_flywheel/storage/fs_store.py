@@ -6,20 +6,17 @@ import re
 from pathlib import Path
 from typing import Any
 
+from ai_flywheel.core.privacy import SECRET_PATTERNS as CANONICAL_SECRET_PATTERNS
+from ai_flywheel.core.privacy import redact_secrets
 
-SECRET_PATTERNS = [
-    re.compile(r"(Bearer\s+)[A-Za-z0-9\-._~+/]+=*", re.IGNORECASE),
-    re.compile(r"((?:api[_-]?key|token|secret|password)\s*[=:]\s*['\"]?)([^\s'\",;]+)", re.IGNORECASE),
-    re.compile(r"\b(gho|ghp|sk)-[A-Za-z0-9_\-]{12,}\b"),
-]
+# The canonical secret patterns, kept here as the raw compiled regexes so that the
+# module's historical surface stays intact. `core.privacy` owns the definitions.
+SECRET_PATTERNS: list[re.Pattern[str]] = [secret.pattern for secret in CANONICAL_SECRET_PATTERNS]
 
 
 def redact_text(text: str) -> str:
-    redacted = text
-    redacted = SECRET_PATTERNS[0].sub(r"\1[REDACTED]", redacted)
-    redacted = SECRET_PATTERNS[1].sub(r"\1[REDACTED]", redacted)
-    redacted = SECRET_PATTERNS[2].sub("[REDACTED_TOKEN]", redacted)
-    return redacted
+    """Mask credentials in stored text, keeping the readable prefix of the match."""
+    return redact_secrets(text)
 
 
 def canonical_hash(payload: Any) -> str:

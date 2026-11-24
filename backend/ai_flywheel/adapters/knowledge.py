@@ -6,9 +6,17 @@ from typing import Any, Iterator
 
 import yaml
 
-from ai_flywheel.adapters.wiki_gate import WikiGate, WikiGateError, split_frontmatter
+from ai_flywheel.adapters.wiki import (
+    FORBIDDEN_PATH_SEGMENTS,
+    SCHEMA_FILE_NAME,
+    WikiGate,
+    WikiGateError,
+    WikiSchemaLoader,
+    split_frontmatter,
+)
 from ai_flywheel.config import FlywheelConfig
-from ai_flywheel.core.privacy import compute_valid_until, sanitize_and_check_secrets, shanghai_today_ymd
+from ai_flywheel.core.privacy import sanitize_and_check_secrets
+from ai_flywheel.core.time_utils import compute_valid_until, shanghai_today_ymd
 from ai_flywheel.storage.db import FlywheelDB, build_knowledge_search_text
 from ai_flywheel.storage.fs_store import file_sha256
 
@@ -16,7 +24,6 @@ from ai_flywheel.storage.fs_store import file_sha256
 # minus the derived `queries` partition, matching the audit's P-2 spec.
 FTS_PARTITION_IDS = {"entities", "topics", "sources", "comparisons", "synthesis", "projects"}
 EXCLUDED_STATUSES = {"archived", "deprecated", "retired", "snapshot", "placeholder", "process_data"}
-EXCLUDED_PATH_SEGMENTS = {"raw", "raw-原始素材", ".wiki-tmp", ".wiki-agent-memory"}
 
 
 class KnowledgeWriteError(ValueError):
@@ -30,6 +37,7 @@ class KnowledgeSinkAdapter:
         self.cfg = cfg
         self.db = db
         self.wiki_gate = WikiGate(cfg)
+        self._schema_loader: WikiSchemaLoader | None = None
 
     @property
     def root(self) -> Path:
@@ -39,7 +47,16 @@ class KnowledgeSinkAdapter:
 
     @property
     def schema_path(self) -> Path:
-        return self.root / ".wiki-schema.md"
+        return self.root / SCHEMA_FILE_NAME
+
+    @property
+    def schema_loader(self) -> WikiSchemaLoader:
+        """The contract reader for the current root; the root follows the configuration."""
+        loader = self._schema_loader
+        if loader is None or loader.root != self.root:
+            loader = WikiSchemaLoader(self.root)
+            self._schema_loader = loader
+        return loader
 
     def _safe_resolve(self, relative_path: str) -> Path:
         norm = relative_path.replace("\\", "/").lstrip("/")
@@ -60,17 +77,10 @@ class KnowledgeSinkAdapter:
     def _load_schema(self) -> dict[str, Any] | None:
         if not self.schema_path.is_file():
             return None
-        text = self.schema_path.read_text(encoding="utf-8", errors="replace")
-        fm_text, _ = split_frontmatter(text)
-        if fm_text is None:
-            raise KnowledgeWriteError(f"{self.schema_path} has no parseable frontmatter")
-        data = yaml.safe_load(fm_text)
-        if not isinstance(data, dict):
-            raise KnowledgeWriteError(f"{self.schema_path} frontmatter is not a mapping")
-        for key in ("partition_contract", "content_contract"):
-            if not isinstance(data.get(key), dict):
-                raise KnowledgeWriteError(f"{self.schema_path} is missing machine block '{key}'")
-        return data
+        try:
+            return self.schema_loader.load(required_blocks=("partition_contract", "content_contract"))
+        except WikiGateError as exc:
+            raise KnowledgeWriteError(str(exc)) from None
 
     def _partition_roots(self, schema: dict[str, Any]) -> list[Path]:
         content = schema["content_contract"]
@@ -90,7 +100,7 @@ class KnowledgeSinkAdapter:
     @staticmethod
     def _is_excluded_path(relative_path: str) -> bool:
         return any(
-            segment in EXCLUDED_PATH_SEGMENTS or segment.startswith("archive-")
+            segment in FORBIDDEN_PATH_SEGMENTS or segment.startswith("archive-")
             for segment in relative_path.split("/")
         )
 
@@ -180,8 +190,11 @@ class KnowledgeSinkAdapter:
     def _search_documents(self, limit: int | None = None) -> tuple[list[dict[str, str]], int]:
         schema = self._load_schema()
         alias_map = {}
+        projects_root_rel = ""
         if schema is not None:
             alias_map = (schema["content_contract"].get("legacy_type_aliases") or {})
+            # The project partition is declared by the contract, never hardcoded.
+            projects_root_rel = self.schema_loader.projects_root_rel(schema)
         docs: list[dict[str, str]] = []
         skipped = 0
         for md, rel in self._iter_candidate_files():
@@ -207,10 +220,11 @@ class KnowledgeSinkAdapter:
             tags_text = self._tags_text(fm)
             body_text = body[:20000]
             project_id = str(fm.get("project_id") or "").strip()
-            if not project_id and rel.startswith("wiki-知识库/projects-项目/"):
+            if not project_id and projects_root_rel and rel.startswith(projects_root_rel + "/"):
+                root_parts = projects_root_rel.split("/")
                 parts = rel.split("/")
-                if len(parts) > 2:
-                    project_id = parts[2]
+                if len(parts) > len(root_parts):
+                    project_id = parts[len(root_parts)]
             tags_value = tags_text or rel.split("/")[0]
             docs.append(
                 {
@@ -275,7 +289,16 @@ class KnowledgeSinkAdapter:
         root_resolved = self.root.resolve()
         if root_resolved not in target.parents or not target.exists():
             return None
+        # Read guard: the excluded roots (raw / archive / process memory), the schema
+        # contract itself, and — on a schema-governed Wiki — every page the schema keeps
+        # out of the default surface (private_sensitive / contains_credentials) stay unreadable.
+        if self._is_excluded_path(norm):
+            return None
+        if norm == SCHEMA_FILE_NAME or target == self.schema_path.resolve():
+            return None
         content = target.read_text(encoding="utf-8", errors="ignore")
+        if self.schema_path.is_file() and self._parse_page(content) is None:
+            return None
         return {
             "doc_path": norm,
             "content": content,
@@ -284,12 +307,21 @@ class KnowledgeSinkAdapter:
 
     # ---------------- write path ----------------
 
-    def write_document_verified(self, relative_path: str, content: str, action: str = "create") -> dict[str, Any]:
-        """Controlled atomic write with privacy/secrets gate, pre-write schema gate, and post-write verification."""
+    def write_document_verified(
+        self, relative_path: str, content: str, action: str = "create", *, sync_fts: bool = True
+    ) -> dict[str, Any]:
+        """Controlled atomic write with privacy/secrets gate, pre-write schema gate, and post-write verification.
+
+        ``sync_fts=False`` skips the search-index rebuild: a batch that writes several
+        documents rebuilds the index once at the end instead of once per document.
+        """
         target = self._safe_resolve(relative_path)
         rel = relative_path.replace("\\", "/").lstrip("/")
         # v3 write-time privacy & secret leak gate (<private> redaction + refuseSecrets)
         content = sanitize_and_check_secrets(content, context=f"knowledge_doc:{rel}")
+        # LF-only documents: a Windows write must never introduce CRLF into an
+        # LF-governed Wiki, so the line endings are normalised before the gate sees it.
+        content = content.replace("\r\n", "\n")
         gate_result = self.wiki_gate.validate_document(rel, content)
         if gate_result.applicable and not gate_result.ok:
             self.wiki_gate.write_artifact(gate_result, rel, {"stage": "pre_write"})
@@ -300,16 +332,17 @@ class KnowledgeSinkAdapter:
 
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_suffix(target.suffix + ".tmp")
-        tmp.write_text(content, encoding="utf-8")
+        tmp.write_text(content, encoding="utf-8", newline="\n")
         tmp.replace(target)
 
-        # Read-back verification
-        readback = target.read_text(encoding="utf-8")
+        # Read-back verification: compare the bytes as written, not as translated.
+        with target.open("r", encoding="utf-8", newline="") as handle:
+            readback = handle.read()
         postimage_sha = file_sha256(target)
         if readback != content:
             raise KnowledgeWriteError(f"Read-back content mismatch on {relative_path}")
-        if action == "update" and preimage_sha == postimage_sha:
-            raise KnowledgeWriteError(f"Update action produced no byte change on {relative_path}")
+        if action == "update" and _is_unchanged(preimage_bytes, content):
+            raise KnowledgeWriteError(f"Update action produced no content change on {relative_path}")
 
         rollback_info: dict[str, Any] | None = None
         if gate_result.applicable:
@@ -319,7 +352,8 @@ class KnowledgeSinkAdapter:
             if not gate_result.ok:
                 rollback_info = self._rollback(target, preimage_bytes)
                 rollback_info["resync"] = self.wiki_gate.resync_after_rollback(rel)
-                self.sync_fts_index()
+                if sync_fts:
+                    self.sync_fts_index()
                 self.wiki_gate.write_artifact(
                     gate_result,
                     rel,
@@ -328,7 +362,8 @@ class KnowledgeSinkAdapter:
                 raise WikiGateError(_format_gate_failure(rel, gate_result, rollback_info))
             self.wiki_gate.write_artifact(gate_result, rel, {"stage": "post_write"})
 
-        self.sync_fts_index()
+        if sync_fts:
+            self.sync_fts_index()
         # Record initial freshness governance metadata for the written card
         fm_parsed = self._parse_page_lenient(content).get("frontmatter") or {}
         tier = str(fm_parsed.get("freshness_tier") or "evolving").strip().lower()
@@ -394,6 +429,20 @@ class KnowledgeSinkAdapter:
                 freshness_state="fresh",
             )
         return count
+
+
+def _is_unchanged(preimage_bytes: bytes | None, content: str) -> bool:
+    """True when an update would not change the document: identical bytes, or the same
+    text modulo line endings (an LF-governed Wiki rewrites CRLF as LF)."""
+    if preimage_bytes is None:
+        return False
+    if preimage_bytes == content.encode("utf-8"):
+        return True
+    try:
+        previous = preimage_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return previous.replace("\r\n", "\n") == content
 
 
 def _format_gate_failure(

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 import uuid
+from typing import Callable
 
 from ai_flywheel.core.activation import ActivationEngine
 from ai_flywheel.core.policies import PolicyEngine
-from ai_flywheel.core.privacy import shanghai_today_ymd
+from ai_flywheel.core.time_utils import shanghai_today_ymd
 from ai_flywheel.models import (
     CheckResult,
     OutcomeRecord,
@@ -38,6 +40,25 @@ class ReceiptService:
         self.fs_store = fs_store
         self.policies = policies
         self.activation = activation
+        self._state_change_hook: Callable[[], None] | None = None
+
+    def set_state_change_hook(self, hook: Callable[[], None] | None) -> None:
+        """Register the callback that re-derives whatever mirrors the store.
+
+        An outcome or a signal changes rules, dissents and freshness; the
+        derived core card is a projection of those, so it is refreshed with them.
+        """
+        self._state_change_hook = hook
+
+    def _notify_state_change(self) -> None:
+        hook = self._state_change_hook
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception:
+            # A failed refresh must never lose the outcome that caused it.
+            logging.getLogger("ai_flywheel.receipts").exception("state change hook failed")
 
     def validate_outcome_request(self, req: RecordOutcomeRequest) -> None:
         gates = self.policies.get_hard_gates().get("outcome_gate", {})
@@ -155,6 +176,13 @@ class ReceiptService:
                 self.db.refresh_knowledge_freshness(used_knowledge_paths, shanghai_today_ymd())
 
         # Any failed rule check also enqueues a retro item AND records traceable counter-evidence dissent
+        # `revalidate_from_outcome` already counted the recurrence for the rules it downgraded: counting it
+        # a second time here would make one failed check look like two.
+        revalidated_rules = {
+            str(effect.get("rule_id"))
+            for effect in effects
+            if effect.get("action") == "downgraded_on_recurrence"
+        }
         for chk in req.checks:
             if chk.result == CheckResult.FAIL and chk.rule_id:
                 claim_text = redact_text(
@@ -179,11 +207,27 @@ class ReceiptService:
                         summary=f"Rule {chk.rule_id} failed verification in check '{chk.name}': {chk.note or req.summary}",
                         rule_id=chk.rule_id,
                         detail={"outcome_id": outcome_id, "evidence": chk.evidence},
-                    )
+                    ),
+                    skip_rule_mutation=chk.rule_id in revalidated_rules,
+                    _notify=False,
                 )
+        # The outcome changed rules, dissents and freshness: whatever mirrors
+        # the store is refreshed once, after the whole outcome is recorded.
+        self._notify_state_change()
         return record
 
-    def report_signal(self, req: ReportSignalRequest) -> tuple[RetroItem, bool]:
+    def report_signal(
+        self,
+        req: ReportSignalRequest,
+        *,
+        skip_rule_mutation: bool = False,
+        _notify: bool = True,
+    ) -> tuple[RetroItem, bool]:
+        """Enqueue a retro item for a signal.
+
+        ``skip_rule_mutation`` still enqueues the item but leaves the rule's counters alone:
+        the caller already counted the recurrence (one failed check, one recurrence).
+        """
         session_key = req.session_key or (f"{req.client}:{req.session_id}" if req.session_id else f"{req.client}:adhoc")
         dedupe_key = canonical_hash(
             {
@@ -207,6 +251,14 @@ class ReceiptService:
             detail=req.detail,
         )
         saved, created = self.db.enqueue_retro(item, dedupe_key=dedupe_key)
-        if created and req.kind == SignalKind.RULE_RECURRENCE and req.rule_id:
+        if (
+            created
+            and not skip_rule_mutation
+            and req.kind == SignalKind.RULE_RECURRENCE
+            and req.rule_id
+        ):
             self.activation.mark_rule_recurrence(req.rule_id, req.summary, session_key=session_key)
+        if created and _notify:
+            # A new signal can downgrade a rule: the derived views follow.
+            self._notify_state_change()
         return saved, created

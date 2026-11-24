@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -14,8 +17,9 @@ from fastapi.staticfiles import StaticFiles
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel
 
+from ai_flywheel import __version__
 from ai_flywheel.core.connect_templates import build_client_connect_guides
-from ai_flywheel.core.orchestrator import WorkflowLockError
+from ai_flywheel.core.orchestrator import ApprovalLockBusy, WorkflowLockError
 from ai_flywheel.core.publication import MCP_TOOL_CATALOG
 from ai_flywheel.core.receipts import OutcomeGateError
 from ai_flywheel.models import (
@@ -45,6 +49,10 @@ class RejectBody(BaseModel):
     reason: str = "用户在可视化画布中取消放行"
 
 
+class FeishuCheckBody(BaseModel):
+    wait_seconds: float = 120.0
+
+
 class RuleTransitionBody(BaseModel):
     status: RuleStatus
     note: str = ""
@@ -72,8 +80,18 @@ def create_app(
     config_path: str | Path | None = None,
     base_dir: str | Path | None = None,
     auto_seed: bool = False,
+    process_role: str | None = None,
 ) -> FastAPI:
-    rt = runtime or FlywheelRuntime.create(config_path=config_path, base_dir=base_dir, auto_seed=auto_seed)
+    # The role decides what this process does (the recovery loop, the Feishu
+    # listener). An explicitly requested role wins; without one the runtime's
+    # own role decides, because the runtime was built for this process.
+    effective_role = process_role or (runtime.process_role if runtime is not None else "serve")
+    rt = runtime or FlywheelRuntime.create(
+        config_path=config_path,
+        base_dir=base_dir,
+        auto_seed=auto_seed,
+        process_role=effective_role,
+    )
     mcp_http_app = rt.mcp.streamable_http_app(
         streamable_http_path="/",
         json_response=True,
@@ -86,10 +104,16 @@ def create_app(
     )
 
     scheduler: BackgroundScheduler | None = None
+    recovery_stop: threading.Event | None = None
+    recovery_thread: threading.Thread | None = None
+
+    # ---------------- Feishu interactive layer (built in FlywheelRuntime) ----------------
+    # The Feishu pieces are read from the runtime at call time, not captured
+    # here: the runtime may build (or rebuild) them after the app was created.
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        nonlocal scheduler
+        nonlocal scheduler, recovery_stop, recovery_thread
         if rt.cfg.workflow.schedule_enabled:
             scheduler = BackgroundScheduler()
             try:
@@ -102,14 +126,36 @@ def create_app(
                 scheduler.start()
             except Exception:
                 scheduler = None
+        if effective_role == "serve":
+            # Recovery loop: reap runs whose executor is gone and reconcile ask cards.
+            # First execution happens inside the thread so lifespan startup never blocks.
+            recovery_stop = threading.Event()
+
+            def _recovery_loop() -> None:
+                interval = float(os.environ.get("FLYWHEEL_RECOVERY_INTERVAL", "30"))
+                stale_after = int(os.environ.get("FLYWHEEL_RECOVERY_STALE_SECONDS", "300"))
+                while True:
+                    try:
+                        rt.orchestrator.recover_interrupted_runs(stale_after_seconds=stale_after)
+                    except Exception:
+                        logging.getLogger("ai_flywheel.recovery").exception("recovery pass failed")
+                    if recovery_stop.wait(interval):
+                        break
+
+            recovery_thread = threading.Thread(target=_recovery_loop, name="flywheel-recovery", daemon=True)
+            recovery_thread.start()
+            rt.start_feishu()
         async with rt.mcp.session_manager.run():
             yield
+        rt.stop_feishu()
+        if recovery_stop is not None:
+            recovery_stop.set()
         if scheduler and scheduler.running:
             scheduler.shutdown(wait=False)
 
     app = FastAPI(
         title="AI Flywheel",
-        version="0.3.0",
+        version=__version__,
         description="Evidence-driven AI collaboration flywheel portal, API, and MCP server.",
         lifespan=lifespan,
     )
@@ -135,7 +181,7 @@ def create_app(
     # ---------------- Public Unified Layer (AIHOT-inspired) ----------------
     @app.get("/health")
     def health() -> dict[str, Any]:
-        return {"status": "ok", "version": "0.3.0", "lock": rt.db.get_workflow_lock()}
+        return {"status": "ok", "version": __version__, "lock": rt.db.get_workflow_lock()}
 
     @app.get("/llms.txt", response_class=PlainTextResponse)
     def llms_txt() -> str:
@@ -213,8 +259,13 @@ def create_app(
 
     @app.put("/api/site/config")
     def site_update_config(patch: dict[str, Any]) -> dict[str, Any]:
-        rt.update_runtime_config(patch)
-        return {"status": "saved", "config": _safe_config_dump()}
+        result = rt.update_runtime_config(patch)
+        return {
+            "status": "saved",
+            "config": _safe_config_dump(),
+            "restart_required": result["restart_required"],
+            "restart_reasons": result["restart_reasons"],
+        }
 
     @app.post("/api/site/seed")
     def site_seed() -> dict[str, Any]:
@@ -296,37 +347,10 @@ def create_app(
 
     @app.post("/api/site/observations/{obs_id}/promote")
     def site_promote_observation(obs_id: str) -> dict[str, Any]:
-        obs = rt.db.get_mistake_observation(obs_id)
-        if not obs:
+        promoted = rt.activation.promote_observation(obs_id)
+        if not promoted:
             raise HTTPException(status_code=404, detail="Observation not found")
-        import re as _re
-
-        tokens = _re.findall(r"[a-zA-Z0-9_-]{3,}|[\u4e00-\u9fff]{2,6}", obs["title"])
-        triggers = list(dict.fromkeys(tokens))[:5] or ["review"]
-        sess_keys = obs.get("session_keys") or []
-        req = CreateRuleRequest(
-            title=f"避坑规则：{obs['title'][:36]}",
-            domain="engineering",
-            projects=["generic"],
-            triggers=triggers,
-            checklist=[
-                obs.get("truth") or "执行前核对前置条件并真实验证",
-                "保留真实运行证据并提交结构化回执",
-            ],
-            forbidden_routes=[obs.get("thinking_root_cause") or "跳过前置核查直接盲改"],
-            source_pointers=sess_keys[:3],
-            origin_session_key=sess_keys[0] if sess_keys else None,
-        )
-        rule = rt.activation.register_rule(req, root_cause_key=obs["root_cause_key"])
-        updated = rt.db.update_mistake_observation_status(obs_id, "promoted", promoted_rule_id=rule.rule_id)
-        rt.db.append_audit_event(
-            entity_type="mistake_observation",
-            entity_id=obs_id,
-            event_type="manual_promoted",
-            actor="user",
-            summary=f"手动将错题「{obs['title']}」升级为试运行规则 {rule.rule_id}",
-            payload={"rule_id": rule.rule_id},
-        )
+        updated, rule = promoted
         rt.refresh_core_card()
         return {"observation": updated, "rule": rule.model_dump(mode="json")}
 
@@ -374,6 +398,13 @@ def create_app(
 
     @app.get("/api/site/core-card")
     def site_core_card() -> dict[str, Any]:
+        # Read-only: a plain GET never rewrites the derived card on disk.
+        return rt.read_core_card()
+
+    @app.post("/api/site/core-card/refresh")
+    def site_core_card_refresh() -> dict[str, Any]:
+        # The explicit rebuild: the card is a projection of the store, so it is
+        # only rewritten when the caller asks for it.
         return rt.refresh_core_card()
 
     @app.get("/api/site/retro")
@@ -414,6 +445,29 @@ def create_app(
     def site_run_events(run_id: str) -> dict[str, Any]:
         return {"events": rt.db.list_audit_events(entity_type="workflow_run", entity_id=run_id, limit=50)}
 
+    @app.post("/api/site/feishu-check")
+    def site_feishu_check_start(body: FeishuCheckBody | None = None) -> dict[str, Any]:
+        check = rt.feishu_check
+        if check is None:
+            raise HTTPException(status_code=404, detail="Feishu interactive layer is not configured (need enabled feishu_cli with bot identity and a private-chat user_id)")
+        wait = float(body.wait_seconds if body is not None else 120.0)
+        threading.Thread(
+            target=lambda: check.run(wait_seconds=wait),
+            name="flywheel-feishu-check",
+            daemon=True,
+        ).start()
+        return {"started": True, "wait_seconds": wait}
+
+    @app.get("/api/site/feishu-check")
+    def site_feishu_check_status() -> dict[str, Any]:
+        check = rt.feishu_check
+        if check is None:
+            return {"state": "unavailable", "reason": "feishu interactive layer not configured", "valid": False}
+        status = check.status()
+        listener = rt.feishu_listener
+        status["listener"] = listener.state if listener is not None else None
+        return status
+
     @app.get("/api/site/settings")
     def site_list_settings() -> dict[str, Any]:
         return {
@@ -422,7 +476,9 @@ def create_app(
         }
 
     @app.post("/api/site/runs")
-    def site_start_run(body: RunTriggerBody) -> dict[str, Any]:
+    def site_start_run(body: RunTriggerBody, background: bool = False) -> dict[str, Any]:
+        if background:
+            return _start_run_in_background(body)
         try:
             run = rt.orchestrator.start_run(
                 trigger="api",
@@ -436,15 +492,125 @@ def create_app(
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    def _start_run_in_background(body: RunTriggerBody) -> dict[str, Any]:
+        """Take the lock now, run the pipeline on a worker thread, answer at once.
+
+        The lock is taken in the request thread so a busy lock is reported as a
+        clean 409 instead of a failure nobody sees; the pipeline itself runs on
+        a daemon thread and reports through the SSE stream.
+        """
+        if not rt.cfg.safety_valves.workflow_enabled:
+            raise HTTPException(
+                status_code=400,
+                detail="Workflow execution is disabled by safety valve WORKFLOW_ENABLED=false.",
+            )
+        run_id = rt.orchestrator.new_run_id()
+        if not rt.db.acquire_workflow_lock(run_id):
+            lock = rt.db.get_workflow_lock()
+            raise HTTPException(
+                status_code=409, detail=f"Another workflow run already holds the lock: {lock}"
+            )
+
+        def _runner() -> None:
+            try:
+                rt.orchestrator.start_run(
+                    trigger="api",
+                    phase=body.phase,
+                    session_keys=body.session_keys,
+                    auto_approve_override=body.auto_approve,
+                    run_id=run_id,
+                )
+            except Exception as exc:  # the thread is the last line of defence
+                logging.getLogger("ai_flywheel.background").exception(
+                    "background run %s failed", run_id
+                )
+                rt.db.release_workflow_lock(run_id)
+                rt.broker.publish(
+                    "run_failed",
+                    {
+                        "run_id": run_id,
+                        "status": "FAILED",
+                        "error": str(exc),
+                        "nodes": [],
+                        "planned_writes": [],
+                    },
+                )
+
+        try:
+            threading.Thread(target=_runner, name=f"flywheel-run-{run_id}", daemon=True).start()
+        except Exception as exc:
+            # The worker never started: the lock this request took must not stay.
+            rt.db.release_workflow_lock(run_id)
+            raise HTTPException(status_code=500, detail=f"Cannot start the background run: {exc}") from exc
+        return {"run": None, "run_id": run_id, "background": True, "status": "RUNNING"}
+
     @app.post("/api/site/runs/{run_id}/approve")
-    def site_approve_run(run_id: str, body: ApprovalBody) -> dict[str, Any]:
+    def site_approve_run(run_id: str, body: ApprovalBody, background: bool = False) -> dict[str, Any]:
+        if background:
+            return _approve_run_in_background(run_id, body)
         try:
             run = rt.orchestrator.approve_and_resume(run_id, approved_indices=body.approved_indices)
             return {"run": run.model_dump(mode="json")}
+        except ApprovalLockBusy as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def _approve_run_in_background(run_id: str, body: ApprovalBody) -> dict[str, Any]:
+        """Claim the approval now, resume the pipeline on a worker thread.
+
+        The claim is the fast, atomic half — it takes the lock and decides the
+        outcome — so a busy lock or a stale run is still reported as a clean
+        409 / 404 / 400 before the answer goes out.
+        """
+        try:
+            run = rt.orchestrator.claim_approval_for_resume(
+                run_id, approved_indices=body.approved_indices
+            )
+        except ApprovalLockBusy as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        def _runner() -> None:
+            try:
+                rt.orchestrator.resume_claimed_run(run)
+            except Exception as exc:  # the thread is the last line of defence
+                logging.getLogger("ai_flywheel.background").exception(
+                    "background approval %s failed", run_id
+                )
+                rt.broker.publish(
+                    "run_failed",
+                    {
+                        "run_id": run_id,
+                        "status": "FAILED",
+                        "error": str(exc),
+                        "nodes": [],
+                        "planned_writes": [],
+                    },
+                )
+
+        try:
+            threading.Thread(
+                target=_runner, name=f"flywheel-approve-{run_id}", daemon=True
+            ).start()
+        except Exception as exc:
+            # The worker never started: the claimed run must not stay half-open.
+            rt.db.finish_run_terminal(
+                run_id,
+                status="FAILED",
+                card_state="failed",
+                error=f"background approval could not start: {exc}",
+                source="portal",
+            )
+            raise HTTPException(
+                status_code=500, detail=f"Cannot start the background approval: {exc}"
+            ) from exc
+        return {"run": run.model_dump(mode="json"), "background": True}
 
     @app.post("/api/site/runs/{run_id}/reject")
     def site_reject_run(run_id: str, body: RejectBody) -> dict[str, Any]:
@@ -471,6 +637,14 @@ def create_app(
         if not doc:
             raise HTTPException(status_code=404, detail="Document not found")
         return doc
+
+    # ---- Skill Preview (read-only): what an existing Skill looks like before it is updated ----
+    @app.get("/api/site/skills/{skill_name}/preview")
+    def site_skill_preview(skill_name: str) -> dict[str, Any]:
+        info = rt.skill_writer.inspect_existing_skill(skill_name)
+        if not info.get("exists"):
+            raise HTTPException(status_code=404, detail="Skill not found")
+        return info
 
     # ---- Built React Frontend SPA Hosting ----
     frontend_dist = (rt.cfg.base_dir / "frontend" / "dist").resolve()

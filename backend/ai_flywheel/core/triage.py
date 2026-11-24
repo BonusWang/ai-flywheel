@@ -54,11 +54,6 @@ _KNOWLEDGE_OR_PROJECT_SIGNALS = (
     "playbook",
 )
 
-_RAW_ID_TITLE_RE = re.compile(
-    r"^(?:codex|claude|claude-code|antigravity|cursor|session|chat)\s*(?:session|[·:：\-])\s*[0-9a-zA-Z\-_]{6,}$",
-    re.IGNORECASE,
-)
-
 _TURN_MARKER_RE = re.compile(r"^\[(?:user|assistant|human|model)\]", re.IGNORECASE | re.MULTILINE)
 
 
