@@ -3,6 +3,29 @@
 All notable changes to **AI Flywheel** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-11-25
+
+### Added
+- **Data modeling foundation, unified code dictionary & authoritative DDL (`v4` SQLite migration)** (`storage/db/schema.py`, `storage/db/migrations.py`, `storage/db/dict_repo.py`, `storage/db/queue_repo.py`, `storage/db/audit_repo.py`, `storage/db/session_repo.py`, `routes/governance.py`, `docs/schema.sql`, `docs/data-model.md`, `tests/test_data_foundation.py`):
+  - Added unified dictionary table `sys_dict_items` (composite PK `(dict_type, code)`) idempotently seeded with 9 built-in code categories / 55 items (`queue_status`, `ingress_channel`, `exclude_reason`, `client_type`, `priority_level`, `run_status`, `rule_status`, `signal_kind`, `entity_type`) while preserving custom non-builtin extensions (`is_builtin = 0`), exposed via `GET /api/site/dicts`.
+  - Added dedicated `distill_queue` inventory table (unique `(session_key, revision, chunk_index)`) decoupled from `sessions` entity profiles, plus session watermark & opt-out columns (`opt_out`, `opt_out_reason`, `latest_content_hash`, `latest_turn_count`, `last_consumed_turn`, `last_consumed_hash`).
+  - Extended universal trail table `audit_events` with structured state-transition columns (`from_status`, `to_status`, `reason_code`) and event-type index so queue, rule, and workflow transitions reuse a single audit ledger.
+  - Committed authoritative `docs/schema.sql` and `docs/data-model.md` (with Mermaid ER diagram and dictionary catalog), extended `scripts/verify_repo.py` `SCAN_SUFFIXES` to scan `.sql`, and added architecture invariant tests pinning DDL↔runtime schema parity and frontend/backend `QueueStatus` alignment.
+- **Explicit Distill Queue engine, Codex/Claude triggers & MCP session intent** (`core/queue_service.py`, `core/triage.py`, `core/hooks.py`, `core/connect_templates.py`, `mcp_server.py`, `app.py`, `routes/runs.py`, `tests/test_distill_queue.py`):
+  - Added `DistillQueueService` unifying four ingress events (`EXPLICIT_ENQUEUE`, `ARCHIVE`, `WITHDRAW`, `OPT_OUT`) with a three-tier admission gate (opt-out veto → explicit bypass → configurable triage rules), incremental watermark revisions on re-archive, 0-token structured compaction and turn-boundary chunking (`chunk 1/N..N/N`, `is_oversized`) so oversized sessions never silently drop tail conclusions, per-item retry counters with Dead-Letter Queue (`dead_letter`) isolation, and read-only/applied rule re-triage (`POST /api/site/queue/re-triage`).
+  - Implemented **Codex strict archive mode** (`sessions.codex_archive_sources`, background `flywheel-archive-sync` thread under `serve` role, and manual `POST /api/site/queue/sync`): only sessions moved into `archived_sessions/` or explicitly declared via MCP enter the queue, unarchiving automatically withdraws unconsumed items, and re-archiving grown transcripts enqueues incremental `rev + 1`.
+  - Implemented **Claude Code exit trigger mode**: `SessionEnd` enqueues via `claude_exit`, `SessionStart(source="resume")` and resumed `UserPromptSubmit` automatically withdraw unconsumed queued items, `Stop` no longer pollutes the queue mid-conversation, and `UserPromptSubmit` injects canonical `session=<client>:<session_id>` into hook context for 100% hook↔MCP alignment.
+  - Added 7th MCP tool `flywheel_session_intent(action="enqueue"|"opt_out"|"withdraw")` and wired `flywheel_ingest_session` and manual portal registration directly into `distill_queue`.
+  - Added 6 queue control-plane endpoints (`GET /api/site/queue`, `GET /api/site/queue/{queue_id}/events`, `POST /api/site/queue/sync`, `POST /api/site/queue/{queue_id}/action`, `POST /api/site/queue/bulk-action`, `POST /api/site/queue/re-triage`) and extended `POST /api/site/runs` with `queue_ids` expedite support.
+- **Workflows dual-tab Inventory & Pipeline Console** (`frontend/src/components/workflows/QueueInventoryPanel.tsx`, `frontend/src/pages/WorkflowsPage.tsx`, `frontend/src/App.tsx`, `frontend/src/api.ts`, `frontend/src/types.ts`, `frontend/src/lib/labels.ts`):
+  - Added a persistent 6-state inventory & progress strip (`queued` / `processing` / `processed` / `excluded` / `withdrawn` / `dead_letter`, per-client partition counts, estimated drain batches, one-click archive sync) and dual tabs (**沉淀队列（库存）** / **执行流水线（P00–P07）**) inside `WorkflowsPage`, consuming `/api/site/dicts` for unified labels, SSE `queue_updated` live refresh, lazy-loaded `audit_events` state trails, bulk expedite/requeue/exclude actions, rule re-triage dry-run preview, and one-click jump to linked runs.
+
+### Changed
+- **P00–P07 queue-backed admission, settlement & recovery** (`core/pipeline/coordinator.py`, `core/pipeline/recovery.py`, `runtime.py`, `core/publication.py`):
+  - P00 reconciles Codex archives and idempotently bridges legacy pending sessions; P01 claims prioritized `distill_queue` items (or explicit `queue_ids`) with exact oversized chunk loading; P05 settles reviewed items to `processed` while advancing session watermarks; failed/reaped runs increment item retry counts toward `dead_letter`, while approval rejection (`CANCELLED`) returns items to `queued` with zero retry penalty.
+- **Version `0.7.0`** (`backend/ai_flywheel/__init__.py`, `pyproject.toml`, `frontend/package.json`, `profile/site.yaml`, `README.md`, `AGENTS.md`, `openspec/config.yaml`):
+  - Bumped version across all parity layers and synchronized documentation with the v4 data model, 7 MCP tools, and Workflows queue inventory console.
+
 ## [0.6.2] - 2026-11-25
 
 ### Added

@@ -59,24 +59,24 @@ flowchart LR
 
 AI Flywheel 采用「**3+1**」通用生态定位：最外层是一个不持有事实源的**客户端网关与分发层**（Model Routing `/v1` · MCP Hub · Static Asset Sync，明确标注 **Non-SSOT**），面向 Claude Code、Codex、Claude Desktop、Antigravity 等 AI 客户端；其内是三个可独立治理的内核角色：
 
-- **AI Flywheel（治理与进化引擎）**：MCP 6 Tools + 4 Resources、执行期证据门禁、P00–P07 受控流水线、SQLite FTS5、5+1 控制面与多通道审批——所有决策事实源的唯一归属。
+- **AI Flywheel（治理与进化引擎）**：MCP 7 Tools + 4 Resources、执行期证据门禁、显式沉淀队列（`distill_queue` + 统一字典表 + 通用轨迹）、P00–P07 受控流水线、SQLite FTS5、5+1 控制面与多通道审批——所有决策事实源的唯一归属。
 - **外部策略与装备仓（可选覆盖）**：通过 `profile.override_dir` 只读挂载 policies / triggers、`skills/` 与 `agents/`；P04 对 `SKILL.md` 只做追加式更新（旧文件逐字节为新文件前缀）。
 - **挂载知识库（本地 Markdown / Obsidian Wiki）**：人类可读、可进 Git 的知识资产；`.wiki-schema.md` 写入门禁、FTS5 回读索引与 P04 审批后受控写入。
 
-> **v0.6.2 更新指引**：重构「错题与分歧」四子视图（待我处理 / 错题观察池 / 规则分歧 / 实时异常线索）并补齐批量处理、同类异常折叠与周五低危错题自动归档；全站轨迹与治理列表统一支持默认创建时间倒序、关键词检索、状态筛选与默认 10 条分页；修复「Skill 与保鲜」本地探测 Skill 合并与过期经验卡计数对齐，并精简「关于」页定位与界面。
+> **v0.7.0 更新指引**：新增显式**沉淀队列机制（`distill_queue`）与数据建模底座（SQLite v4）**——统一码值字典表 `sys_dict_items`（`GET /api/site/dicts`）、复用 `audit_events` 作为全系统结构化状态变迁轨迹、落仓权威建模脚本 [`docs/schema.sql`](./docs/schema.sql) 与 [`docs/data-model.md`](./docs/data-model.md)（含不变量测试守护）；实现 **Codex 严格归档制（`archived_sessions` 出现入队/移出撤回/增大增量）**、**Claude Code exit 退出触发（`SessionEnd` 入队 + `resume` 自动撤回）**、第 7 个 MCP 工具 **`flywheel_session_intent`**（对话内一键声明沉淀 / 不沉淀 / 撤回，Hook 透传 `session_key` 精准对齐）、超大上下文 0-Token 瘦身与分片（不丢尾）以及死信隔离（DLQ）；「沉淀与审批」页升级为顶部 6 态库存进度条 + **「沉淀队列（库存）」/「执行流水线（P00–P07）」**双 Tab 控制台。
 
 ---
 
 ## 工作原理：一条执行闭环 + 一条受控进化流水线
 
-### 1. 执行期闭环（标准 MCP：6 Tools + 4 Resources）
+### 1. 执行期闭环（标准 MCP：7 Tools + 4 Resources）
 
 AI 工具通过 `http://127.0.0.1:8765/mcp`（Streamable HTTP）或 `flywheel mcp-stdio` 接入：
 
 - **开工前**：调用 `flywheel_preflight_activate` 获取反偷懒契约、个人协作偏好、命中先例规则及已知反例，并签发不可变预检回执；也可随时读取 `flywheel://core-card`（≤200 行跨端热态索引卡）。
-- **执行中**：遇到死循环、高危动作或规则复发时，通过 `flywheel_report_signal` 记入复盘队列。
+- **执行中**：遇到死循环、高危动作或规则复发时，通过 `flywheel_report_signal` 记入复盘队列；`UserPromptSubmit` Hook 会向模型上下文注入规范 `session=<client>:<session_id>` 标识，确保 MCP 声明与本地归档 100% 对齐。
 - **交付时**：调用 `flywheel_record_outcome` 提交结构化验收结果——声明 `status=success` 必须所有必填检查项通过，`real + pass` 必须附带真实证据，并同步回传 `used_knowledge_paths`（自动续期经验卡）与 `used_skills`（记录 Skill 真实调用）。
-- **会话入队**：通过 `flywheel_register_session` / `flywheel_ingest_session` 或后台定时扫盘，进入受控进化流水线。
+- **会话入队与显式意图控制**：通过 `flywheel_session_intent`（`enqueue` 显式高优沉淀 / `opt_out` 本会话永久不沉淀 / `withdraw` 撤回排队）、`flywheel_ingest_session`、`flywheel_register_session`，或由 **Codex 归档目录对账 / Claude Code `SessionEnd` 退出钩子**进入 `distill_queue` 库存队列。
 
 ### 2. 后台受控进化流水线（P00–P07 固定 8 节点）
 
@@ -97,33 +97,42 @@ AI 工具通过 `http://127.0.0.1:8765/mcp`（Streamable HTTP）或 `flywheel mc
 
 ---
 
-## 核心能力（v0.6.2）
+## 核心能力（v0.7.0）
 
 ### 1. 策略与知识解耦 + 执行期实证门禁
 - 反偷懒契约、循环保护阈值、证据分级（`real / test / static / unknown`）与个人协作偏好独立托管在 `profile/policies/`，无需绑定特定知识库。
 - 知识落点完全可插拔：默认内置 `./data/knowledge`（零配置开箱即用），也可无侵入挂载任意本地 Markdown / Obsidian Wiki。
 
-### 2. 抗熵增进化引擎（防记忆投毒、敢做减法、规则可回溯）
+### 2. 显式沉淀队列、双端归档机制与统一数据底座（v0.7.0）
+- **可见的流水线库存（`distill_queue`）**：将客户端会话主档（`sessions`）与流水线沉淀任务解耦，提供 6 态库存（`queued` / `processing` / `processed` / `excluded` / `withdrawn` / `dead_letter`）、按工具分片统计与预计清仓批次数；同一会话支持撤回后再输入增量入队（`rev + 1` 水位线）与独立失败重试/死信隔离。
+- **双端精准触发 + MCP 显式声明**：
+  - **Codex（严格归档制）**：仅同步 `archived_sessions/` 归档目录或 MCP 显式声明，移出自动撤回、续聊增大后重归档自动增量入队；
+  - **Claude Code（exit 退出触发制）**：`SessionEnd` 过三级规则闸门入队，`SessionStart(resume)` 与续聊提示自动撤回，`Stop` 不再制造半成品噪音；
+  - **对话内 MCP 控制**：`flywheel_session_intent` 支持一句话声明沉淀（`enqueue` 高优直通）、本会话永久不沉淀（`opt_out` 一票否决）与撤回（`withdraw`），并由 `UserPromptSubmit` 自动注入规范 `session_key` 实现 100% 对齐。
+- **超大上下文 0-Token 瘦身与分片**：入队前保留完整用户提问与尾部结论、折叠冗长工具日志，仍超预算时按轮次边界自动拆片（`chunk 1/N..N/N`），杜绝截尾丢根因。
+- **统一字典表 + 通用状态轨迹 + 权威 DDL**：新增 `sys_dict_items` 统一托管 9 类 55 项内置码值与扩展元数据（`GET /api/site/dicts`）；复用 `audit_events` 承接全系统状态变迁轨迹；权威建模脚本 [`docs/schema.sql`](./docs/schema.sql) 与 [`docs/data-model.md`](./docs/data-model.md) 受架构不变量测试强守护。
+
+### 3. 抗熵增进化引擎（防记忆投毒、敢做减法、规则可回溯）
 - **两级会话初筛**：一级 0-Token 规则硬筛自动过滤内部子代理碎片与空会话；二级 P02 语义价值闸门直接丢弃翻译、闲聊与一次性问答，绝不硬凑笔记。
 - **双轨错题观察池**：失误分 `red_silent`（🔴 沉默错误）/ `yellow_caught`（🟡 自查拦截）/ `green_minor`（🟢 轻微）；普通失误按 `root_cause_key` 聚类满 **3 次（事不过三）** 才晋升规则，高危沉默错误支持首次直通试运行。
 - **分歧反例保留 + 轻量规则双时态沿革**：规则复测失败或出现例外时写入 `dissent_records` 绝不静默覆盖；规则替代与停用自动记录 `supersedes_rule_id`、`effective_from`、`effective_to`（纯 SQLite 幂等迁移，无需图库），完整保留规则演进时间线。
 - **经验卡新鲜度保鲜**：按 `volatile`（30 天）/ `evolving`（90 天）/ `evergreen`（180 天）管理有效期；超期自动降权并提示复核，在真实任务中通过 `real` 验证引用时自动续期。
 - **周五分层蒸馏 + 反 Skill 表演**：支持只读预览（`GET /api/site/dream` / 控制台一键预览）与自动/手动执行——将 14 天零命中试运行规则转入 `dormant`、标记超期经验、检测触发词重合规则及 21 天零调用或连续失败 Skill。
 
-### 3. 人机可控的资产变更、Git 审计与多通道通知
+### 4. 人机可控的资产变更、Git 审计与多通道通知
 - **合同驱动的 Schema 写入门禁**：挂载含 `.wiki-schema.md` 的 Wiki 时，P03 由模型从现场候选集中声明路由并经证据交叉校验（归属不明或冲突绝不写入，记 `planned_doc_unrouted`）；支持中性 `postflight_hook_script` 写后校验钩子（向后兼容 `wiki_d2_postflight_script`）。
 - **写时隐私与密钥门禁**：自动脱敏 `<private>...</private>` 区块（含文件名 slug 剥离），硬拦截 API Key / Token / 私钥（`SecretLeakError`）。
 - **Skill 追加式无损更新**：`action="update"` 只在现有 `SKILL.md` 末尾追加新节——旧文件逐字节为新文件前缀，写前备份、原子替换、SHA-256 回读校验并保留原有换行符；审批卡提供现有大纲与全文对照。
 - **可选 P04 本地 Git 审计提交**：开启 `knowledge_sink.auto_git_commit: true` 后，P04 写入验收完成时仅对本批写入路径执行 `git commit --only`（带 `run_id` 与审批来源，绝不触碰无关文件、绝不 `push`）。
 - **分层审批、安全阀与多通道通知**：支持 `smart` / `always` / `auto` 审批模式，安全阀 `safety_valves.auto_approve_writes = false` 拥有最终否决权；支持 Web 控制台、通用 **Webhook**（隐私脱敏 + 可选 HMAC-SHA256 `X-Flywheel-Signature` 签名 + 非致命投递）以及可选飞书交互卡片审批。
 
-### 4. 工程级可靠性与可观测性
+### 5. 工程级可靠性与可观测性
 - **反静默回退**：`api` / `cli` 模式下模型输出不可用时节点直接失败并留下原因码与结构化诊断，绝不偷偷退回本地启发式却伪报模型来源。
 - **校验后缓存与调用追踪**：仅在回复通过语义校验后写入 `api_cache/`；记录尝试次数、耗时、实际服务模型与 prompt / completion / reasoning token 用量，在控制台节点详情直接透出。
 - **原子审批与崩溃恢复**：认领审批、状态迁移与审计事件在同一事务落盘；执行中每 15 秒续锁打心跳，`serve` 进程每 30 秒自动收割僵尸批次。
 
-### 5. 极简 `5+1` 控制面与零摩擦引导 CLI
-- **控制面 Web UI**：`今日态势`（实证通过率 / 规则健康 / 错题池 / 实时调度与安全阀 / 核心索引卡）/ `沉淀与审批`（噪音过滤漏斗 / 模型遥测 / 审批抽屉）/ `自动化调度`（上海时区 Cron 热重载 / 周五蒸馏预览与触发 / 守护巡检）/ `规则与进化`（避坑规则含沿革徽标 / 错题与分歧 / Skill 实效与经验保鲜 / 证据台账 / 执行规矩）/ `接入与设置` + `关于`。
+### 6. 极简 `5+1` 控制面与零摩擦引导 CLI
+- **控制面 Web UI**：`今日态势`（实证通过率 / 规则健康 / 错题池 / 实时调度与安全阀 / 核心索引卡）/ `沉淀与审批`（顶部 6 态队列库存进度条 + 「沉淀队列（库存）」与「执行流水线（P00–P07）」双 Tab / 轨迹展开 / 规则重筛预览 / 批量插队与审批抽屉）/ `自动化调度`（上海时区 Cron 热重载 / 周五蒸馏预览与触发 / 守护巡检）/ `规则与进化`（避坑规则含沿革徽标 / 错题与分歧 / Skill 实效与经验保鲜 / 证据台账 / 执行规矩）/ `接入与设置` + `关于`。
 - **引导与诊断 CLI**：内置只读环境体检 `flywheel doctor [--json]` 与多端 MCP 配置向导 `flywheel init-client <claude-code|codex|claude-desktop|antigravity> [--apply]`（默认安全 dry-run，应用时自动备份并幂等合并）。
 
 ---
@@ -202,6 +211,14 @@ profile:
 capabilities:
   skills_dirs:
     - "/path/to/your-skills"                      # 可选：本地 SKILL.md 目录
+
+sessions:
+  codex_archive_sources:                          # 可选：Codex 严格归档目录（出现入队/移出撤回/增大增量）
+    - client: "codex"
+      path: "~/.codex/archived_sessions"
+      glob: "**/*.jsonl"
+  queue_max_item_chars: 24000                     # 超大上下文瘦身后单片字符上限
+  queue_max_retries: 3                            # 队列项最大失败重试次数（超限转死信）
 
 knowledge_sink:
   type: "local_markdown_wiki"                     # builtin_kb | local_markdown_wiki
