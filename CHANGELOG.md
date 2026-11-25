@@ -3,6 +3,27 @@
 All notable changes to **AI Flywheel** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.6.2] - 2026-11-25
+
+### Added
+- **Unified list toolbar & pagination across the console** (`frontend/src/components/ListControls.tsx`, `WorkflowsPage.tsx`, `AutomationsPage.tsx`, `RulesListTab.tsx`, `CluesObservationsTab.tsx`, `AssetsFreshnessTab.tsx`, `OutcomesLedgerTab.tsx`):
+  - Added reusable `ListToolbar` (keyword search, status/client/trigger filters, default `created_at DESC` ordering) and `PaginationBar` (default 10 items per page, switchable 10 / 20 / 50) across all trajectory and governance lists.
+- **Bulk governance APIs & Friday Dream low-severity auto-archive** (`routes/governance.py`, `storage/db/rule_repo.py`, `storage/db/session_repo.py`, `core/dream.py`, `tests/test_console_governance_ux.py`):
+  - Added `POST /api/site/observations/bulk-archive`, `POST /api/site/dissents/bulk-status`, and `POST /api/site/retro/bulk-status`, and raised default list limits with `total` metadata on `/api/site/runs`, `/api/site/outcomes`, `/api/site/observations`, `/api/site/dissents`, and `/api/site/retro`.
+  - Extended Friday Dream Tier 1 (`run_dream_consolidation` and read-only `preview_dream_consolidation`) to auto-archive single-occurrence `yellow_caught` / `green_minor` observing mistakes older than 30 days while never auto-archiving `red_silent` observations.
+
+### Changed
+- **Four-subview governance redesign for "错题与分歧"** (`frontend/src/pages/RulesRetroPage.tsx`, `frontend/src/components/rules/CluesObservationsTab.tsx`):
+  - Split the tab into **待我处理** (default: high-risk `red_silent` / ready-to-promote observations + open dissents), **错题观察池** (system auto-tracking banner + batch archive), **规则分歧** (dedicated view for `dissent_records` with enriched `target_title` / `target_status` and batch convergence), and **实时异常线索** (default hides resolved history, groups repeated identical signals with `×N` badges, and supports batch resolution/dismissal). Tab badge counts only actionable items in **待我处理**.
+  - Compacted list rows to 1–2 line summaries with click-to-expand details.
+- **Cleaner About page** (`frontend/src/pages/AboutPage.tsx`):
+  - Removed third-party memory product name-drops from the hero and footer, and removed the inline `/llms.txt` collapsible raw-text panel while retaining MCP endpoint cards, the 6 MCP tool descriptions, and the footer `/llms.txt` link.
+
+### Fixed
+- **Local Skills ledger & knowledge freshness count parity** (`routes/governance.py`, `frontend/src/components/rules/AssetsFreshnessTab.tsx`):
+  - `GET /api/site/skills` now merges locally probed skills from `capabilities.skills_dirs` with database effectiveness records so configured local skills appear immediately rather than rendering an empty table.
+  - `GET /api/site/knowledge` now merges all expired and tracked cards from `freshness_map` beyond the newest filesystem slice, aligning `expired_total` 1:1 with `growth-metrics.live.expired_card_count`.
+
 ## [0.6.1] - 2026-11-25
 
 ### Added

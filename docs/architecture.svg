@@ -21,7 +21,7 @@
   <!-- header -->
   <text x="40" y="50" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="26" font-weight="700" fill="#0F172A">AI Flywheel · 3+1 Ecosystem Architecture</text>
   <text x="40" y="74" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="12.5" fill="#64748B">Sanitized, vendor-neutral view · three abstract kernel roles plus one non-SSOT client gateway</text>
-  <text x="1160" y="50" text-anchor="end" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="12" fill="#94A3B8">PUBLIC · v0.6.1</text>
+  <text x="1160" y="50" text-anchor="end" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="12" fill="#94A3B8">PUBLIC · v0.6.2</text>
   <line x1="40" y1="90" x2="1160" y2="90" stroke="#E2E8F0" stroke-width="1"/>
 
   <!-- ================= layer 0: client gateway & distribution ================= -->
