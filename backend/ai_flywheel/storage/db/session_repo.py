@@ -406,6 +406,17 @@ class SessionRepoMixin:
                 ).fetchall()
             return [self._row_to_retro(r) for r in rows]
 
+    def count_retro_items(self, status: str | None = None) -> int:
+        with self.connect() as conn:
+            if status:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM retro_queue WHERE status = ?",
+                    (status,),
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT COUNT(*) AS cnt FROM retro_queue").fetchone()
+            return int(row["cnt"]) if row else 0
+
     def update_retro_status(self, retro_id: str, status: RetroStatus) -> RetroItem | None:
         with self.connect() as conn:
             conn.execute(
@@ -414,6 +425,23 @@ class SessionRepoMixin:
             )
             row = conn.execute("SELECT * FROM retro_queue WHERE retro_id = ?", (retro_id,)).fetchone()
             return self._row_to_retro(row) if row else None
+
+    def bulk_update_retro_status(self, retro_ids: list[str], status: RetroStatus) -> int:
+        ids = [rid for rid in dict.fromkeys(retro_ids) if rid]
+        if not ids:
+            return 0
+        now = self._now_iso()
+        placeholders = ",".join("?" for _ in ids)
+        with self.connect() as conn:
+            cur = conn.execute(
+                f"""
+                UPDATE retro_queue
+                SET status = ?, updated_at = ?
+                WHERE retro_id IN ({placeholders})
+                """,
+                (status.value, now, *ids),
+            )
+            return int(cur.rowcount)
 
     def resolve_retros_for_sessions(self, session_keys: list[str], run_id: str) -> int:
         """Close the OPEN retro items of the given sessions and link them to the settling run.

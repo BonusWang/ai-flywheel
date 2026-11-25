@@ -36,6 +36,7 @@ export const RulesRetroPage: React.FC<Props> = ({
   const [tab, setTab] = useState<RulesTabKey>(initialTab)
   const [rules, setRules] = useState<RuleRecord[]>([])
   const [dissentsByRule, setDissentsByRule] = useState<Record<string, DissentRecord[]>>({})
+  const [dissents, setDissents] = useState<DissentRecord[]>([])
   const [observations, setObservations] = useState<MistakeObservation[]>([])
   const [growth, setGrowth] = useState<GrowthMetricsLive | null>(null)
   const [retros, setRetros] = useState<RetroItem[]>([])
@@ -55,8 +56,9 @@ export const RulesRetroPage: React.FC<Props> = ({
   }, [initialTab])
 
   const loadAll = async () => {
-    const [rRes, qRes, pRes, oRes, gRes, sRes, kRes, outRes, ccRes] = await Promise.all([
+    const [rRes, dRes, qRes, pRes, oRes, gRes, sRes, kRes, outRes, ccRes] = await Promise.all([
       api.listRules(),
+      api.listDissents().catch(() => ({ dissents: [] })),
       api.listRetro(),
       api.listPolicies(),
       api.listObservations(),
@@ -68,6 +70,7 @@ export const RulesRetroPage: React.FC<Props> = ({
     ])
     setRules(rRes.rules)
     setDissentsByRule(rRes.dissents_by_rule || {})
+    setDissents(dRes.dissents || [])
     setRetros(qRes.items)
     setPolicies(pRes.policies)
     setObservations(oRes.observations)
@@ -92,8 +95,12 @@ export const RulesRetroPage: React.FC<Props> = ({
     onGlobalRefresh()
   }
 
-  const openClues = retros.filter((x) => x.status === 'open' || x.status === 'in_review')
-  const observingPool = observations.filter((o) => o.status === 'observing')
+  const actionRequiredCount =
+    observations.filter(
+      (o) =>
+        o.status === 'observing' &&
+        (o.severity_grade === 'red_silent' || o.occurrence_count >= 3)
+    ).length + dissents.filter((d) => d.status === 'open').length
   const filteredRules = filter === 'all' ? rules : rules.filter((r) => r.status === filter)
 
   return (
@@ -207,7 +214,7 @@ export const RulesRetroPage: React.FC<Props> = ({
         <PillTabs
           items={[
             { key: 'rules', label: '避坑规则', count: rules.length },
-            { key: 'clues', label: '错题与分歧', count: observingPool.length + openClues.length },
+            { key: 'clues', label: '错题与分歧', count: actionRequiredCount },
             {
               key: 'assets',
               label: 'Skill 与保鲜',
@@ -263,6 +270,7 @@ export const RulesRetroPage: React.FC<Props> = ({
       {tab === 'clues' && (
         <CluesObservationsTab
           observations={observations}
+          dissents={dissents}
           retros={retros}
           onChanged={reload}
           onToast={showToast}

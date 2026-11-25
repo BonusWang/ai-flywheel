@@ -315,6 +315,86 @@ class RuleRepoMixin:
             row = conn.execute("SELECT * FROM mistake_observations WHERE obs_id = ?", (obs_id,)).fetchone()
             return self._row_to_observation(row) if row else None
 
+    def bulk_update_mistake_observation_status(self, obs_ids: list[str], status: str) -> int:
+        if status not in {"observing", "promoted", "archived"}:
+            return 0
+        ids = [oid for oid in dict.fromkeys(obs_ids) if oid]
+        if not ids:
+            return 0
+        now = self._now_iso()
+        placeholders = ",".join("?" for _ in ids)
+        with self.connect() as conn:
+            cur = conn.execute(
+                f"""
+                UPDATE mistake_observations
+                SET status = ?, version = version + 1, updated_at = ?
+                WHERE obs_id IN ({placeholders})
+                """,
+                (status, now, *ids),
+            )
+            return int(cur.rowcount)
+
+    def archive_stale_low_severity_observations(self, *, days: int = 30) -> list[dict[str, Any]]:
+        """Auto-archive low-severity single-occurrence observing mistakes older than `days`.
+
+        High-risk `red_silent` observations and recurring mistakes (`occurrence_count >= 2`)
+        are never auto-archived.
+        """
+        cutoff = (self.now_datetime() - timedelta(days=days)).isoformat()
+        now = self._now_iso()
+        archived: list[dict[str, Any]] = []
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT obs_id, root_cause_key, title, severity_grade, updated_at
+                FROM mistake_observations
+                WHERE status = 'observing'
+                  AND severity_grade IN ('yellow_caught', 'green_minor')
+                  AND occurrence_count <= 1
+                  AND updated_at < ?
+                """,
+                (cutoff,),
+            ).fetchall()
+            for r in rows:
+                conn.execute(
+                    """
+                    UPDATE mistake_observations
+                    SET status = 'archived', version = version + 1, updated_at = ?
+                    WHERE obs_id = ?
+                    """,
+                    (now, r["obs_id"]),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO audit_events (entity_type, entity_id, event_type, actor, summary, payload_json, created_at)
+                    VALUES ('mistake_observation', ?, 'auto_archived', 'dream', ?, ?, ?)
+                    """,
+                    (
+                        r["obs_id"],
+                        f"低危单次错题超过 {days} 天未复现，自动归档：{r['title']}",
+                        json.dumps(
+                            {
+                                "days_threshold": days,
+                                "severity_grade": r["severity_grade"],
+                                "root_cause_key": r["root_cause_key"],
+                                "updated_at": r["updated_at"],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        now,
+                    ),
+                )
+                archived.append(
+                    {
+                        "obs_id": r["obs_id"],
+                        "root_cause_key": r["root_cause_key"],
+                        "title": r["title"],
+                        "severity_grade": r["severity_grade"],
+                        "updated_at": r["updated_at"],
+                    }
+                )
+        return archived
+
     # ---------------- v3 Dissent & Counter-Evidence Records ----------------
     def add_dissent_record(
         self,
@@ -442,6 +522,25 @@ class RuleRepoMixin:
             )
             row = conn.execute("SELECT * FROM dissent_records WHERE dissent_id = ?", (dissent_id,)).fetchone()
             return dict(row) if row else None
+
+    def bulk_update_dissent_status(self, dissent_ids: list[str], status: str) -> int:
+        if status not in {"open", "merged", "dismissed"}:
+            return 0
+        ids = [did for did in dict.fromkeys(dissent_ids) if did]
+        if not ids:
+            return 0
+        now = self._now_iso()
+        placeholders = ",".join("?" for _ in ids)
+        with self.connect() as conn:
+            cur = conn.execute(
+                f"""
+                UPDATE dissent_records
+                SET status = ?, version = version + 1, updated_at = ?
+                WHERE dissent_id IN ({placeholders})
+                """,
+                (status, now, *ids),
+            )
+            return int(cur.rowcount)
 
     # ---------------- v3 Rule Auto-Dormancy & Growth Metrics ----------------
     def mark_dormant_stale_rules(self, *, days: int = 14) -> list[dict[str, Any]]:

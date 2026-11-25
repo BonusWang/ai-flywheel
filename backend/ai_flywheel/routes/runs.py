@@ -42,9 +42,12 @@ def build_runs_router(rt: FlywheelRuntime) -> APIRouter:
 
     # ---- P00-P07 Workflow Runs ----
     @router.get("/api/site/runs")
-    def site_list_runs() -> dict[str, Any]:
+    def site_list_runs(limit: int = 200) -> dict[str, Any]:
+        safe_limit = max(1, min(int(limit), 500))
+        runs = rt.db.list_workflow_runs(limit=safe_limit)
         return {
-            "runs": [r.model_dump(mode="json") for r in rt.db.list_workflow_runs(limit=30)],
+            "runs": [r.model_dump(mode="json") for r in runs],
+            "total": rt.db.count_workflow_runs(),
             "lock": rt.db.get_workflow_lock(),
         }
 

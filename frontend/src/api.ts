@@ -53,7 +53,7 @@ export const api = {
     }),
 
   listRuns: () =>
-    req<{ runs: WorkflowRunRecord[]; lock: WorkflowLock | null }>('/api/site/runs'),
+    req<{ runs: WorkflowRunRecord[]; total?: number; lock: WorkflowLock | null }>('/api/site/runs'),
   getRunEvents: (runId: string) =>
     req<{ events: AuditEventRecord[] }>(`/api/site/runs/${runId}/events`),
   startRun: (
@@ -121,7 +121,8 @@ export const api = {
       body: JSON.stringify({ status, note }),
     }),
 
-  listObservations: () => req<{ observations: MistakeObservation[] }>('/api/site/observations'),
+  listObservations: () =>
+    req<{ observations: MistakeObservation[]; total?: number }>('/api/site/observations'),
   promoteObservation: (obsId: string) =>
     req<{ observation: MistakeObservation; rule: RuleRecord }>(
       `/api/site/observations/${obsId}/promote`,
@@ -130,6 +131,11 @@ export const api = {
   archiveObservation: (obsId: string) =>
     req<{ observation: MistakeObservation }>(`/api/site/observations/${obsId}/archive`, {
       method: 'POST',
+    }),
+  bulkArchiveObservations: (obsIds: string[]) =>
+    req<{ updated: number }>('/api/site/observations/bulk-archive', {
+      method: 'POST',
+      body: JSON.stringify({ obs_ids: obsIds }),
     }),
 
   createDissent: (body: {
@@ -147,15 +153,23 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ status }),
     }),
+  bulkUpdateDissents: (dissentIds: string[], status: 'open' | 'merged' | 'dismissed') =>
+    req<{ updated: number }>('/api/site/dissents/bulk-status', {
+      method: 'POST',
+      body: JSON.stringify({ dissent_ids: dissentIds, status }),
+    }),
 
   growthMetrics: () => req<GrowthMetricsPayload>('/api/site/growth-metrics'),
   coreCard: () => req<CoreCardPayload>('/api/site/core-card'),
   refreshCoreCard: () =>
     req<CoreCardPayload>('/api/site/core-card/refresh', { method: 'POST' }),
-  listOutcomes: () => req<{ outcomes: OutcomeRecord[] }>('/api/site/outcomes'),
-  listSkills: () => req<{ skills: SkillAssetRecord[]; probed_count: number }>('/api/site/skills'),
+  listOutcomes: () => req<{ outcomes: OutcomeRecord[]; total?: number }>('/api/site/outcomes'),
+  listSkills: () =>
+    req<{ skills: SkillAssetRecord[]; probed_count: number; tracked_count?: number }>(
+      '/api/site/skills'
+    ),
   listDissents: (status?: string) =>
-    req<{ dissents: DissentRecord[] }>(
+    req<{ dissents: DissentRecord[]; total?: number }>(
       status ? `/api/site/dissents?status=${encodeURIComponent(status)}` : '/api/site/dissents'
     ),
   getDream: () => req<DreamStatusPayload>('/api/site/dream'),
@@ -165,11 +179,16 @@ export const api = {
       body: JSON.stringify({ dry_run: dryRun }),
     }),
 
-  listRetro: () => req<{ items: RetroItem[] }>('/api/site/retro'),
+  listRetro: () => req<{ items: RetroItem[]; total?: number }>('/api/site/retro'),
   updateRetroStatus: (retroId: string, status: RetroItem['status']) =>
     req<{ item: RetroItem }>(`/api/site/retro/${retroId}/status`, {
       method: 'POST',
       body: JSON.stringify({ status }),
+    }),
+  bulkUpdateRetro: (retroIds: string[], status: RetroItem['status']) =>
+    req<{ updated: number }>('/api/site/retro/bulk-status', {
+      method: 'POST',
+      body: JSON.stringify({ retro_ids: retroIds, status }),
     }),
 
   listPolicies: () => req<{ policies: Record<string, any> }>('/api/site/policies'),
@@ -189,7 +208,13 @@ export const api = {
     }),
 
   listKnowledge: () =>
-    req<{ sink_type: string; root: string; documents: KnowledgeDocSummary[] }>('/api/site/knowledge'),
+    req<{
+      sink_type: string
+      root: string
+      documents: KnowledgeDocSummary[]
+      total?: number
+      expired_total?: number
+    }>('/api/site/knowledge'),
   feishuCheckStatus: () => req<FeishuCheckStatus>('/api/site/feishu-check'),
   startFeishuCheck: (waitSeconds = 120) =>
     req<{ started: boolean; wait_seconds: number }>('/api/site/feishu-check', {

@@ -268,7 +268,7 @@ class AutomationManager:
 
     def get_snapshot(self) -> dict[str, Any]:
         today = shanghai_today_ymd()
-        runs = self.db.list_workflow_runs(limit=60)
+        runs = self.db.list_workflow_runs(limit=200)
         scheduled_runs = [r for r in runs if r.trigger == "scheduled"]
         today_runs = [r for r in runs if r.batch_date == today]
         today_scheduled = [r for r in scheduled_runs if r.batch_date == today]
@@ -317,7 +317,7 @@ class AutomationManager:
         )
 
         recent_items = []
-        for r in runs[:20]:
+        for r in runs[:100]:
             duration_ms = sum(int(n.duration_ms or 0) for n in r.nodes)
             recent_items.append(
                 {

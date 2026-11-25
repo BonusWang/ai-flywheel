@@ -1,6 +1,7 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import { Plus, Play } from 'lucide-react'
 import { api } from '../api'
+import { ListToolbar, PaginationBar, usePagination } from '../components/ListControls'
 import { ManualSessionModal, type ManualSessionInput } from '../components/workflows/ManualSessionModal'
 import { RunPipelineRow } from '../components/workflows/RunPipelineRow'
 import type { WorkflowDetailTab } from '../components/workflows/RunDetailPanel'
@@ -41,6 +42,9 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
   const [newTitle, setNewTitle] = useState('')
   const [newSummary, setNewSummary] = useState('')
   const [feishuLabel, setFeishuLabel] = useState('未配置')
+  const [runQuery, setRunQuery] = useState('')
+  const [runStatusFilter, setRunStatusFilter] = useState('all')
+  const [runTriggerFilter, setRunTriggerFilter] = useState('all')
 
   useEffect(() => {
     api
@@ -239,6 +243,28 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
     }
   }
 
+  const filteredRuns = useMemo(() => {
+    const q = runQuery.trim().toLowerCase()
+    return [...runs]
+      .filter((r) => (runStatusFilter === 'all' ? true : r.status === runStatusFilter))
+      .filter((r) => (runTriggerFilter === 'all' ? true : r.trigger === runTriggerFilter))
+      .filter((r) =>
+        !q
+          ? true
+          : `${r.batch_date || ''} ${r.run_id} ${r.phase} ${r.trigger} ${r.runner_mode} ${r.error || ''}`
+              .toLowerCase()
+              .includes(q)
+      )
+      .sort((a, b) =>
+        String(b.started_at || b.created_at || '').localeCompare(
+          String(a.started_at || a.created_at || '')
+        )
+      )
+  }, [runs, runQuery, runStatusFilter, runTriggerFilter])
+
+  const runsPager = usePagination(filteredRuns, 10)
+  const latestRunId = runs[0]?.run_id
+
   return (
     <div className="mx-auto max-w-[var(--page-max-wide)] space-y-5">
       {/* Header */}
@@ -310,35 +336,91 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
         />
       )}
 
+      {/* Search, filter & sort bar */}
+      <ListToolbar
+        query={runQuery}
+        onQueryChange={(q) => {
+          setRunQuery(q)
+          runsPager.resetPage()
+        }}
+        placeholder="按日期、批次 ID、执行模式或错误信息搜索…"
+      >
+        <select
+          aria-label="批次状态筛选"
+          value={runStatusFilter}
+          onChange={(e) => {
+            setRunStatusFilter(e.target.value)
+            runsPager.resetPage()
+          }}
+          className="h-8 rounded-[var(--radius-control)] border border-line bg-surface px-2.5 text-[12px] text-ink"
+        >
+          <option value="all">全部状态</option>
+          <option value="AWAITING_APPROVAL">待审批</option>
+          <option value="PASS">已通过</option>
+          <option value="FAILED">已失败</option>
+          <option value="PARTIAL">部分完成</option>
+          <option value="CANCELLED">已取消</option>
+          <option value="RUNNING">运行中</option>
+        </select>
+        <select
+          aria-label="触发方式筛选"
+          value={runTriggerFilter}
+          onChange={(e) => {
+            setRunTriggerFilter(e.target.value)
+            runsPager.resetPage()
+          }}
+          className="h-8 rounded-[var(--radius-control)] border border-line bg-surface px-2.5 text-[12px] text-ink"
+        >
+          <option value="all">全部触发</option>
+          <option value="scheduled">定时调度</option>
+          <option value="api">手动触发</option>
+          <option value="cli">CLI 触发</option>
+        </select>
+      </ListToolbar>
+
       {/* GitLab-CI-style Daily Batch Pipeline Rows */}
-      {runs.length === 0 ? (
+      {filteredRuns.length === 0 ? (
         <div className="card p-12 text-center text-[13.5px] text-ink-4">
-          还没有沉淀批次，点击右上角「立即跑一轮」开始第一次整理。
+          {runs.length === 0
+            ? '还没有沉淀批次，点击右上角「立即跑一轮」开始第一次整理。'
+            : '没有符合当前查询或筛选条件的批次记录。'}
         </div>
       ) : (
-        <div className="card divide-y divide-line overflow-hidden">
-          {runs.map((run, idx) => (
-            <RunPipelineRow
-              key={run.run_id}
-              run={run}
-              isLatest={idx === 0}
-              isExpanded={expandedRunId === run.run_id}
-              batchNo={run.batch_seq || runs.length - idx}
-              selectedNodeId={selectedNodeId}
-              detailTab={detailTab}
-              sessions={sessions}
-              events={runEvents}
-              approvedIndices={approvalSel[run.run_id]?.selected ?? []}
-              busy={busy}
-              feishuLabel={feishuLabel}
-              onToggleRow={toggleRow}
-              onTabChange={setDetailTab}
-              onSelectNode={setSelectedNodeId}
-              onToggleIndex={(idx) => togglePlannedIdx(run.run_id, idx)}
-              onApprove={() => handleApprove(run)}
-              onReject={() => handleReject(run)}
+        <div className="card overflow-hidden">
+          <div className="divide-y divide-line">
+            {runsPager.pageItems.map((run, idx) => (
+              <RunPipelineRow
+                key={run.run_id}
+                run={run}
+                isLatest={run.run_id === latestRunId}
+                isExpanded={expandedRunId === run.run_id}
+                batchNo={run.batch_seq || filteredRuns.length - ((runsPager.page - 1) * runsPager.pageSize + idx)}
+                selectedNodeId={selectedNodeId}
+                detailTab={detailTab}
+                sessions={sessions}
+                events={runEvents}
+                approvedIndices={approvalSel[run.run_id]?.selected ?? []}
+                busy={busy}
+                feishuLabel={feishuLabel}
+                onToggleRow={toggleRow}
+                onTabChange={setDetailTab}
+                onSelectNode={setSelectedNodeId}
+                onToggleIndex={(idx) => togglePlannedIdx(run.run_id, idx)}
+                onApprove={() => handleApprove(run)}
+                onReject={() => handleReject(run)}
+              />
+            ))}
+          </div>
+          <div className="px-4 pb-3">
+            <PaginationBar
+              total={runsPager.total}
+              page={runsPager.page}
+              pageSize={runsPager.pageSize}
+              totalPages={runsPager.totalPages}
+              onPageChange={runsPager.setPage}
+              onPageSizeChange={runsPager.setPageSize}
             />
-          ))}
+          </div>
         </div>
       )}
     </div>

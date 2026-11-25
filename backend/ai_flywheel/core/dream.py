@@ -99,6 +99,7 @@ def preview_dream_consolidation(
     *,
     dormant_days: int = 14,
     stale_skill_days: int = 21,
+    stale_observation_days: int = 30,
     now_utc: datetime | None = None,
 ) -> dict[str, Any]:
     """Read-only preview of Friday Dream Consolidation with zero database writes."""
@@ -107,6 +108,7 @@ def preview_dream_consolidation(
     today = shanghai_today_ymd(now)
     period_key = _shanghai_iso_week_key(now)
     cutoff_dormant = (now - timedelta(days=dormant_days)).isoformat()
+    cutoff_obs = (now - timedelta(days=stale_observation_days)).isoformat()
 
     all_rules = db.list_rules()
     dormant_candidates = [
@@ -116,6 +118,21 @@ def preview_dream_consolidation(
         and int(r.hit_count or 0) == 0
         and r.created_at
         and r.created_at < cutoff_dormant
+    ]
+
+    stale_obs_candidates = [
+        {
+            "obs_id": o["obs_id"],
+            "root_cause_key": o["root_cause_key"],
+            "title": o["title"],
+            "severity_grade": o["severity_grade"],
+            "updated_at": o["updated_at"],
+        }
+        for o in db.list_mistake_observations(status="observing", limit=500)
+        if o.get("severity_grade") in {"yellow_caught", "green_minor"}
+        and int(o.get("occurrence_count") or 0) <= 1
+        and str(o.get("updated_at") or "")
+        and str(o.get("updated_at") or "") < cutoff_obs
     ]
 
     freshness_map = db.get_knowledge_freshness_map()
@@ -140,6 +157,7 @@ def preview_dream_consolidation(
         "dry_run": True,
         "period_key": period_key,
         "auto_dormant_rules": dormant_candidates,
+        "auto_archived_observations": stale_obs_candidates,
         "expired_cards": expired_cards,
         "merge_candidates": merge_candidates,
         "skill_alerts": skill_alerts,
@@ -156,12 +174,14 @@ def run_dream_consolidation(
     run_id: str = "",
     dormant_days: int = 14,
     stale_skill_days: int = 21,
+    stale_observation_days: int = 30,
     now_utc: datetime | None = None,
 ) -> dict[str, Any]:
     """Friday Dream Consolidation: tiered subtraction, expiry sweep, dissent convergence hints, and weekly ledger.
 
     Tier 1 (auto-executed, reversible, audit-logged):
       - Auto-dormant `unverified_active` rules older than `dormant_days` with `hit_count == 0`.
+      - Auto-archive low-severity single-occurrence observing mistakes older than `stale_observation_days`.
       - Mark expired knowledge cards (`valid_until < today`) as `needs_recheck`.
       - Persist weekly `flywheel_metrics_snapshots` row.
 
@@ -183,6 +203,9 @@ def run_dream_consolidation(
     # Tier 1b: Sweep expired knowledge cards into needs_recheck
     expired_cards = db.mark_expired_knowledge_cards(today)
 
+    # Tier 1c: Auto-archive stale low-severity single-occurrence observations
+    archived_observations = db.archive_stale_low_severity_observations(days=stale_observation_days)
+
     # Tier 2a: Detect overlapping active rules
     all_rules = db.list_rules()
     merge_candidates = find_overlapping_rule_pairs(all_rules, threshold=0.7)
@@ -193,7 +216,7 @@ def run_dream_consolidation(
     # Tier 2c: Open dissents needing convergence
     open_dissents = db.list_dissent_records(status="open", limit=30)
 
-    # Tier 1c: Persist weekly growth ledger snapshot
+    # Tier 1d: Persist weekly growth ledger snapshot
     live = db.compute_live_growth_metrics(today)
     snapshot = db.save_metrics_snapshot(
         {
@@ -221,11 +244,13 @@ def run_dream_consolidation(
         actor="dream",
         summary=(
             f"每周蒸馏完成（{period_key}）：自动休眠 {len(dormant_rules)} 条零命中试运行规则，"
+            f"归档 {len(archived_observations)} 条超期低危单次错题，"
             f"标记 {len(expired_cards)} 篇过期经验卡，生成 {len(proposals)} 项精简建议"
         ),
         payload={
             "period_key": period_key,
             "dormant_rules": [d["rule_id"] for d in dormant_rules],
+            "archived_observations": [o["obs_id"] for o in archived_observations],
             "expired_cards": [c["doc_path"] for c in expired_cards[:10]],
             "merge_candidates": merge_candidates[:5],
             "skill_alerts": skill_alerts[:5],
@@ -238,6 +263,7 @@ def run_dream_consolidation(
         "dry_run": False,
         "period_key": period_key,
         "auto_dormant_rules": dormant_rules,
+        "auto_archived_observations": archived_observations,
         "expired_cards": expired_cards,
         "merge_candidates": merge_candidates,
         "skill_alerts": skill_alerts,

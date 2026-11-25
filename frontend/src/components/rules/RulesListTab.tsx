@@ -1,6 +1,7 @@
-import React, { useState } from 'react'
+import React, { useMemo, useState } from 'react'
 import { AlertTriangle, CheckCircle2, RefreshCcw } from 'lucide-react'
 import { api } from '../../api'
+import { ListToolbar, PaginationBar, usePagination } from '../ListControls'
 import { StatusBadge } from '../StatusBadge'
 import type { DissentRecord, RuleRecord } from '../../types'
 
@@ -27,6 +28,22 @@ export const RulesListTab: React.FC<{
   const [dissentRuleId, setDissentRuleId] = useState<string | null>(null)
   const [dissentClaim, setDissentClaim] = useState('')
   const [dissentScope, setDissentScope] = useState('')
+  const [ruleQuery, setRuleQuery] = useState('')
+
+  const visibleRules = useMemo(() => {
+    const q = ruleQuery.trim().toLowerCase()
+    return [...rules]
+      .filter((r) =>
+        !q
+          ? true
+          : `${r.title} ${r.domain} ${r.triggers.join(' ')} ${r.checklist.join(' ')}`
+              .toLowerCase()
+              .includes(q)
+      )
+      .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
+  }, [rules, ruleQuery])
+
+  const rulesPager = usePagination(visibleRules, 10)
 
   const handleTransition = async (ruleId: string, status: RuleRecord['status']) => {
     await api.transitionRule(ruleId, status, '人工调整规则状态')
@@ -137,8 +154,22 @@ export const RulesListTab: React.FC<{
         </form>
       )}
 
+      <ListToolbar
+        query={ruleQuery}
+        onQueryChange={(q) => {
+          setRuleQuery(q)
+          rulesPager.resetPage()
+        }}
+        placeholder="搜索规则标题、领域、触发词或检查项…"
+      />
+
       <section className="space-y-3">
-        {rules.map((rule) => (
+        {visibleRules.length === 0 ? (
+          <div className="card p-10 text-center text-[13px] text-ink-4">
+            没有符合条件的避坑规则。
+          </div>
+        ) : (
+          rulesPager.pageItems.map((rule) => (
           <article key={rule.rule_id} className="card p-5">
             <div className="flex flex-wrap items-start justify-between gap-2">
               <div>
@@ -328,8 +359,18 @@ export const RulesListTab: React.FC<{
               </div>
             </div>
           </article>
-        ))}
+          ))
+        )}
       </section>
+
+      <PaginationBar
+        total={rulesPager.total}
+        page={rulesPager.page}
+        pageSize={rulesPager.pageSize}
+        totalPages={rulesPager.totalPages}
+        onPageChange={rulesPager.setPage}
+        onPageSizeChange={rulesPager.setPageSize}
+      />
     </>
   )
 }

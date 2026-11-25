@@ -1,8 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowRight, ArrowUpRight, ChevronDown, ChevronRight, Terminal, Wrench } from 'lucide-react'
+import { ArrowRight, Wrench } from 'lucide-react'
 import type { PageKey } from '../App'
 import { api } from '../api'
-import { CodeBlock, CopyButton } from '../components/CodeBlock'
+import { CopyButton } from '../components/CodeBlock'
 import { FlywheelRiver } from '../components/FlywheelRiver'
 import { labelOf, RULE_STATUS_LABELS } from '../lib/labels'
 import type { AboutPayload, RiverSource, RuleRecord } from '../types'
@@ -83,7 +83,6 @@ function LatestRule({
 export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
   const [data, setData] = useState<AboutPayload | null>(null)
   const [focus, setFocus] = useState<number | null>(null)
-  const [showRawLlms, setShowRawLlms] = useState(false)
   const [at, setAt] = useState(0)
   const shown = useRef(0)
 
@@ -105,10 +104,10 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
   }, [rules.length])
 
   if (!data) {
-    return <div className="py-20 text-center text-[13px] text-ink-4">正在加载关于页与 llms.txt 实时清单...</div>
+    return <div className="py-20 text-center text-[13px] text-ink-4">正在加载关于页与接口清单...</div>
   }
 
-  const { site, metrics, endpoints, mcp_tools, llms_txt } = data
+  const { site, metrics, endpoints, mcp_tools } = data
   const brand = site.brand
   const verifiedRules = metrics.rules_by_status.verified_active || 0
   const unverifiedRules = metrics.rules_by_status.unverified_active || 0
@@ -168,8 +167,7 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
             <span className="num font-semibold text-ink">{metrics.preflight_activations}</span>{' '}
             次预检激活与{' '}
             <span className="num font-semibold text-ink">{activeRules}</span>{' '}
-            条先例规则收拢成一套实时可验证的协作飞轮——与 OpenViking / Mem0
-            等上下文数据库正交互补，而不是又一个记忆黑盒。
+            条先例规则收拢成一套实时可验证的协作飞轮——以可审计、可回溯的工程闭环守住交付质量，而不是黑盒聊天记忆库。
           </p>
         </div>
         <div className="flex flex-wrap gap-3 lg:pb-2">
@@ -243,35 +241,21 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
         </ol>
       </section>
 
-      {/* 3. /llms.txt Protocol & MCP Capabilities (2-Column Editorial Layout) */}
+      {/* 3. MCP Protocol & Capabilities (2-Column Editorial Layout) */}
       <section
-        aria-labelledby="llms-protocol"
+        aria-labelledby="mcp-protocol"
         className="mt-16 grid gap-10 border-t border-line pt-12 xl:mt-20 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.08fr)] lg:gap-14"
       >
         <div className="min-w-0">
-          <Kicker>LLMS.TXT · 面向 AI 的实时协议</Kicker>
+          <Kicker>MCP PROTOCOL · 标准接入协议</Kicker>
           <h2
-            id="llms-protocol"
+            id="mcp-protocol"
             className="mt-4 text-[24px] font-black leading-[1.3] tracking-[-0.02em] text-ink xl:text-[30px]"
           >
-            给 Agent 读的实时说明书
+            标准 MCP 接入端点
           </h2>
           <p className="mt-3.5 text-[14.5px] leading-[1.85] text-ink-3">
-            本页与{' '}
-            <a
-              href="/llms.txt"
-              target="_blank"
-              rel="noreferrer"
-              className="mono inline-flex items-center gap-0.5 text-accent hover:underline"
-            >
-              /llms.txt
-              <ArrowUpRight className="w-3.5 h-3.5" />
-            </a>{' '}
-            共享同一后端发布层：AI 客户端、自动化脚本或外部 Agent 只需读取{' '}
-            <code className="mono rounded-[var(--radius-mark)] bg-bg-sunk px-1.5 py-0.5 text-[12px] text-ink-2">
-              {endpoints.llms_txt_url}
-            </code>
-            ，即可获得当前 MCP 接入端点、可用工具与实时健康指标。
+            支持 Claude Code、Codex、Claude Desktop、Antigravity 等任意 MCP 客户端旁路接入，通过 Streamable HTTP 或 Stdio CLI 直接调用执行期门禁与后台沉淀能力。
           </p>
 
           {/* MCP Endpoints */}
@@ -298,41 +282,6 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
               <CopyButton text={endpoints.mcp_stdio_cmd} className="shrink-0" />
             </div>
           </div>
-
-          {/* Collapsible Live /llms.txt Plaintext Preview */}
-          <div className="mt-6 rounded-[var(--radius-card)] border border-line bg-surface">
-            <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3">
-              <button
-                type="button"
-                onClick={() => setShowRawLlms((v) => !v)}
-                className="inline-flex items-center gap-1.5 text-[12.5px] font-semibold text-ink hover:text-accent"
-              >
-                {showRawLlms ? (
-                  <ChevronDown className="w-4 h-4 text-accent" />
-                ) : (
-                  <ChevronRight className="w-4 h-4 text-ink-4" />
-                )}
-                <Terminal className="w-3.5 h-3.5 text-accent" />
-                <span>{showRawLlms ? '收起 /llms.txt 实时原文' : '展开查看 /llms.txt 实时原文'}</span>
-              </button>
-              <div className="flex items-center gap-2">
-                <CopyButton text={llms_txt.trimEnd()} label="复制原文" />
-                <a
-                  href="/llms.txt"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex items-center gap-0.5 text-[12px] text-accent hover:underline"
-                >
-                  新标签页打开 <ArrowUpRight className="w-3.5 h-3.5" />
-                </a>
-              </div>
-            </div>
-            {showRawLlms && (
-              <div className="px-3 pb-2 border-t border-line-soft">
-                <CodeBlock code={llms_txt.trimEnd()} title="GET /llms.txt · text/plain" lang="markdown" />
-              </div>
-            )}
-          </div>
         </div>
 
         {/* Right Column: Available MCP Tools */}
@@ -351,7 +300,7 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
             可用 MCP 工具清单
           </h3>
           <p className="mt-2 text-[13.5px] leading-[1.75] text-ink-3">
-            与 <code className="mono text-[12px]">/llms.txt</code> 声明的接口清单单源同步，覆盖「登记 → 启程预检 → 异常上报 → 证据回执 → 会话入队 → 全局态势」完整闭环。
+            覆盖「登记 → 启程预检 → 异常上报 → 证据回执 → 会话入队 → 全局态势」完整执行闭环。
           </p>
 
           <ul className="mt-5 divide-y divide-line border-y border-line">
@@ -391,11 +340,10 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
         </div>
       </section>
 
-      {/* 4. Boundary Notice Well & Minimal Footer (matching AIHOT) */}
+      {/* 4. Boundary Notice Well & Minimal Footer */}
       <p className="mt-14 well rounded-[var(--radius-card)] px-5 py-4 text-[13px] leading-[1.85] text-ink-3">
         <strong className="font-semibold text-ink">{brand.name}</strong>{' '}
-        是面向多 AI 编码工具的本地优先「治理与进化控制面」：以执行纪律与实证门禁、抗熵增进化引擎和受控审批流水线守住交付质量与资产新鲜度，与 OpenViking / Mem0
-        等上下文数据库、记忆引擎正交互补。工程上采用「外层接入与模型路由 × 公共动态飞轮引擎 × 私有个人配置层 × 长期知识库」3+1 分层解耦架构：本引擎只承载通用方法论、先例路由、回执验真与 P00–P07 审批工作流，私有偏好与个人知识库通过外部目录挂载并默认开启审批写门禁；公开导出接口（
+        是面向多 AI 编码工具的本地优先「治理与进化控制面」：以执行纪律与实证门禁、抗熵增进化引擎和受控审批流水线守住交付质量与资产新鲜度。工程上采用「外层接入与模型路由 × 公共动态飞轮引擎 × 私有个人配置层 × 长期知识库」3+1 分层解耦架构：本引擎只承载通用方法论、先例路由、回执验真与 P00–P07 审批工作流，私有偏好与个人知识库通过外部目录挂载并默认开启审批写门禁；公开导出接口（
         <a
           href="/api/v1/overview"
           target="_blank"
@@ -403,15 +351,6 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
           className="mono text-accent hover:underline"
         >
           /api/v1/overview
-        </a>
-        、
-        <a
-          href="/llms.txt"
-          target="_blank"
-          rel="noreferrer"
-          className="mono text-accent hover:underline"
-        >
-          /llms.txt
         </a>
         ）自动脱敏本地路径。
       </p>

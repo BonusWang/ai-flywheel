@@ -58,6 +58,8 @@ export interface DissentRecord {
   dissent_id: string
   target_type: 'rule' | 'knowledge_doc' | 'skill'
   target_id: string
+  target_title?: string
+  target_status?: string
   counter_claim: string
   condition_scope: string
   evidence_pointer: string
