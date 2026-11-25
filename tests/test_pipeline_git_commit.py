@@ -52,6 +52,7 @@ def _init_repo(repo: Path) -> None:
     _git(repo, "init", "-q", ".")
     _git(repo, "config", "user.name", "Flywheel Test")
     _git(repo, "config", "user.email", "flywheel-test@example.com")
+    _git(repo, "config", "core.quotePath", "false")
 
 
 def _commit_count(repo: Path) -> int:
@@ -296,6 +297,137 @@ def test_auto_git_commit_commits_only_the_p04_written_files(
     assert "p04_git_commit" in events
     assert events["p04_git_commit"]["payload"]["status"] == "committed"
     assert events["p04_git_commit"]["payload"]["commits"][0]["commit"]
+
+
+@pytest.mark.skipif(GIT is None, reason="git is not installed")
+def test_practice_index_is_part_of_the_p04_git_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    shutil.copytree(REPO_ROOT / "profile", repo / "profile")
+    (repo / "skills").mkdir()
+    wiki = repo / "wiki"
+    project = wiki / "wiki-知识库" / "projects-项目" / "alpha" / "实战笔记"
+    project.mkdir(parents=True)
+    (wiki / ".wiki-schema.md").write_text(
+        """---
+title: Test Wiki Schema
+description: Minimal schema for P04 index commits
+type: protocol
+created: 2026-11-23
+updated: 2026-11-23
+status: active
+core_contract:
+  version: "2.1"
+  core_files: [.wiki-schema.md]
+  required_fields: [title, description, type, created, updated]
+partition_contract:
+  version: "1.0"
+  partitions:
+    projects:
+      root: wiki-知识库/projects-项目
+content_contract:
+  version: "1.4.1"
+  page_types:
+    project-practice-index:
+      partition: projects
+      required_fields: [title, description, type, project_id, created, updated, status]
+      path_pattern: "^[^/]+/实战笔记/笔记索引\\\\.md$"
+      allowed_status: [active]
+    project-practice-note:
+      partition: projects
+      required_fields: [title, description, type, project_id, record_id, event_date, load_policy, default_load, created, updated, status]
+      path_pattern: "^[^/]+/实战笔记/[^/]+\\\\.md$"
+      allowed_status: [active]
+---
+""",
+        encoding="utf-8",
+    )
+    (project / "笔记索引.md").write_text(
+        """---
+title: alpha 索引
+description: alpha 实战经验卡索引
+type: project-practice-index
+project_id: alpha
+created: 2026-11-23
+updated: 2026-11-23
+status: active
+---
+
+# alpha 索引
+""",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "--", "profile", "skills", "wiki")
+    _git(repo, "commit", "-q", "-m", "init")
+
+    cfg = FlywheelConfig(base_dir=repo)
+    cfg.capabilities.skills_dirs = [str(repo / "skills")]
+    cfg.workflow.approval_mode = "auto"
+    cfg.safety_valves.auto_approve_writes = True
+    cfg.knowledge_sink.type = "local_markdown_wiki"
+    cfg.knowledge_sink.root = str(wiki)
+    cfg.knowledge_sink.allowed_write_prefixes = ["wiki-知识库/"]
+    cfg.knowledge_sink.wiki_gate_enabled = True
+    cfg.knowledge_sink.wiki_gate_require_scripts = False
+    cfg.knowledge_sink.auto_git_commit = True
+    cfg.runner.mode = "api"
+    cfg.runner.api.base_url = "http://127.0.0.1:9999/v1"
+    cfg.runner.api.model = "mock-model"
+    rt = FlywheelRuntime(cfg)
+    rt.register_session(
+        RegisterSessionRequest(
+            client="codex",
+            session_id="alpha-1",
+            title="索引提交边界",
+            project="alpha",
+            workspace=str(repo / "alpha"),
+            summary="项目索引必须随主卡一起进入 Git 回执",
+            content="用户：提交卡片。助手：同时登记项目索引。",
+        )
+    )
+    base_model = _FakeModel()
+
+    class _PracticePlan:
+        def __call__(self, prompt: str, system_prompt: str) -> str:
+            raw = base_model(prompt, system_prompt)
+            if prompt.startswith("You are the P02 Review Worker"):
+                return raw
+            payload = json.loads(raw)
+            payload["planned_writes"][0]["wiki_route"] = {
+                "page_type": "project-practice-note",
+                "project": "alpha",
+                "reason": "会话工作区属于 alpha",
+            }
+            return json.dumps(payload, ensure_ascii=False)
+
+    monkeypatch.setattr(OpenAICompatibleRunner, "_call_chat_completion", _PracticePlan())
+    run = rt.orchestrator.start_run(
+        trigger="test",
+        phase="daily",
+        session_keys=["codex:alpha-1"],
+        auto_approve_override=True,
+    )
+
+    assert run.status == RunStatus.PASS, run.error
+    item = run.planned_writes[0]
+    index_rel = item.side_effects[0]["target_path"]
+    expected = sorted([item.relative_path, index_rel])
+    expected_in_outer_repo = [f"wiki/{path}" for path in expected]
+    assert _commit_count(repo) == 2
+    assert _head_files(repo) == expected_in_outer_repo
+    payload = _node(run, "P04_WRITE_VERIFY").payload or {}
+    assert payload["written_practice_index_paths"] == [index_rel]
+    assert payload["write_receipts"][0]["practice_index"]["status"] == "update"
+    commit = payload["git_commit"]["commits"][0]
+    assert sorted(commit["files"]) == expected_in_outer_repo
+    events = _audit_events(rt, run.run_id)
+    assert (
+        sorted(events["p04_git_commit"]["payload"]["commits"][0]["files"])
+        == expected_in_outer_repo
+    )
 
 
 # ---------------------------------------------------------------- 3b. approval source

@@ -132,7 +132,7 @@ def run_topic_lint(result: WikiGateResult, relative_path: str, *, sink: Knowledg
 
 def run_postflight(
     result: WikiGateResult,
-    relative_path: str,
+    relative_path: str | list[str],
     *,
     sink: KnowledgeSinkConfig,
     root: Path,
@@ -154,13 +154,14 @@ def run_postflight(
         "d2-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + ".json"
     )
     python = sink.wiki_python.strip() or sys.executable
+    write_set = _write_set_arg(relative_path)
     command = [
         resolve_bash_executable(sink.wiki_bash),
         script,
         "--wiki-root",
         str(root),
         "--write-set",
-        relative_path,
+        write_set,
         "--today",
         shanghai_today_ymd(),
         "--json-out",
@@ -211,7 +212,7 @@ def run_postflight(
 
 
 def resync_after_rollback(
-    relative_path: str,
+    relative_path: str | list[str],
     *,
     sink: KnowledgeSinkConfig,
     root: Path,
@@ -222,13 +223,14 @@ def resync_after_rollback(
     if not script:
         return {"status": "skipped", "reason": "d2_script_not_configured"}
     python = sink.wiki_python.strip() or sys.executable
+    write_set = _write_set_arg(relative_path)
     command = [
         resolve_bash_executable(sink.wiki_bash),
         script,
         "--wiki-root",
         str(root),
         "--write-set",
-        relative_path,
+        write_set,
         "--today",
         shanghai_today_ymd(),
         "--skip-validator",
@@ -269,3 +271,12 @@ def _last_json_line(stdout: str) -> dict[str, Any]:
         if isinstance(data, dict):
             return data
     return {}
+
+
+def _write_set_arg(relative_path: str | list[str]) -> str:
+    values = [relative_path] if isinstance(relative_path, str) else relative_path
+    return ",".join(
+        str(path).replace("\\", "/").strip()
+        for path in values
+        if str(path).strip()
+    )

@@ -184,6 +184,19 @@ def _item_block(index: int, w: dict[str, Any], *, sensitive: bool, limits: dict[
         _detail("摘要", w.get("summary") or "", limits["summary"]),
         _detail("理由", w.get("approval_reason") or "", limits["reason"]),
     ]
+    for effect in (w.get("side_effects") or [])[:3]:
+        if not isinstance(effect, dict):
+            continue
+        status = (
+            "已登记，无新增"
+            if effect.get("status") == "already_present"
+            else "随本次写入同步"
+        )
+        target = str(effect.get("target_path") or "")
+        entry = str(effect.get("entry_preview") or "")
+        details.append(_detail(f"索引副作用 · {status}", target, limits["path"]))
+        if entry:
+            details.append(_detail("索引新增条目", entry, limits["excerpt"]))
     if sensitive:
         excerpt = str(w.get("content_preview") or "")
         details.append(_detail("摘录（≠全文，全文在控制台）", excerpt[: limits["excerpt"] * 4], limits["excerpt"]))

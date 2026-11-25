@@ -258,6 +258,14 @@ export interface PlannedWrite {
   skill_route?: Record<string, unknown> | null
   /** The planner's routing declaration for a knowledge doc (page_type, project, reason). */
   wiki_route?: Record<string, unknown> | null
+  /** Additional paths committed under the same approval item, such as a project practice index. */
+  side_effects?: Array<{
+    kind: string
+    target_path: string
+    action: string
+    status: string
+    entry_preview: string
+  }>
   requires_approval?: boolean
   approval_reason?: string
   source_session_keys: string[]

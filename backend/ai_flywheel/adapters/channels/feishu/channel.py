@@ -130,6 +130,7 @@ class FeishuChannel:
                 # knowledge_doc / flywheel_rule that needs approval would look routine
                 # and "仅同意常规项" would approve it.
                 "requires_approval": bool(w.requires_approval),
+                "side_effects": [dict(effect) for effect in w.side_effects],
             }
             for w in run.planned_writes
         ]
@@ -219,7 +220,13 @@ class FeishuChannel:
             return
         # Text fallbacks carry the same untrusted titles / summaries / reasons as cards: sanitize them too.
         items = "\n".join(
-            f"- [{KIND_LABEL.get(w.target_kind, w.target_kind)}] {sanitize(w.title, limit=80)}：{sanitize(w.summary, limit=120)}"
+            f"- [{KIND_LABEL.get(w.target_kind, w.target_kind)}] "
+            f"{sanitize(w.title, limit=80)}：{sanitize(w.summary, limit=120)}"
+            + "".join(
+                f"\n  索引同步：{sanitize(str(effect.get('target_path') or ''), limit=160)}"
+                for effect in w.side_effects[:2]
+                if isinstance(effect, dict)
+            )
             for w in run.planned_writes[:6]
         )
         reason_line = self._format_text_reasons(reasons)

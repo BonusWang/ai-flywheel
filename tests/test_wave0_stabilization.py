@@ -60,6 +60,11 @@ content_contract:
   version: "1.4.1"
   legacy_type_aliases: {}
   page_types:
+    project-practice-index:
+      partition: projects
+      required_fields: [title, description, type, project_id, created, updated, status]
+      path_pattern: "^[^/]+/实战笔记/笔记索引\\\\.md$"
+      allowed_status: [active]
     project-practice-note:
       partition: projects
       required_fields: [title, description, type, project_id, record_id, event_date, load_policy, default_load, created, updated, status]
@@ -136,7 +141,8 @@ def _add_project(wiki_root: Path, dir_name: str, project_id: str) -> None:
     practice = wiki_root / "wiki-知识库" / "projects-项目" / dir_name / "实战笔记"
     practice.mkdir(parents=True)
     (practice / "笔记索引.md").write_text(
-        f"---\ntitle: {dir_name} 索引\ntype: project-practice-index\nproject_id: {project_id}\n"
+        f"---\ntitle: {dir_name} 索引\ndescription: {dir_name} 实战经验卡索引\n"
+        f"type: project-practice-index\nproject_id: {project_id}\n"
         "created: 2026-11-23\nupdated: 2026-11-23\nstatus: active\n---\n\n"
         f"# {dir_name} 索引\n",
         encoding="utf-8",

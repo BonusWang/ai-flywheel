@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -8,10 +10,14 @@ import yaml
 
 from ai_flywheel.adapters.wiki import (
     FORBIDDEN_PATH_SEGMENTS,
+    PracticeIndexError,
+    PracticeIndexRegistration,
     SCHEMA_FILE_NAME,
     WikiGate,
     WikiGateError,
     WikiSchemaLoader,
+    approved_registration_matches,
+    practice_index_write_lock,
     split_frontmatter,
 )
 from ai_flywheel.config import FlywheelConfig
@@ -308,12 +314,23 @@ class KnowledgeSinkAdapter:
     # ---------------- write path ----------------
 
     def write_document_verified(
-        self, relative_path: str, content: str, action: str = "create", *, sync_fts: bool = True
+        self,
+        relative_path: str,
+        content: str,
+        action: str = "create",
+        *,
+        sync_fts: bool = True,
+        sync_practice_index: bool = False,
+        approved_side_effects: list[dict[str, object]] | None = None,
     ) -> dict[str, Any]:
         """Controlled atomic write with privacy/secrets gate, pre-write schema gate, and post-write verification.
 
         ``sync_fts=False`` skips the search-index rebuild: a batch that writes several
         documents rebuilds the index once at the end instead of once per document.
+
+        ``sync_practice_index`` is enabled by P04 for schema-governed project practice
+        cards. The card and its project notes-index entry are committed as one
+        compensating transaction, with both paths included in postflight.
         """
         target = self._safe_resolve(relative_path)
         rel = relative_path.replace("\\", "/").lstrip("/")
@@ -322,55 +339,195 @@ class KnowledgeSinkAdapter:
         # LF-only documents: a Windows write must never introduce CRLF into an
         # LF-governed Wiki, so the line endings are normalised before the gate sees it.
         content = content.replace("\r\n", "\n")
+
+        registration = (
+            self._plan_practice_index_registration(rel, content)
+            if sync_practice_index
+            else None
+        )
+        self._require_approved_practice_index(registration, approved_side_effects)
+        if registration is not None:
+            index_target = self._safe_resolve(registration.target_relative_path)
+            with practice_index_write_lock(index_target):
+                # Re-read under the lock: another process may have changed the index
+                # between the approved preview and this write.
+                registration = self._plan_practice_index_registration(rel, content)
+                self._require_approved_practice_index(registration, approved_side_effects)
+                return self._write_document_transaction(
+                    target=target,
+                    rel=rel,
+                    content=content,
+                    action=action,
+                    sync_fts=sync_fts,
+                    registration=registration,
+                )
+        return self._write_document_transaction(
+            target=target,
+            rel=rel,
+            content=content,
+            action=action,
+            sync_fts=sync_fts,
+            registration=registration,
+        )
+
+    def _write_document_transaction(
+        self,
+        *,
+        target: Path,
+        rel: str,
+        content: str,
+        action: str,
+        sync_fts: bool,
+        registration: PracticeIndexRegistration | None,
+    ) -> dict[str, Any]:
         gate_result = self.wiki_gate.validate_document(rel, content)
         if gate_result.applicable and not gate_result.ok:
-            self.wiki_gate.write_artifact(gate_result, rel, {"stage": "pre_write"})
+            self.wiki_gate.write_artifact(
+                gate_result,
+                rel,
+                {
+                    "stage": "pre_write",
+                    "practice_index": registration.side_effect() if registration else None,
+                },
+            )
             raise WikiGateError(_format_gate_failure(rel, gate_result))
 
         preimage_bytes = target.read_bytes() if target.exists() else None
-        preimage_sha = hashlib.sha256(preimage_bytes).hexdigest() if preimage_bytes is not None else "ABSENT"
+        preimage_sha = (
+            hashlib.sha256(preimage_bytes).hexdigest()
+            if preimage_bytes is not None
+            else "ABSENT"
+        )
+        if action == "update" and _is_unchanged(preimage_bytes, content):
+            raise KnowledgeWriteError(f"Update action produced no content change on {rel}")
 
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(target.suffix + ".tmp")
-        tmp.write_text(content, encoding="utf-8", newline="\n")
-        tmp.replace(target)
+        index_target: Path | None = None
+        index_preimage: bytes | None = None
+        index_written = False
+        if registration is not None and registration.status == "update":
+            index_target = self._safe_resolve(registration.target_relative_path)
+            index_gate = self.wiki_gate.validate_document(
+                registration.target_relative_path,
+                registration.new_content,
+            )
+            if index_gate.applicable and not index_gate.ok:
+                self.wiki_gate.write_artifact(
+                    index_gate,
+                    registration.target_relative_path,
+                    {
+                        "stage": "pre_write",
+                        "practice_index": registration.side_effect(),
+                        "card_relative_path": rel,
+                    },
+                )
+                raise WikiGateError(
+                    _format_gate_failure(registration.target_relative_path, index_gate)
+                )
+            index_preimage = index_target.read_bytes()
+            try:
+                _atomic_write_text(index_target, registration.new_content)
+                index_written = True
+            except OSError as exc:
+                raise KnowledgeWriteError(
+                    f"Practice index write failed for "
+                    f"'{registration.target_relative_path}': {exc}"
+                ) from exc
 
-        # Read-back verification: compare the bytes as written, not as translated.
-        with target.open("r", encoding="utf-8", newline="") as handle:
-            readback = handle.read()
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(target, content)
+        except Exception:
+            if index_written and index_target is not None:
+                self._rollback(index_target, index_preimage)
+            raise
+
+        readback = _read_text_exact(target)
         postimage_sha = file_sha256(target)
         if readback != content:
-            raise KnowledgeWriteError(f"Read-back content mismatch on {relative_path}")
-        if action == "update" and _is_unchanged(preimage_bytes, content):
-            raise KnowledgeWriteError(f"Update action produced no content change on {relative_path}")
+            rollback = self._rollback(target, preimage_bytes)
+            if index_written and index_target is not None:
+                rollback["practice_index"] = self._rollback(index_target, index_preimage)
+            raise KnowledgeWriteError(f"Read-back content mismatch on {rel}: {rollback}")
+        if (
+            index_target is not None
+            and registration is not None
+            and _read_text_exact(index_target) != registration.new_content
+        ):
+            self._rollback(target, preimage_bytes)
+            self._rollback(index_target, index_preimage)
+            raise KnowledgeWriteError(
+                f"Read-back mismatch on practice index "
+                f"'{registration.target_relative_path}'"
+            )
 
+        postflight_paths = [rel]
+        if registration is not None:
+            postflight_paths.append(registration.target_relative_path)
         rollback_info: dict[str, Any] | None = None
         if gate_result.applicable:
-            self.wiki_gate.run_topic_lint(gate_result, rel)
-            if gate_result.ok:
-                self.wiki_gate.run_postflight(gate_result, rel)
+            try:
+                self.wiki_gate.run_topic_lint(gate_result, rel)
+                if gate_result.ok:
+                    self.wiki_gate.run_postflight(gate_result, postflight_paths)
+            except Exception as exc:
+                gate_result.error(
+                    "D2_FAILED",
+                    f"post-write verification raised {type(exc).__name__}: {exc}",
+                )
             if not gate_result.ok:
                 rollback_info = self._rollback(target, preimage_bytes)
-                rollback_info["resync"] = self.wiki_gate.resync_after_rollback(rel)
+                if index_written and index_target is not None:
+                    rollback_info["practice_index"] = self._rollback(
+                        index_target,
+                        index_preimage,
+                    )
+                try:
+                    rollback_info["resync"] = self.wiki_gate.resync_after_rollback(
+                        postflight_paths
+                    )
+                except Exception as exc:
+                    rollback_info["resync"] = {
+                        "status": "error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
                 if sync_fts:
-                    self.sync_fts_index()
+                    try:
+                        self.sync_fts_index()
+                    except Exception as exc:
+                        rollback_info["fts_resync"] = {
+                            "status": "error",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
                 self.wiki_gate.write_artifact(
                     gate_result,
                     rel,
-                    {"stage": "post_write", "rollback": rollback_info},
+                    {
+                        "stage": "post_write",
+                        "rollback": rollback_info,
+                        "practice_index": registration.receipt() if registration else None,
+                    },
                 )
                 raise WikiGateError(_format_gate_failure(rel, gate_result, rollback_info))
-            self.wiki_gate.write_artifact(gate_result, rel, {"stage": "post_write"})
+            self.wiki_gate.write_artifact(
+                gate_result,
+                rel,
+                {
+                    "stage": "post_write",
+                    "practice_index": registration.receipt() if registration else None,
+                },
+            )
 
         if sync_fts:
             self.sync_fts_index()
-        # Record initial freshness governance metadata for the written card
         fm_parsed = self._parse_page_lenient(content).get("frontmatter") or {}
         tier = str(fm_parsed.get("freshness_tier") or "evolving").strip().lower()
         if tier not in {"volatile", "evolving", "evergreen"}:
             tier = "evolving"
         last_verified = str(fm_parsed.get("last_verified") or shanghai_today_ymd()).strip()
-        valid_until = str(fm_parsed.get("valid_until") or compute_valid_until(tier, last_verified)).strip()
+        valid_until = str(
+            fm_parsed.get("valid_until")
+            or compute_valid_until(tier, last_verified)
+        ).strip()
         self.db.upsert_knowledge_freshness(
             rel,
             freshness_tier=tier,
@@ -387,7 +544,32 @@ class KnowledgeSinkAdapter:
             "valid_until": valid_until,
             "verified": True,
             "wiki_gate": gate_result.to_dict() if gate_result.applicable else None,
+            "practice_index": registration.receipt() if registration else None,
         }
+
+    def _plan_practice_index_registration(
+        self,
+        relative_path: str,
+        content: str,
+    ) -> PracticeIndexRegistration | None:
+        try:
+            return self.wiki_gate.plan_practice_index_registration(relative_path, content)
+        except PracticeIndexError as exc:
+            raise KnowledgeWriteError(str(exc)) from None
+
+    @staticmethod
+    def _require_approved_practice_index(
+        registration: PracticeIndexRegistration | None,
+        approved_side_effects: list[dict[str, object]] | None,
+    ) -> None:
+        if registration is not None and not approved_registration_matches(
+            registration,
+            approved_side_effects,
+        ):
+            raise KnowledgeWriteError(
+                "Practice index registration is not in the approved write scope "
+                f"for '{registration.target_relative_path}'. Re-plan and approve it."
+            )
 
     @staticmethod
     def _rollback(target: Path, preimage_bytes: bytes | None) -> dict[str, Any]:
@@ -396,9 +578,18 @@ class KnowledgeSinkAdapter:
                 target.unlink(missing_ok=True)
                 state = "deleted_new_file"
             else:
-                tmp = target.with_suffix(target.suffix + ".rollback.tmp")
-                tmp.write_bytes(preimage_bytes)
-                tmp.replace(target)
+                descriptor, temp_name = tempfile.mkstemp(
+                    prefix=f".{target.name}.rollback.",
+                    suffix=".tmp",
+                    dir=target.parent,
+                )
+                temp_path = Path(temp_name)
+                try:
+                    with os.fdopen(descriptor, "wb") as handle:
+                        handle.write(preimage_bytes)
+                    temp_path.replace(target)
+                finally:
+                    temp_path.unlink(missing_ok=True)
                 state = "restored_preimage"
         except OSError as exc:
             return {"state": "rollback_failed", "error": str(exc)}
@@ -443,6 +634,27 @@ def _is_unchanged(preimage_bytes: bytes | None, content: str) -> bool:
     except UnicodeDecodeError:
         return False
     return previous.replace("\r\n", "\n") == content
+
+
+def _atomic_write_text(target: Path, content: str) -> None:
+    """Write UTF-8/LF through a unique sibling temp file and atomically replace."""
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=target.parent,
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+        temp_path.replace(target)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _read_text_exact(target: Path) -> str:
+    with target.open("r", encoding="utf-8", newline="") as handle:
+        return handle.read()
 
 
 def _format_gate_failure(

@@ -34,7 +34,11 @@ from ai_flywheel.adapters.runners import (
 )
 from ai_flywheel.adapters.sessions import SessionAdapter
 from ai_flywheel.adapters.skills import SkillWriterAdapter
-from ai_flywheel.adapters.wiki_gate import ROUTE_DECLARED, ROUTE_EVIDENCE
+from ai_flywheel.adapters.wiki_gate import (
+    ROUTE_DECLARED,
+    ROUTE_EVIDENCE,
+    approved_registration_matches,
+)
 from ai_flywheel.config import FlywheelConfig
 from ai_flywheel.core.activation import ActivationEngine
 from ai_flywheel.core.approval_channel import ApprovalChannel
@@ -728,6 +732,8 @@ class WorkflowOrchestrator(RecoveryMixin):
             # instead of being guessed into a project or failing the whole batch in P04.
             unrouted_docs: list[dict[str, Any]] = []
             routed_docs: list[dict[str, Any]] = []
+            index_capacity_drops: list[dict[str, Any]] = []
+            knowledge_write_paths: set[str] = set()
             if self.knowledge.wiki_gate.applicable:
                 used_norm_paths: set[str] = set()
                 sess_by_key = {s.session_key: s for s, _ in admitted}
@@ -766,9 +772,32 @@ class WorkflowOrchestrator(RecoveryMixin):
                     if new_rel in used_norm_paths:
                         stem = new_rel[:-3] if new_rel.endswith(".md") else new_rel
                         new_rel = f"{stem}-{len(used_norm_paths) + 1}.md"
+                    index_registration = (
+                        self.knowledge.wiki_gate.plan_practice_index_registration(
+                            new_rel,
+                            new_md,
+                        )
+                    )
+                    side_effect = index_registration.side_effect() if index_registration else None
+                    candidate_paths = {new_rel}
+                    if side_effect and side_effect.get("status") == "update":
+                        candidate_paths.add(str(side_effect["target_path"]))
+                    if len(knowledge_write_paths | candidate_paths) > max_ws:
+                        index_capacity_drops.append(
+                            {
+                                "title": w.title,
+                                "relative_path": new_rel,
+                                "reason": "WRITE_SET_TOTAL_LIMIT",
+                                "planned_paths": sorted(candidate_paths),
+                                "limit": max_ws,
+                            }
+                        )
+                        continue
+                    knowledge_write_paths.update(candidate_paths)
                     used_norm_paths.add(new_rel)
                     w.relative_path = new_rel
                     w.content_preview = new_md
+                    w.side_effects = [side_effect] if side_effect else []
                     routed_writes.append(w)
                     routed_docs.append(
                         {
@@ -776,12 +805,26 @@ class WorkflowOrchestrator(RecoveryMixin):
                             "relative_path": new_rel,
                             "source_session_keys": list(w.source_session_keys),
                             "route": decision.to_dict(),
+                            "side_effects": list(w.side_effects),
                         }
                     )
                 planned_writes = routed_writes
+                plan_info.kept_count = len(planned_writes)
             run.planned_writes = planned_writes
             if plan_info.dropped_items:
                 self._trace_dropped_plan_items(run, plan_info)
+            if index_capacity_drops:
+                self.db.append_audit_event(
+                    entity_type="workflow_run",
+                    entity_id=run.run_id,
+                    event_type="planned_doc_write_set_limited",
+                    actor="wiki_gate",
+                    summary=(
+                        f"{len(index_capacity_drops)} 篇笔记连同项目索引超过单批 "
+                        f"{max_ws} 个物理写入路径，未列入计划"
+                    ),
+                    payload={"dropped": index_capacity_drops, "limit": max_ws},
+                )
             if plan_info.deferred_skill_candidates:
                 self.db.append_audit_event(
                     entity_type="workflow_run",
@@ -824,6 +867,11 @@ class WorkflowOrchestrator(RecoveryMixin):
                 if unrouted_docs
                 else ""
             )
+            capacity_note = (
+                f"；{len(index_capacity_drops)} 篇笔记连同索引超过物理写入上限，未列入计划"
+                if index_capacity_drops
+                else ""
+            )
             invalid_items = len(plan_info.dropped_items) - plan_info.over_limit_count
             dropped_note = ""
             if plan_info.dropped_items:
@@ -842,12 +890,21 @@ class WorkflowOrchestrator(RecoveryMixin):
                     f"计划来源：{PLAN_SOURCE_LABELS.get(plan_info.source, plan_info.source)}；"
                     f"查重比对 {len(existing_rules)} 条规则与 {len(existing_skills)} 个技能，"
                     f"整理出 {len(planned_writes)} 项建议（含 {skill_plans} 项 Skill 封装/优化）"
-                    f"{dropped_note}{unrouted_note}{deferred_note}"
+                    f"{dropped_note}{unrouted_note}{capacity_note}{deferred_note}"
                 ),
                 internal_checks=[
                     {"name": "规则与技能查重", "status": "PASS"},
                     {"name": "Skill 路由判定", "status": "PASS", "detail": {"skill_plans": skill_plans}},
-                    {"name": "单批数量上限校验", "status": "PASS", "detail": {"planned": len(planned_writes), "limit": max_ws}},
+                    {
+                        "name": "单批数量上限校验",
+                        "status": "PASS",
+                        "detail": {
+                            "planned": len(planned_writes),
+                            "physical_knowledge_paths": len(knowledge_write_paths),
+                            "index_capacity_dropped": len(index_capacity_drops),
+                            "limit": max_ws,
+                        },
+                    },
                     {
                         "name": "写入计划项校验",
                         "status": "PASS" if not invalid_items else "WARN",
@@ -881,6 +938,7 @@ class WorkflowOrchestrator(RecoveryMixin):
                     "skill_plans": skill_plans,
                     "routed_docs": routed_docs,
                     "unrouted_docs": unrouted_docs,
+                    "index_capacity_drops": index_capacity_drops,
                     "plan_source": plan_info.source,
                     "plan_diagnostics": plan_info.to_dict(),
                     # What the model call cost: attempts, duration, served model, token usage.
@@ -1199,12 +1257,55 @@ class WorkflowOrchestrator(RecoveryMixin):
         )
         return result
 
+    def _validate_p04_knowledge_scope(
+        self,
+        approved_items: list[PlannedWrite],
+    ) -> list[str]:
+        """Fail before any P04 side effect when the approved physical set is stale."""
+        if not self.knowledge.wiki_gate.applicable:
+            return []
+        physical_paths: set[str] = set()
+        for item in approved_items:
+            if item.target_kind != "knowledge_doc":
+                continue
+            if not item.relative_path:
+                raise ValueError(
+                    f"知识文档写入项缺少 relative_path，无法落盘：{item.title}"
+                )
+            physical_paths.add(item.relative_path)
+            physical_paths.update(
+                str(effect["target_path"])
+                for effect in item.side_effects
+                if effect.get("kind") == "practice_index_entry"
+                and effect.get("status") == "update"
+                and effect.get("target_path")
+            )
+            registration = self.knowledge.wiki_gate.plan_practice_index_registration(
+                item.relative_path,
+                item.content_preview,
+            )
+            if registration is not None and registration.status == "update":
+                if not approved_registration_matches(registration, item.side_effects):
+                    raise ValueError(
+                        "P04 practice-index side effect is outside the approved scope "
+                        f"for '{item.title}'. Re-plan and approve the batch."
+                    )
+                physical_paths.add(registration.target_relative_path)
+        limit = max(1, int(self.cfg.knowledge_sink.max_write_set))
+        if len(physical_paths) > limit:
+            raise ValueError(
+                f"P04 approved physical write set has {len(physical_paths)} paths; "
+                f"the configured maximum is {limit}."
+            )
+        return sorted(physical_paths)
+
     def _execute_post_approval(
         self, run: WorkflowRunRecord, simulate_fail_node: str | None = None
     ) -> WorkflowRunRecord:
         active_node = "P04_WRITE_VERIFY"
         t0 = time.perf_counter()
         written_paths: list[str] = []
+        written_index_paths: list[str] = []
         created_rules: list[str] = []
         written_skills: list[str] = []
         skipped_docs: list[dict[str, Any]] = []
@@ -1225,6 +1326,7 @@ class WorkflowOrchestrator(RecoveryMixin):
             dissent_candidates = [
                 c for c in (p02_payload.get("candidate_dissents") or []) if isinstance(c, dict)
             ]
+            approved_physical_paths = self._validate_p04_knowledge_scope(approved_items)
             persisted_observations: list[dict[str, Any]] = []
             index_error: Exception | None = None
             try:
@@ -1300,8 +1402,17 @@ class WorkflowOrchestrator(RecoveryMixin):
                             content_to_write,
                             action=item.action,
                             sync_fts=False,  # the batch rebuilds the search index once, at the end
+                            sync_practice_index=self.knowledge.wiki_gate.applicable,
+                            approved_side_effects=item.side_effects,
                         )
                         written_paths.append(res["relative_path"])
+                        index_receipt = res.get("practice_index") or {}
+                        if (
+                            index_receipt.get("status") == "update"
+                            and index_receipt.get("target_path")
+                            and index_receipt["target_path"] not in written_index_paths
+                        ):
+                            written_index_paths.append(str(index_receipt["target_path"]))
                         write_receipts.append(res)
                     elif item.target_kind == "flywheel_rule":
                         normalized_payload = normalize_rule_payload(item)
@@ -1348,10 +1459,15 @@ class WorkflowOrchestrator(RecoveryMixin):
             except Exception as exc:
                 # A half-done batch must leave its receipts behind: the next run needs to know
                 # which documents were already written before the failure.
-                self._record_partial_writes(run, write_receipts, written_paths, exc)
+                self._record_partial_writes(
+                    run,
+                    write_receipts,
+                    [*written_paths, *written_index_paths],
+                    exc,
+                )
                 raise
             finally:
-                if written_paths:
+                if written_paths or written_index_paths:
                     # One index rebuild for the whole batch, not one per document.
                     try:
                         self.knowledge.sync_fts_index()
@@ -1365,10 +1481,13 @@ class WorkflowOrchestrator(RecoveryMixin):
 
             # Optional audit trail: commit exactly the files P04 wrote. Never fails the batch.
             git_commit_result: dict[str, Any] | None = None
-            if self.cfg.knowledge_sink.auto_git_commit and (written_paths or written_skills):
+            changed_knowledge_paths = [*written_paths, *written_index_paths]
+            if self.cfg.knowledge_sink.auto_git_commit and (
+                changed_knowledge_paths or written_skills
+            ):
                 git_commit_result = self._commit_p04_writes(
                     run,
-                    written_paths,
+                    changed_knowledge_paths,
                     written_skills,
                     approval_source=self._approval_source_for(run),
                 )
@@ -1390,6 +1509,11 @@ class WorkflowOrchestrator(RecoveryMixin):
                 summary=(
                     f"写入 {len(written_paths)} 篇笔记、注册 {len(created_rules)} 条规则、"
                     f"更新/新建 {len(written_skills)} 个 Skill（全部校验通过）"
+                    + (
+                        f"；同步 {len(written_index_paths)} 个项目笔记索引"
+                        if written_index_paths
+                        else ""
+                    )
                     + (f"；{len(skipped_docs)} 篇笔记因无法归属项目跳过" if skipped_docs else "")
                     + (
                         f"；错题观察池入池 {len(persisted_observations)} 条"
@@ -1401,6 +1525,18 @@ class WorkflowOrchestrator(RecoveryMixin):
                 internal_checks=[
                     {"name": "路径安全与白名单校验", "status": "PASS"},
                     {"name": "落盘回读一致性校验", "status": "PASS", "detail": {"docs": len(written_paths), "skills": len(written_skills)}},
+                    {
+                        "name": "实战卡项目笔记索引原子登记",
+                        "status": "PASS",
+                        "detail": {
+                            "indexes_updated": len(written_index_paths),
+                            "registered_or_already_present": sum(
+                                1
+                                for receipt in write_receipts
+                                if isinstance(receipt.get("practice_index"), dict)
+                            ),
+                        },
+                    },
                     {
                         "name": "错题观察池与分歧记录写入（审批后）",
                         "status": "PASS",
@@ -1427,9 +1563,12 @@ class WorkflowOrchestrator(RecoveryMixin):
                         else []
                     ),
                 ],
-                artifacts=written_paths + created_rules + written_skills,
+                artifacts=changed_knowledge_paths + created_rules + written_skills,
                 payload={
                     "write_receipts": write_receipts,
+                    "approved_physical_paths": approved_physical_paths,
+                    "written_paths": written_paths,
+                    "written_practice_index_paths": written_index_paths,
                     "skipped_unrouted_docs": skipped_docs,
                     "persisted_observation_ids": [
                         str(o.get("obs_id")) for o in persisted_observations if o.get("obs_id")

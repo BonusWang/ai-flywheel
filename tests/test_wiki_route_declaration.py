@@ -76,6 +76,11 @@ SCHEMA = textwrap.dedent(
         formal_active:
           partition_ids: [projects, topics]
       page_types:
+        project-practice-index:
+          partition: projects
+          required_fields: [title, description, type, project_id, created, updated, status]
+          path_pattern: "^[^/]+/实战笔记/笔记索引\\\\.md$"
+          allowed_status: [active, deprecated, archived]
         project-practice-note:
           partition: projects
           required_fields: [title, description, type, project_id, record_id, event_date, load_policy, default_load, created, updated, status]
@@ -138,7 +143,7 @@ def _add_project(
     practice.mkdir(parents=True)
     frontmatter = {
         "title": f"{project_id} 索引",
-        "description": description,
+        "description": description or f"{project_id} 实战经验卡索引",
         "type": "project-practice-index",
         "project_id": project_id,
         "created": "2026-11-23",
@@ -222,7 +227,7 @@ def test_routing_candidates_follow_the_mounted_contract(tmp_path: Path):
     assert candidates.page_types == ["project-practice-note"]
     assert [(p["dir_name"], p["project_id"], p["aliases"], p["description"]) for p in candidates.projects] == [
         (ALPHA[0], ALPHA[1], list(ALPHA[2]), "alpha-crm 的经验卡导航"),
-        (BETA[0], BETA[1], list(BETA[2]), ""),
+            (BETA[0], BETA[1], list(BETA[2]), "beta-bill 实战经验卡索引"),
     ]
     assert candidates.routable is True
     assert candidates.to_dict() == {
@@ -234,7 +239,12 @@ def test_routing_candidates_follow_the_mounted_contract(tmp_path: Path):
                 "aliases": list(ALPHA[2]),
                 "description": "alpha-crm 的经验卡导航",
             },
-            {"project": BETA[0], "project_id": BETA[1], "aliases": list(BETA[2]), "description": ""},
+                {
+                    "project": BETA[0],
+                    "project_id": BETA[1],
+                    "aliases": list(BETA[2]),
+                    "description": "beta-bill 实战经验卡索引",
+                },
         ],
     }
 
@@ -945,7 +955,23 @@ def test_run_routes_knowledge_docs_by_declaration_and_traces_every_verdict(tmp_p
     planned = [w for w in run.planned_writes if w.target_kind == "knowledge_doc"]
     assert sorted(w.title for w in planned) == sorted(routed)
     assert all(f"/{ALPHA[0]}/实战笔记/" in w.relative_path for w in planned)
+    assert all(
+        w.side_effects
+        and w.side_effects[0]["kind"] == "practice_index_entry"
+        and w.side_effects[0]["target_path"].endswith("/实战笔记/笔记索引.md")
+        for w in planned
+    )
     assert len(_cards(rt)) == 2
+    alpha_index = (
+        rt.knowledge.root
+        / "wiki-知识库"
+        / "projects-项目"
+        / ALPHA[0]
+        / "实战笔记"
+        / "笔记索引.md"
+    ).read_text(encoding="utf-8")
+    for item in planned:
+        assert alpha_index.count(item.relative_path.removesuffix(".md")) == 1
     assert rt.db.get_session(notes_key).status.value == "processed"
 
     events = rt.db.list_audit_events(entity_type="workflow_run", entity_id=run.run_id, limit=50)
@@ -973,6 +999,41 @@ def test_dry_run_run_keeps_evidence_routing_and_traces_its_source(tmp_path: Path
     routed = _node(run, "P03_ROUTE_PLAN").payload["routed_docs"]
     assert [doc["route"]["source"] for doc in routed] == [ROUTE_EVIDENCE]
     assert routed[0]["route"]["project"] == ALPHA[0]
+    assert len(_cards(rt)) == 1
+
+
+def test_p03_counts_cards_and_shared_index_against_the_physical_write_limit(
+    tmp_path: Path,
+    monkeypatch,
+):
+    rt = _api_runtime(tmp_path)
+    rt.cfg.knowledge_sink.max_write_set = 2
+    _add_project(rt.knowledge.root, *ALPHA)
+    alpha_key = _register(rt, "alpha-limit", tmp_path / "work" / "alpha-crm")
+    runner = _ModelPlanRunner(
+        [
+            _doc("容量甲", alpha_key, _declare("alpha-crm")),
+            _doc("容量乙", alpha_key, _declare("alpha-crm")),
+        ]
+    )
+    monkeypatch.setattr(orchestrator, "build_runner", lambda cfg, fs_store: runner)
+
+    run = rt.orchestrator.start_run(
+        trigger="test",
+        phase="daily",
+        session_keys=[alpha_key],
+    )
+
+    assert run.status == RunStatus.PASS, run.error
+    p03 = _node(run, "P03_ROUTE_PLAN")
+    assert len(run.planned_writes) == 1
+    assert len(p03.payload["index_capacity_drops"]) == 1
+    assert p03.payload["index_capacity_drops"][0]["reason"] == "WRITE_SET_TOTAL_LIMIT"
+    plan_check = next(
+        item for item in p03.internal_checks if item["name"] == "写入计划项校验"
+    )
+    assert plan_check["detail"]["invalid"] == 0
+    assert "1 篇笔记连同索引超过物理写入上限" in p03.summary
     assert len(_cards(rt)) == 1
 
 
@@ -1016,3 +1077,68 @@ def test_p04_skips_a_stale_plan_item_that_no_longer_routes(tmp_path: Path, monke
     receipts = _node(run, "P04_WRITE_VERIFY").payload["write_receipts"]
     assert [(r["status"], r["reason_code"]) for r in receipts] == [("SKIPPED_UNROUTED_PROJECT", "declaration_missing")]
     assert _cards(rt) == []
+
+
+def test_awaiting_run_persists_index_side_effect_and_legacy_plan_fails_closed(
+    tmp_path: Path,
+    monkeypatch,
+):
+    rt = _api_runtime(tmp_path)
+    rt.cfg.workflow.approval_mode = "always"
+    _add_project(rt.knowledge.root, *ALPHA)
+    notes_key = _register(rt, "notes-1", tmp_path / "notes")
+    runner = _ModelPlanRunner([_doc("审批副作用重载", notes_key, _declare("alpha-crm"))])
+    monkeypatch.setattr(orchestrator, "build_runner", lambda cfg, fs_store: runner)
+
+    run = rt.orchestrator.start_run(
+        trigger="test",
+        phase="daily",
+        session_keys=[notes_key],
+    )
+    assert run.status == RunStatus.AWAITING_APPROVAL
+    planned = run.planned_writes[0]
+    assert planned.side_effects and planned.side_effects[0]["status"] == "update"
+
+    reloaded = rt.db.get_workflow_run(run.run_id)
+    assert reloaded is not None
+    assert reloaded.planned_writes[0].side_effects == planned.side_effects
+
+    # A plan persisted by an older release has no approved derived-write record.
+    reloaded.planned_writes[0].side_effects = []
+    rt.db.save_workflow_run(reloaded)
+    run = rt.orchestrator.approve_and_resume(run.run_id)
+
+    assert run.status == RunStatus.FAILED
+    p04 = _node(run, "P04_WRITE_VERIFY")
+    assert "outside the approved scope" in (p04.error or "")
+    assert _cards(rt) == []
+    assert rt.db.get_session(notes_key).status.value == "pending"
+    assert _node(run, "P05_SETTLE").status.value == "SKIPPED"
+
+
+def test_p04_fails_closed_when_the_approved_index_disappears_before_write(
+    tmp_path: Path,
+    monkeypatch,
+):
+    rt = _api_runtime(tmp_path)
+    rt.cfg.workflow.approval_mode = "always"
+    _add_project(rt.knowledge.root, *ALPHA)
+    notes_key = _register(rt, "notes-2", tmp_path / "notes")
+    runner = _ModelPlanRunner([_doc("索引消失失败关闭", notes_key, _declare("alpha-crm"))])
+    monkeypatch.setattr(orchestrator, "build_runner", lambda cfg, fs_store: runner)
+    run = rt.orchestrator.start_run(
+        trigger="test",
+        phase="daily",
+        session_keys=[notes_key],
+    )
+    assert run.status == RunStatus.AWAITING_APPROVAL
+    target = run.planned_writes[0].side_effects[0]["target_path"]
+    (rt.knowledge.root / target).unlink()
+
+    run = rt.orchestrator.approve_and_resume(run.run_id)
+
+    assert run.status == RunStatus.FAILED
+    p04 = _node(run, "P04_WRITE_VERIFY")
+    assert "has no project notes index" in (p04.error or "")
+    assert _cards(rt) == []
+    assert rt.db.get_session(notes_key).status.value == "pending"

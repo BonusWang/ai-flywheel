@@ -362,6 +362,10 @@ class PlannedWrite(BaseModel):
     # The planner's routing declaration for a knowledge_doc (page_type, project, reason), carried
     # untouched for the Wiki gate to validate. The dry-run planner has no model and never sets it.
     wiki_route: dict[str, Any] | None = None
+    # Non-primary paths this approved write will also change, such as the
+    # project practice index. P03 previews them before approval and P04 records
+    # their actual receipt in the same write receipt.
+    side_effects: list[dict[str, Any]] = Field(default_factory=list)
     requires_approval: bool = False
     approval_reason: str = ""
     source_session_keys: list[str] = Field(default_factory=list)

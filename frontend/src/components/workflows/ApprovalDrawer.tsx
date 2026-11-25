@@ -160,6 +160,26 @@ export const ApprovalDrawer: React.FC<{
                   </div>
                 )}
                 <p className="text-[12px] text-ink-3 mt-1">{pw.summary}</p>
+                {(pw.side_effects ?? []).map((effect, effectIdx) => (
+                  <div
+                    key={`${effect.target_path}-${effectIdx}`}
+                    className="mt-2 rounded-[var(--radius-control)] border border-accent/20 bg-accent-soft/35 p-2"
+                  >
+                    <div className="text-[11px] font-medium text-accent-ink">
+                      {effect.status === 'already_present'
+                        ? '索引已登记，本次无新增'
+                        : '随本次批准同步项目笔记索引'}
+                    </div>
+                    <div className="mono text-[10.5px] text-ink-3 mt-0.5 truncate">
+                      {effect.target_path}
+                    </div>
+                    {effect.entry_preview && (
+                      <div className="mono text-[10.5px] text-ink-2 mt-1 break-words">
+                        {effect.entry_preview}
+                      </div>
+                    )}
+                  </div>
+                ))}
                 {pw.content_preview && (
                   <div className="mt-2">
                     {isSkillUpdate && (

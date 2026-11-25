@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import textwrap
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 
@@ -8,9 +10,12 @@ import pytest
 import yaml
 
 from ai_flywheel.adapters.wiki_gate import WikiGateError, split_frontmatter
+from ai_flywheel.adapters.knowledge import KnowledgeWriteError
+from ai_flywheel.adapters.channels.feishu.card import render_ask_card
 from ai_flywheel.config import FlywheelConfig
 from ai_flywheel.models import (
     OutcomeStatus,
+    PlannedWrite,
     PreflightRequest,
     RecordOutcomeRequest,
     RegisterSessionRequest,
@@ -50,6 +55,11 @@ SCHEMA = textwrap.dedent(
         formal_active:
           partition_ids: [projects, topics]
       page_types:
+        project-practice-index:
+          partition: projects
+          required_fields: [title, description, type, project_id, created, updated, status]
+          path_pattern: "^[^/]+/实战笔记/笔记索引\\\\.md$"
+          allowed_status: [active, deprecated, archived]
         project-practice-note:
           partition: projects
           required_fields: [title, description, type, project_id, record_id, event_date, load_policy, default_load, created, updated, status]
@@ -332,7 +342,8 @@ def _add_project(wiki_root: Path, dir_name: str, project_id: str) -> None:
     practice = wiki_root / "wiki-知识库" / "projects-项目" / dir_name / "实战笔记"
     practice.mkdir(parents=True)
     (practice / "笔记索引.md").write_text(
-        f"---\ntitle: {dir_name} 索引\ntype: project-practice-index\nproject_id: {project_id}\n"
+        f"---\ntitle: {dir_name} 索引\ndescription: {dir_name} 实战经验卡索引\n"
+        f"type: project-practice-index\nproject_id: {project_id}\n"
         "created: 2026-11-23\nupdated: 2026-11-23\nstatus: active\n---\n\n"
         f"# {dir_name} 索引\n",
         encoding="utf-8",
@@ -522,3 +533,275 @@ def test_run_skips_unrouted_docs_and_still_passes(tmp_path: Path):
     assert any(row["event_type"] == "planned_doc_unrouted" for row in events)
     # The second session is still settled by P05; a skipped card must not strand it.
     assert rt.db.get_session("claude-code:notes-1").status.value == "processed"
+
+
+def test_practice_note_and_lite_write_register_once_with_combined_postflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rt = _make_runtime(tmp_path)
+    _add_project(rt.knowledge.root, "demo-project", "demo")
+    practice = (
+        rt.knowledge.root
+        / "wiki-知识库"
+        / "projects-项目"
+        / "demo-project"
+        / "实战笔记"
+    )
+    index_path = practice / "笔记索引.md"
+    postflight_paths: list[list[str]] = []
+
+    def _capture_postflight(result, paths):
+        postflight_paths.append(list(paths))
+
+    monkeypatch.setattr(rt.knowledge.wiki_gate, "run_postflight", _capture_postflight)
+
+    note_rel = "wiki-知识库/projects-项目/demo-project/实战笔记/2026-11-23-缓存雪崩.md"
+    note_md = _practice_note(note_rel, "缓存雪崩根因定位", "预热并打散 key 的过期时间")
+    note_registration = rt.knowledge.wiki_gate.plan_practice_index_registration(note_rel, note_md)
+    assert note_registration is not None and note_registration.status == "update"
+    note_receipt = rt.knowledge.write_document_verified(
+        note_rel,
+        note_md,
+        sync_fts=False,
+        sync_practice_index=True,
+        approved_side_effects=[note_registration.side_effect()],
+    )
+
+    lite_rel = "wiki-知识库/projects-项目/demo-project/实战笔记/2026-11-23-Redis命中率.md"
+    lite_md = _lite_note("Redis 命中率快速定位")
+    lite_registration = rt.knowledge.wiki_gate.plan_practice_index_registration(lite_rel, lite_md)
+    assert lite_registration is not None and lite_registration.status == "update"
+    lite_receipt = rt.knowledge.write_document_verified(
+        lite_rel,
+        lite_md,
+        sync_fts=False,
+        sync_practice_index=True,
+        approved_side_effects=[lite_registration.side_effect()],
+    )
+
+    index_text = index_path.read_text(encoding="utf-8")
+    assert index_text.count(note_rel.removesuffix(".md")) == 1
+    assert index_text.count(lite_rel.removesuffix(".md")) == 1
+    assert "## P04 自动登记" in index_text
+    assert note_receipt["practice_index"]["status"] == "update"
+    assert lite_receipt["practice_index"]["status"] == "update"
+    assert postflight_paths == [
+        [note_rel, note_registration.target_relative_path],
+        [lite_rel, lite_registration.target_relative_path],
+    ]
+
+    repeat_registration = rt.knowledge.wiki_gate.plan_practice_index_registration(note_rel, note_md)
+    assert repeat_registration is not None and repeat_registration.status == "already_present"
+    repeat_receipt = rt.knowledge.write_document_verified(
+        note_rel,
+        note_md,
+        sync_fts=False,
+        sync_practice_index=True,
+        approved_side_effects=[],
+    )
+    assert repeat_receipt["practice_index"]["status"] == "already_present"
+    assert index_path.read_text(encoding="utf-8").count(note_rel.removesuffix(".md")) == 1
+
+
+def test_practice_index_postflight_failure_rolls_back_card_and_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rt = _make_runtime(tmp_path)
+    _add_project(rt.knowledge.root, "demo-project", "demo")
+    practice = (
+        rt.knowledge.root
+        / "wiki-知识库"
+        / "projects-项目"
+        / "demo-project"
+        / "实战笔记"
+    )
+    index_path = practice / "笔记索引.md"
+    index_preimage = index_path.read_bytes()
+    rel = "wiki-知识库/projects-项目/demo-project/实战笔记/2026-11-23-回滚验证.md"
+    content = _practice_note(rel, "回滚验证", "任何一项失败都必须恢复两处 preimage")
+    registration = rt.knowledge.wiki_gate.plan_practice_index_registration(rel, content)
+    assert registration is not None and registration.status == "update"
+    resync_calls: list[list[str]] = []
+
+    def _block_postflight(result, paths):
+        raise RuntimeError("sandbox postflight raised")
+
+    def _resync(paths):
+        resync_calls.append(list(paths))
+        return {"status": "pass", "returncode": 0}
+
+    monkeypatch.setattr(rt.knowledge.wiki_gate, "run_postflight", _block_postflight)
+    monkeypatch.setattr(rt.knowledge.wiki_gate, "resync_after_rollback", _resync)
+
+    with pytest.raises(WikiGateError) as excinfo:
+        rt.knowledge.write_document_verified(
+            rel,
+            content,
+            sync_fts=False,
+            sync_practice_index=True,
+            approved_side_effects=[registration.side_effect()],
+        )
+
+    assert "D2_FAILED" in str(excinfo.value)
+    assert "sandbox postflight raised" in str(excinfo.value)
+    assert not (rt.knowledge.root / rel).exists()
+    assert index_path.read_bytes() == index_preimage
+    assert resync_calls == [[rel, registration.target_relative_path]]
+    evidence_files = sorted(rt.cfg.wiki_gate_evidence_path.glob("gate-*.json"))
+    payloads = [json.loads(path.read_text(encoding="utf-8")) for path in evidence_files]
+    post_write = [item for item in payloads if item.get("stage") == "post_write"]
+    assert post_write
+    rollback = post_write[-1]["rollback"]
+    assert rollback["state"] == "deleted_new_file"
+    assert rollback["practice_index"]["state"] == "restored_preimage"
+    assert post_write[-1]["practice_index"]["status"] == "update"
+
+
+def test_practice_index_update_must_be_in_the_approved_side_effect_scope(tmp_path: Path):
+    rt = _make_runtime(tmp_path)
+    _add_project(rt.knowledge.root, "demo-project", "demo")
+    rel = "wiki-知识库/projects-项目/demo-project/实战笔记/2026-11-23-审批范围.md"
+    content = _practice_note(rel, "审批范围", "派生索引写入必须有精确审批预览")
+    registration = rt.knowledge.wiki_gate.plan_practice_index_registration(rel, content)
+    assert registration is not None and registration.status == "update"
+    index_path = rt.knowledge.root / registration.target_relative_path
+    index_preimage = index_path.read_bytes()
+
+    with pytest.raises(KnowledgeWriteError, match="not in the approved write scope"):
+        rt.knowledge.write_document_verified(
+            rel,
+            content,
+            sync_fts=False,
+            sync_practice_index=True,
+            approved_side_effects=[],
+        )
+
+    assert not (rt.knowledge.root / rel).exists()
+    assert index_path.read_bytes() == index_preimage
+
+
+def test_concurrent_practice_cards_on_the_same_index_preserve_both_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rt = _make_runtime(tmp_path)
+    _add_project(rt.knowledge.root, "demo-project", "demo")
+    monkeypatch.setattr(rt.knowledge.wiki_gate, "run_postflight", lambda result, paths: None)
+    practice_rel = "wiki-知识库/projects-项目/demo-project/实战笔记"
+    cards = [
+        (
+            f"{practice_rel}/2026-11-23-并发条目甲.md",
+            _practice_note(
+                f"{practice_rel}/2026-11-23-并发条目甲.md",
+                "并发条目甲",
+                "索引锁内必须重新读取当前内容",
+            ),
+        ),
+        (
+            f"{practice_rel}/2026-11-23-并发条目乙.md",
+            _practice_note(
+                f"{practice_rel}/2026-11-23-并发条目乙.md",
+                "并发条目乙",
+                "同一索引的其它条目不得被覆盖",
+            ),
+        ),
+    ]
+    registrations = [
+        rt.knowledge.wiki_gate.plan_practice_index_registration(rel, content)
+        for rel, content in cards
+    ]
+    assert all(item is not None and item.status == "update" for item in registrations)
+
+    def _write_one(index: int):
+        rel, content = cards[index]
+        registration = registrations[index]
+        return rt.knowledge.write_document_verified(
+            rel,
+            content,
+            sync_fts=False,
+            sync_practice_index=True,
+            approved_side_effects=[registration.side_effect()],
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        receipts = list(pool.map(_write_one, range(2)))
+
+    index_path = (
+        rt.knowledge.root
+        / "wiki-知识库"
+        / "projects-项目"
+        / "demo-project"
+        / "实战笔记"
+        / "笔记索引.md"
+    )
+    index_text = index_path.read_text(encoding="utf-8")
+    for rel, _content in cards:
+        assert index_text.count(rel.removesuffix(".md")) == 1
+    assert {receipt["practice_index"]["status"] for receipt in receipts} == {"update"}
+    assert not list(index_path.parent.glob("*.lock"))
+
+
+def test_p04_rejects_an_approved_physical_set_above_max_write_set(tmp_path: Path):
+    rt = _make_runtime(tmp_path)
+    rt.cfg.knowledge_sink.max_write_set = 2
+    _add_project(rt.knowledge.root, "demo-project", "demo")
+    practice_rel = "wiki-知识库/projects-项目/demo-project/实战笔记"
+    items: list[PlannedWrite] = []
+    for suffix in ("甲", "乙"):
+        rel = f"{practice_rel}/2026-11-23-容量{suffix}.md"
+        content = _practice_note(rel, f"容量{suffix}", f"容量验证{suffix}")
+        registration = rt.knowledge.wiki_gate.plan_practice_index_registration(rel, content)
+        assert registration is not None and registration.status == "update"
+        items.append(
+            PlannedWrite(
+                target_kind="knowledge_doc",
+                relative_path=rel,
+                action="create",
+                title=f"容量{suffix}",
+                summary="物理写入上限验证",
+                content_preview=content,
+                side_effects=[registration.side_effect()],
+            )
+        )
+
+    with pytest.raises(ValueError, match="approved physical write set has 3 paths"):
+        rt.orchestrator._validate_p04_knowledge_scope(items)
+
+
+def test_feishu_approval_card_shows_the_exact_index_side_effect():
+    entry = "| 2026-11-23 | 重卡 | [[wiki/Card|审批卡]] |"
+    card = json.loads(
+        render_ask_card(
+            card_id="card-1",
+            batch_label="2026-11-23 #01",
+            reasons=["索引副作用需要审批"],
+            writes=[
+                {
+                    "target_kind": "knowledge_doc",
+                    "action": "create",
+                    "relative_path": "wiki/Card.md",
+                    "title": "审批卡",
+                    "summary": "验证派生写入可见",
+                    "approval_reason": "",
+                    "content_preview": "",
+                    "requires_approval": False,
+                    "side_effects": [
+                        {
+                            "kind": "practice_index_entry",
+                            "target_path": "wiki/笔记索引.md",
+                            "action": "append_entry",
+                            "status": "update",
+                            "entry_preview": entry,
+                        }
+                    ],
+                }
+            ],
+            portal_url="http://127.0.0.1/runs",
+        )
+    )
+    serialized = json.dumps(card, ensure_ascii=False)
+    assert "wiki/笔记索引.md" in serialized
+    assert "审批卡" in serialized
+    assert "2026-11-23" in serialized

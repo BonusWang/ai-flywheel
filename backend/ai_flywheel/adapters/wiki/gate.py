@@ -19,6 +19,10 @@ from ai_flywheel.adapters.wiki.postflight import (
     run_postflight,
     run_topic_lint,
 )
+from ai_flywheel.adapters.wiki.practice_index import (
+    PracticeIndexRegistration,
+    plan_practice_index_registration,
+)
 from ai_flywheel.adapters.wiki.router import (
     RouteContext,
     RouteDecision,
@@ -249,10 +253,24 @@ class WikiGate:
 
     # ---------------- post-write validation ----------------
 
+    def plan_practice_index_registration(
+        self,
+        relative_path: str,
+        content: str,
+    ) -> PracticeIndexRegistration | None:
+        """Return the project-index side effect of a practice-card write."""
+        if not self.applicable:
+            return None
+        return plan_practice_index_registration(self.root, relative_path, content)
+
     def run_topic_lint(self, result: WikiGateResult, relative_path: str) -> None:
         run_topic_lint(result, relative_path, sink=self.sink, root=self.root)
 
-    def run_postflight(self, result: WikiGateResult, relative_path: str) -> None:
+    def run_postflight(
+        self,
+        result: WikiGateResult,
+        relative_path: str | list[str],
+    ) -> None:
         run_postflight(
             result,
             relative_path,
@@ -261,7 +279,7 @@ class WikiGate:
             evidence_dir=self.cfg.wiki_gate_evidence_path,
         )
 
-    def resync_after_rollback(self, relative_path: str) -> dict[str, Any]:
+    def resync_after_rollback(self, relative_path: str | list[str]) -> dict[str, Any]:
         """Re-run index sync only after a failed write has been rolled back."""
         return resync_after_rollback(
             relative_path,
