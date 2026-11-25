@@ -3,7 +3,36 @@
 All notable changes to **AI Flywheel** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.6.0] - 2026-11-25
+
+### Added
+- **Governance & Evolution Control Plane Console (P0-1 & P0-2)** (`core/dream.py`, `routes/`, `frontend/src/App.tsx`, `frontend/src/pages/HomePage.tsx`, `frontend/src/pages/RulesRetroPage.tsx`, `frontend/src/pages/WorkflowsPage.tsx`, `frontend/src/pages/AutomationsPage.tsx`, `frontend/src/pages/ConnectPolicyPage.tsx`, `README.md`):
+  - Added zero-side-effect `preview_dream_consolidation()` in `core/dream.py` and exposed `GET /api/site/skills` (Skill effectiveness ledger), `GET /api/site/dream` (latest audit + read-only preview), and `POST /api/site/dream/run` (`dry_run` preview or explicit execution + core-card refresh); enriched `GET /api/site/knowledge` with card freshness and helpfulness metrics (`freshness_tier`, `valid_until`, `is_expired`, `surface_count`, `helped_count`).
+  - Rebuilt the `5+1` console around the **Governance & Evolution Control Plane** positioning: renamed primary nav to 今日态势 / 沉淀与审批 / 自动化调度 / 规则与进化 / 接入与设置 + 关于; replaced hardcoded schedule copy on `HomePage` with live `/api/site/automations`, real verification rate, rule health, mistake pool, safety valves, and derived core-card preview; deduplicated schedule toggles in `ConnectPolicyPage` and elevated safety valves.
+  - Added **Skill 与保鲜**, **证据台账 (Outcomes)**, and **FLYWHEEL-CORE.md** live preview/rebuild modal to `RulesRetroPage`; added **噪音过滤漏斗** and **模型调用遥测** badges to `WorkflowsPage`; added a **周五分层蒸馏控制卡** (preview & run) to `AutomationsPage`.
+  - Updated `README.md` and `AboutPage.tsx` with the clarified control-plane positioning, explicit comparison with context databases / memory engines (e.g., OpenViking, Mem0), MCP execution loop, and non-goals.
+- **Optional P04 Local Git Audit Trail (`knowledge_sink.auto_git_commit`)** (`core/pipeline/git_commit.py`, `config.py`, `flywheel.yaml.example`, `tests/test_pipeline_git_commit.py`):
+  - Added opt-in `knowledge_sink.auto_git_commit` (default `false`): when enabled and P04 writes files inside a Git repository, stages and commits **only** the exact P04-written paths (`git commit --only`) with `run_id` and `approval_source` (`portal` / `feishu` / `auto`) in the commit message, leaving unrelated dirty/untracked files untouched and never running `git push`. Git errors are audited (`p04_git_commit_failed` / `p04_git_commit_skipped`) without breaking verified writes.
+- **Onboarding & Diagnostics CLI (`flywheel doctor` & `flywheel init-client`)** (`core/doctor.py`, `core/onboarding.py`, `cli.py`, `tests/test_onboarding_cli.py`):
+  - Added read-only `flywheel doctor [--json]` covering 7 check groups (`config`, `storage`, `knowledge_sink`, `skills`, `runner`, `safety_valves`, `channels`) with exit code `0` on healthy/warn and `1` on failures.
+  - Added `flywheel init-client <claude-code|codex|claude-desktop|antigravity> [--transport http|stdio] [--apply] [--target <path>] [--json]` defaulting to safe dry-run; `--apply` backs up existing config, atomically merges only the `ai-flywheel` MCP entry (JSON or TOML) with LF line endings, preserves sibling entries, and is idempotent.
+  - Added neutral `knowledge_sink.postflight_hook_script` config key (env `FLYWHEEL_POSTFLIGHT_HOOK_SCRIPT`) with 100% backward-compatible fallback to `wiki_d2_postflight_script`.
+- **Generic Webhook Notification Channel & Bi-Temporal Rule Lineage (P2-1)** (`adapters/channels/webhook.py`, `adapters/delivery.py`, `storage/db/schema.py`, `storage/db/migrations.py`, `storage/db/rule_repo.py`, `core/activation.py`, `frontend/src/components/rules/RulesListTab.tsx`, `tests/test_webhook_and_rule_lineage.py`):
+  - Added vendor-neutral `delivery.webhook` channel (`enabled`, `url`, `secret`, `timeout_seconds`, `notify_on_fyi`; env `FLYWHEEL_WEBHOOK_URL` / `FLYWHEEL_WEBHOOK_SECRET`) with `core/privacy.py` outbound redaction, optional `X-Flywheel-Signature: sha256=<hex>` HMAC signing, non-fatal delivery on network/HTTP errors, and config secret masking.
+  - Added lightweight bi-temporal rule lineage columns (`supersedes_rule_id`, `effective_from`, `effective_to`) with idempotent SQLite migration: superseding an active rule retires it with `effective_to` and `rule_superseded` audit trail; dormant/retired transitions stamp `effective_to` and reactivation clears it; rendered lineage badges on rule cards.
+
+### Changed
+- **Modular Frontend & Backend Architecture (P1-1, P1-2, P1-3)** (`frontend/src/components/workflows/`, `frontend/src/components/rules/`, `core/approval_channel.py`, `adapters/channels/feishu/`, `routes/`, `core/pipeline/`, `core/orchestrator.py`, `app.py`):
+  - Decomposed `WorkflowsPage.tsx` (1,103 → 346 lines) into 8 sub-components under `components/workflows/` and `RulesRetroPage.tsx` (1,084 → 298 lines) into 6 sub-components under `components/rules/` (with shared `CoreCardModal`).
+  - Introduced `core/approval_channel.py` (`ApprovalChannel` Protocol & `ApprovalBusyError`), moved Feishu implementation into `adapters/channels/feishu/` (keeping explicit re-export shims in `core/feishu_*.py`), and split `app.py` (798 → 168 lines) into 4 domain `APIRouter` modules under `routes/` preserving all 53 application routes.
+  - Refactored `core/orchestrator.py` (1,845 → 48 lines compatibility facade) into `core/pipeline/` (`constants`, `events`, `helpers`, `recovery`, `git_commit`, `coordinator`), preserving the P00–P07 side-effect contract and monkeypatch seam.
+
+### Fixed
+- **Feishu interactive approval configuration, self-check UX, and text fallback clarity** (`adapters/channels/feishu/`, `adapters/runners/normalizers.py`, `runtime.py`, `routes/`, `frontend/src/pages/ConnectPolicyPage.tsx`, `frontend/src/pages/WorkflowsPage.tsx`):
+  - Sanitized approval `reasons` in plain-text Feishu fallbacks, normalized trailing punctuation so `。；` never appears, rendered Chinese target-kind labels (`KIND_LABEL`), and distinguished interactive-off / self-check-unverified / link-unavailable footers instead of always claiming buttons are unavailable.
+  - Added `FeishuClickListener.wake()`, hot-initialization of the Feishu interactive layer on `/api/site/config` updates, fast-fail when running `feishu-check` with `interactive=false`, and enriched `GET /api/site/feishu-check` with `enabled`, `interactive`, `interaction_ready`, and `availability`.
+  - Exposed interactive approval card toggle, extra `approver_open_ids`, live link/check status, and a one-click self-check trigger with polling guidance in the Web Console's Connect & Settings page, and aligned the Workflows approval drawer status text.
+- **Strip `<private>` blocks before generating document/skill filename slugs** (`adapters/runners/contracts.py`): prevented `<private>...</private>` content inside session titles from leaking into heuristic-generated `relative_path` filenames and outbound notifications.
 
 ## [0.5.0] - 2026-11-25
 

@@ -11,6 +11,7 @@ from ai_flywheel.adapters.sessions import SessionAdapter
 from ai_flywheel.adapters.skills import SkillWriterAdapter
 from ai_flywheel.config import FlywheelConfig, deep_merge, load_config, save_config
 from ai_flywheel.core.activation import ActivationEngine
+from ai_flywheel.core.approval_channel import ApprovalChannel
 from ai_flywheel.core.automation import AutomationManager, validate_cron
 from ai_flywheel.core.core_card import read_core_card, rebuild_core_card
 from ai_flywheel.core.hooks import ThinHookProcessor
@@ -62,7 +63,7 @@ class FlywheelRuntime:
         self.lark_runner = None
         self.feishu_listener = None
         self.feishu_check = None
-        self.feishu_channel = None
+        self.feishu_channel: ApprovalChannel | None = None
         self._build_feishu()
         self.automation = AutomationManager(
             cfg=cfg,
@@ -91,10 +92,10 @@ class FlywheelRuntime:
         fcfg = self.cfg.delivery.feishu_cli
         if not (fcfg.enabled and fcfg.identity == "bot" and fcfg.user_id):
             return
+        from ai_flywheel.adapters.channels.feishu.channel import FeishuChannel
+        from ai_flywheel.adapters.channels.feishu.check import FeishuCheckService
+        from ai_flywheel.adapters.channels.feishu.listen import FeishuClickListener
         from ai_flywheel.adapters.lark_cli import LarkCliRunner
-        from ai_flywheel.core.feishu_check import FeishuCheckService
-        from ai_flywheel.core.feishu_channel import FeishuChannel
-        from ai_flywheel.core.feishu_listen import FeishuClickListener
         from ai_flywheel.storage.outbox import OutboxDB
 
         runner = LarkCliRunner(fcfg.command, fcfg.command_args, identity=fcfg.identity)
@@ -139,21 +140,24 @@ class FlywheelRuntime:
                 logging.getLogger("ai_flywheel.feishu_check").exception("startup cleanup failed")
         if self.feishu_listener is not None:
             # Startup audit: which lark-cli was resolved (path, version, file hash).
-            lark = self.feishu_channel.runner
-            try:
-                version = lark.version()
-            except Exception:
-                version = "unknown"
-            digest = ""
-            try:
-                digest = hashlib.sha256(Path(lark.target_path).read_bytes()).hexdigest()
-            except OSError:
-                pass
-            self._listener_audit(
-                "listener_started",
-                f"点击监听器启动：exe={lark.target_path} version={version} sha256={digest}",
-                {"exe": lark.target_path, "version": version, "sha256": digest, "kind": lark.kind},
-            )
+            # The channel contract is transport-neutral, so the audit reads the
+            # runtime's own runner instead of a Feishu-specific channel attribute.
+            lark = self.lark_runner
+            if lark is not None:
+                try:
+                    version = lark.version()
+                except Exception:
+                    version = "unknown"
+                digest = ""
+                try:
+                    digest = hashlib.sha256(Path(lark.target_path).read_bytes()).hexdigest()
+                except OSError:
+                    pass
+                self._listener_audit(
+                    "listener_started",
+                    f"点击监听器启动：exe={lark.target_path} version={version} sha256={digest}",
+                    {"exe": lark.target_path, "version": version, "sha256": digest, "kind": lark.kind},
+                )
             self.feishu_listener.start()
         self.feishu_channel.start()
 
@@ -175,6 +179,26 @@ class FlywheelRuntime:
             self.feishu_channel.stop()
         if self.feishu_listener is not None:
             self.feishu_listener.stop()
+
+    def _sync_feishu_from_config(self) -> None:
+        """Hot-initialize or wake the Feishu interactive layer after a config save."""
+        fcfg = self.cfg.delivery.feishu_cli
+        if self.feishu_channel is None:
+            if fcfg.enabled and fcfg.identity == "bot" and fcfg.user_id:
+                try:
+                    self._build_feishu()
+                    if self.feishu_channel is not None and self.process_role == "serve":
+                        self.start_feishu()
+                except Exception:
+                    import logging
+
+                    logging.getLogger("ai_flywheel.runtime").warning(
+                        "Failed to hot-initialize Feishu interactive layer after config update",
+                        exc_info=True,
+                    )
+            return
+        if self.feishu_listener is not None:
+            self.feishu_listener.wake()
 
     def _feishu_daemon_status(self) -> dict[str, Any]:
         fcfg = self.cfg.delivery.feishu_cli
@@ -276,23 +300,32 @@ class FlywheelRuntime:
     )
 
     @staticmethod
-    def _without_empty_api_key(patch: dict[str, Any]) -> dict[str, Any]:
-        """Drop an empty or redacted api key: the configured one must survive.
+    def _without_redacted_secrets(patch: dict[str, Any]) -> dict[str, Any]:
+        """Drop empty or redacted secrets: the configured values must survive.
 
-        The settings form sends the key back as ``[REDACTED]``; writing that
-        over the real key would lock the user out of their own endpoint.
+        The settings form sends the API key and the webhook signing secret back
+        as ``[REDACTED]`` (the config dump never contains the real values);
+        writing that over the real secret would lock the user out of their own
+        endpoint or break the webhook signature.
         """
-        runner = patch.get("runner")
-        if not isinstance(runner, dict):
-            return patch
-        api = runner.get("api")
-        if not isinstance(api, dict):
-            return patch
-        value = api.get("api_key")
-        if value and value != "[REDACTED]":
-            return patch
         cleaned = copy.deepcopy(patch)
-        cleaned["runner"]["api"].pop("api_key", None)
+
+        runner = cleaned.get("runner")
+        if isinstance(runner, dict):
+            api = runner.get("api")
+            if isinstance(api, dict):
+                value = api.get("api_key")
+                if not value or value == "[REDACTED]":
+                    api.pop("api_key", None)
+
+        delivery = cleaned.get("delivery")
+        if isinstance(delivery, dict):
+            webhook = delivery.get("webhook")
+            if isinstance(webhook, dict):
+                secret = webhook.get("secret")
+                if not secret or secret == "[REDACTED]":
+                    webhook.pop("secret", None)
+
         return cleaned
 
     @staticmethod
@@ -328,7 +361,7 @@ class FlywheelRuntime:
             for section, values in patch.items()
             if isinstance(values, dict) and isinstance(current.get(section), dict)
         }
-        merged = deep_merge(current, self._without_empty_api_key(scoped))
+        merged = deep_merge(current, self._without_redacted_secrets(scoped))
         updated = FlywheelConfig.model_validate(merged)
         if "workflow" in scoped and "daily_cron" in scoped["workflow"]:
             cleaned_cron, _ = validate_cron(updated.workflow.daily_cron)
@@ -342,12 +375,15 @@ class FlywheelRuntime:
             if field_name in {"base_dir", "config_path"}:
                 continue
             setattr(self.cfg, field_name, getattr(updated, field_name))
+        self._sync_feishu_from_config()
         self.automation.sync_from_config()
         for section, values in patch.items():
             if isinstance(values, dict):
                 for k, v in values.items():
                     if k == "api" and isinstance(v, dict) and "api_key" in v:
                         v = {ak: ("***" if ak == "api_key" else av) for ak, av in v.items()}
+                    if k == "webhook" and isinstance(v, dict) and "secret" in v:
+                        v = {wk: ("***" if wk == "secret" else wv) for wk, wv in v.items()}
                     self.db.set_system_setting(f"{section}.{k}", section, v, updated_by="user")
         self.db.append_audit_event(
             entity_type="system_settings",

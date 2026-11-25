@@ -803,3 +803,181 @@ def test_orchestrator_records_the_selected_option_on_the_card(tmp_path: Path):
             (run.run_id,),
         ).fetchone()
     assert row["selected_option"] == "仅同意常规项"
+
+
+# ---------------- 飞书交互审批闭环与纯文本降级修复回归 ----------------
+
+
+def test_text_fallback_sanitizes_reasons_punctuation_and_chinese_kind_labels(db: FlywheelDB):
+    """纯文本降级消息必须清洗 reasons、消除『。；』叠加并使用中文类型标签。"""
+    runner = FakeRunner()
+    run = _run()
+    run.planned_writes.append(
+        PlannedWrite(
+            target_kind="flywheel_rule",
+            relative_path=None,
+            action="register_rule",
+            title="路由规则",
+            summary="固化边界",
+            content_preview="规则正文",
+        )
+    )
+    _card(db)
+    ch = _channel(db, runner, role="serve", listener_state="ready")
+    ch.cfg.delivery.feishu_cli.interactive = False
+    secret_like = "sk-" + "9" * 32
+    ch.first_send(
+        card_id="card-run-x",
+        run=run,
+        reasons=[
+            f"原因一含秘密 <private>内部隐私</private> {secret_like}。",
+            "原因二尾部带句号。；追加说明。",
+        ],
+        portal_url="http://127.0.0.1:8765/runs",
+    )
+    assert runner.sends[0][0] == "text"
+    text = runner.sends[0][1]
+    assert "<private>" not in text and "内部隐私" not in text
+    assert secret_like not in text and "疑似密钥已掩码" in text
+    assert "。；" not in text
+    assert "[笔记]" in text and "[Skill]" in text and "[规则]" in text
+    assert "[knowledge_doc]" not in text and "[skill_improvement]" not in text and "[flywheel_rule]" not in text
+    assert "当前未开启飞书交互卡片审批" in text
+    assert "飞书按钮暂不可用" not in text
+
+
+def test_text_fallback_footer_distinguishes_unverified_and_unavailable(db: FlywheelDB):
+    """未通过自检与监听不可用时，纯文本尾注必须分别如实提示。"""
+    from types import SimpleNamespace
+
+    runner1 = FakeRunner()
+    _card(db, "card-run-unverified", "run-unverified")
+    run1 = _run("run-unverified")
+    unverified_check = SimpleNamespace(status=lambda: {"valid": False})
+    ch1 = _channel(db, runner1, role="serve", listener_state="ready", check=unverified_check)
+    ch1.first_send(card_id="card-run-unverified", run=run1, reasons=["需审批"], portal_url="http://127.0.0.1:8765/runs")
+    assert runner1.sends[0][0] == "text"
+    assert "尚未通过链路自检" in runner1.sends[0][1]
+    assert "飞书按钮暂不可用" not in runner1.sends[0][1]
+
+    runner2 = FakeRunner()
+    _card(db, "card-run-down", "run-down")
+    run2 = _run("run-down")
+    ch2 = _channel(db, runner2, role="serve", listener_state="stopped")
+    ch2.first_send(card_id="card-run-down", run=run2, reasons=["需审批"], portal_url="http://127.0.0.1:8765/runs")
+    assert runner2.sends[0][0] == "text"
+    assert "飞书按钮暂不可用" in runner2.sends[0][1]
+
+
+def test_normalizer_append_reason_avoids_double_punctuation():
+    from ai_flywheel.adapters.runners.normalizers import _append_reason
+
+    assert _append_reason("已有技能覆盖主体流程。", "在现有文件末尾追加小节") == "已有技能覆盖主体流程；在现有文件末尾追加小节"
+    assert _append_reason("原因A；", "；原因B") == "原因A；原因B"
+    assert _append_reason("", "补充说明") == "补充说明"
+
+
+def test_feishu_check_fails_fast_when_interactive_off(tmp_path: Path):
+    import time as _t
+
+    from ai_flywheel.core.feishu_check import FeishuCheckService
+
+    cfg = FlywheelConfig(base_dir=tmp_path)
+    cfg.delivery.feishu_cli = FeishuCliConfig(enabled=True, interactive=False, user_id="ou_me")
+    db = FlywheelDB(tmp_path / "f.db")
+    runner = FakeRunner()
+    runner.target_path = str(tmp_path / "fake.exe")
+    runner.version = lambda: "1.0.68"
+    svc = FeishuCheckService(cfg, runner, {"state": "stopped", "reason": "interactive mode off", "ready": False}, db=db)
+    t0 = _t.monotonic()
+    res = svc.run(wait_seconds=1.0)
+    elapsed = _t.monotonic() - t0
+    assert res["state"] == "failed"
+    assert "interactive mode is off" in res["reason"]
+    assert elapsed < 2.0
+
+
+def test_feishu_check_api_metadata_and_400_when_interactive_off(tmp_path: Path):
+    import shutil as _shutil
+    import sys
+
+    from fastapi.testclient import TestClient
+
+    from ai_flywheel.app import create_app
+    from ai_flywheel.config import load_config
+    from ai_flywheel.runtime import FlywheelRuntime
+
+    _shutil.copytree(REPO_ROOT / "profile", tmp_path / "profile")
+    cfg = load_config(base_dir=tmp_path)
+    cfg.delivery.feishu_cli = FeishuCliConfig(
+        enabled=True,
+        interactive=False,
+        identity="bot",
+        user_id="ou_me",
+        command=sys.executable,
+    )
+    rt = FlywheelRuntime(cfg, skip_fts_sync=True)
+    client = TestClient(create_app(rt))
+
+    r_get = client.get("/api/site/feishu-check")
+    assert r_get.status_code == 200
+    body = r_get.json()
+    assert body["enabled"] is True
+    assert body["interactive"] is False
+    assert body["interaction_ready"] is False
+    assert body["availability"] == "down:config"
+
+    r_post = client.post("/api/site/feishu-check", json={"wait_seconds": 10})
+    assert r_post.status_code == 400
+    assert "交互" in r_post.json()["detail"]
+
+    r_cfg = client.put(
+        "/api/site/config",
+        json={"delivery": {"feishu_cli": {"interactive": True, "approver_open_ids": ["ou_other"]}}},
+    )
+    assert r_cfg.status_code == 200
+    r_get2 = client.get("/api/site/feishu-check")
+    assert r_get2.status_code == 200
+    body2 = r_get2.json()
+    assert body2["interactive"] is True
+    assert body2["interaction_ready"] is True
+
+
+def test_feishu_listener_wake_responds_immediately_on_config_enable():
+    import time as _t
+
+    from ai_flywheel.core.feishu_listen import FeishuClickListener
+
+    enabled = [False]
+    started = []
+
+    class DummyRunner:
+        def consume_args(self):
+            return ["consume"]
+
+        def popen(self, args):
+            started.append(args)
+            raise RuntimeError("stop-after-start")
+
+    listener = FeishuClickListener(
+        DummyRunner(),  # type: ignore[arg-type]
+        on_click=lambda ev: None,
+        should_run=lambda: enabled[0],
+        transient_backoff=5.0,
+    )
+    listener.start()
+    try:
+        deadline = _t.monotonic() + 2.0
+        while _t.monotonic() < deadline and listener.state["reason"] != "interactive mode off":
+            _t.sleep(0.02)
+        assert listener.state["reason"] == "interactive mode off"
+
+        t0 = _t.monotonic()
+        enabled[0] = True
+        listener.wake()
+        deadline = _t.monotonic() + 1.5
+        while _t.monotonic() < deadline and not started:
+            _t.sleep(0.02)
+        assert started and (_t.monotonic() - t0) < 1.5
+    finally:
+        listener.stop()

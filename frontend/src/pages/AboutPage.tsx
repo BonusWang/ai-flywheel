@@ -119,7 +119,7 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
       no: '01',
       title: '启程激活',
       figure: <Figure n={metrics.preflight_activations} unit="次预检" />,
-      text: '任务开局通过 preflight_activate 注入反偷懒策略、协作偏好与命中先例，返回不可伪造的哈希回执。',
+      text: '任务开局通过 preflight_activate 注入反偷懒契约、协作偏好与命中先例，并签发不可伪造的哈希回执；交付时由 record_outcome 执行 real / test / static 证据门禁，没有真实证据不给过。',
       note:
         metrics.probed_skills_count > 0
           ? `当前已探测 ${metrics.probed_skills_count} 个本地可路由技能`
@@ -129,21 +129,21 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
       no: '02',
       title: '异常与复盘',
       figure: <Figure n={metrics.open_retro_count} unit="条待复盘" />,
-      text: '执行中触发重复报错死循环、高风险操作或验证回归时，自动记录异常信号并推入复盘队列。',
+      text: '执行中触发重复报错死循环、高风险操作或验证回归时，自动记录异常信号并推入复盘队列；普通失误先按根因聚类，满 3 次才晋升为规则。',
       note: `累计登记 ${metrics.sessions_total} 个会话 · 待处理 ${metrics.sessions_pending} 个`,
     },
     {
       no: '03',
       title: '规则沉淀',
       figure: <Figure n={activeRules} unit="条活跃规则" />,
-      text: '新规则先以「待自然验证」立即生效防复发，经跨会话自然真实验证后晋升「已验证生效」，复发即自动回退修订。',
+      text: '新规则先以「试运行」立即生效防复发，经跨会话自然真实验证后晋升「已验证生效」；分歧与反例保留不覆盖，并按 30/90/180 天新鲜度衰减、周五蒸馏持续做减法。',
       note: `已验证 ${verifiedRules} 条 · 待自然验证 ${unverifiedRules} 条`,
     },
     {
       no: '04',
       title: '闭环运行',
       figure: <Figure n={metrics.workflow_runs_total} unit="次工作流" />,
-      text: 'P00–P07 自治飞轮定时或按需审查会话，生成可审批写入 Diff，将有效规律安全回写至知识库与防线。',
+      text: 'P00–P07 受控沉淀流水线定时或按需审查会话：P02/P03 严格只读，审批通过后 P04 才执行唯一受控写入，把有效规律安全回写至知识库与防线。',
       note: '同时暴露 MCP、Hook、REST API 与 /llms.txt',
     },
   ]
@@ -160,12 +160,16 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
             <span className="text-accent">把踩过的坑变成防线。</span>
           </h1>
           <p className="mt-5 max-w-[40em] text-[15.5px] leading-[1.85] text-ink-3 xl:text-[16.5px]">
-            {brand.motto}。围绕「<span className="font-medium text-ink">{brand.subtitle}</span>
-            」，把跨客户端的{' '}
+            {brand.motto}。作为面向多 AI 编码工具的本地优先「
+            <span className="font-medium text-ink">治理与进化控制面</span>
+            」，以执行纪律与实证门禁、抗熵增进化引擎和受控审批流水线，围绕「
+            <span className="font-medium text-ink">{brand.subtitle}</span>
+            」把跨客户端的{' '}
             <span className="num font-semibold text-ink">{metrics.preflight_activations}</span>{' '}
             次预检激活与{' '}
             <span className="num font-semibold text-ink">{activeRules}</span>{' '}
-            条先例规则收拢为一套实时可验证的协作飞轮。
+            条先例规则收拢成一套实时可验证的协作飞轮——与 OpenViking / Mem0
+            等上下文数据库正交互补，而不是又一个记忆黑盒。
           </p>
         </div>
         <div className="flex flex-wrap gap-3 lg:pb-2">
@@ -174,7 +178,7 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
             onClick={() => onNavigate('runs')}
             className="inline-flex h-10 items-center gap-1.5 rounded-[var(--radius-control)] bg-accent px-4 text-[14px] font-semibold text-accent-contrast transition-colors hover:bg-accent-ink"
           >
-            查看每日沉淀 <ArrowRight className="w-4 h-4" />
+            查看沉淀与审批 <ArrowRight className="w-4 h-4" />
           </button>
           <button
             type="button"
@@ -390,7 +394,8 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
       {/* 4. Boundary Notice Well & Minimal Footer (matching AIHOT) */}
       <p className="mt-14 well rounded-[var(--radius-card)] px-5 py-4 text-[13px] leading-[1.85] text-ink-3">
         <strong className="font-semibold text-ink">{brand.name}</strong>{' '}
-        采用「外层接入与模型路由 × 公共动态飞轮引擎 × 私有个人配置层 × 长期知识库」3+1 分层解耦架构：本引擎只承载通用方法论、先例路由、回执验真与 P00–P07 审批工作流，私有偏好与个人知识库通过外部目录挂载并默认开启审批写门禁；公开导出接口（
+        是面向多 AI 编码工具的本地优先「治理与进化控制面」：以执行纪律与实证门禁、抗熵增进化引擎和受控审批流水线守住交付质量与资产新鲜度，与 OpenViking / Mem0
+        等上下文数据库、记忆引擎正交互补。工程上采用「外层接入与模型路由 × 公共动态飞轮引擎 × 私有个人配置层 × 长期知识库」3+1 分层解耦架构：本引擎只承载通用方法论、先例路由、回执验真与 P00–P07 审批工作流，私有偏好与个人知识库通过外部目录挂载并默认开启审批写门禁；公开导出接口（
         <a
           href="/api/v1/overview"
           target="_blank"

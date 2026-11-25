@@ -25,7 +25,7 @@ import {
   PHASE_LABELS,
   TRIGGER_LABELS,
 } from '../lib/labels'
-import type { AutomationsSnapshot } from '../types'
+import type { AutomationsSnapshot, DreamResult, DreamStatusPayload } from '../types'
 
 interface Props {
   refreshToken: number
@@ -105,6 +105,9 @@ export const AutomationsPage: React.FC<Props> = ({
   const [togglingScheduler, setTogglingScheduler] = useState(false)
   const [runningPhase, setRunningPhase] = useState<string | null>(null)
   const [recovering, setRecovering] = useState(false)
+  const [dreamStatus, setDreamStatus] = useState<DreamStatusPayload | null>(null)
+  const [dreamResult, setDreamResult] = useState<DreamResult | null>(null)
+  const [dreamBusy, setDreamBusy] = useState(false)
 
   const syncDraftFromSnapshot = useCallback((snap: AutomationsSnapshot) => {
     const expr = snap.scheduler.cron || '0 20 * * *'
@@ -118,14 +121,20 @@ export const AutomationsPage: React.FC<Props> = ({
   const load = useCallback(
     async (syncEditor = false) => {
       try {
-        const snap = await api.automations()
+        const [snap, dream] = await Promise.all([
+          api.automations(),
+          api.getDream().catch(() => null),
+        ])
         setData(snap)
+        if (dream) {
+          setDreamStatus(dream)
+        }
         if (syncEditor) {
           syncDraftFromSnapshot(snap)
         }
         setError(null)
       } catch (e: any) {
-        setError(e?.message || '加载自动化任务状态失败')
+        setError(e?.message || '加载自动化调度状态失败')
       } finally {
         setLoading(false)
       }
@@ -285,6 +294,30 @@ export const AutomationsPage: React.FC<Props> = ({
     }
   }
 
+  const handleDreamAction = async (dryRun: boolean) => {
+    if (dreamBusy) return
+    setDreamBusy(true)
+    setError(null)
+    setNotice(null)
+    try {
+      const res = await api.runDream(dryRun)
+      setDreamResult(res.result)
+      setNotice(
+        dryRun
+          ? `只读蒸馏预览完成（${res.result.period_key}）：候选休眠 ${res.result.auto_dormant_rules.length} 条规则，超期经验卡 ${res.result.expired_cards.length} 篇，精简建议 ${res.result.proposals.length} 项（未修改数据）。`
+          : `分层蒸馏执行完成（${res.result.period_key}）：已休眠 ${res.result.auto_dormant_rules.length} 条零命中规则，标记 ${res.result.expired_cards.length} 篇过期经验卡并刷新核心索引卡。`
+      )
+      await load(false)
+      if (!dryRun) {
+        onGlobalRefresh()
+      }
+    } catch (e: any) {
+      setError(e?.message || '执行分层蒸馏失败')
+    } finally {
+      setDreamBusy(false)
+    }
+  }
+
   const cronDirty = useMemo(() => {
     if (!data) return false
     return cronDraft.trim() !== (data.scheduler.cron || '').trim()
@@ -342,9 +375,9 @@ export const AutomationsPage: React.FC<Props> = ({
       {/* Page Header */}
       <header className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h1 className="text-[22px] font-bold tracking-tight text-ink">自动化任务</h1>
+          <h1 className="text-[22px] font-bold tracking-tight text-ink">自动化调度</h1>
           <p className="mt-1 text-[13px] text-ink-3">
-            后台调度器、每日定时沉淀批、守护巡检与自动化执行记录（统一上海时区 Asia/Shanghai）。
+            后台调度器、每日定时沉淀批、周五分层蒸馏与守护巡检（统一上海时区 Asia/Shanghai）。
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -704,10 +737,83 @@ export const AutomationsPage: React.FC<Props> = ({
               </div>
             </div>
           </div>
+          {/* Friday Dream Consolidation Control Card */}
+          {(() => {
+            const activeDream = dreamResult || dreamStatus?.preview
+            const latestEv = dreamStatus?.latest_event
+            return (
+              <div className="rounded-[var(--radius-tile)] border border-line bg-bg-sunk/40 p-4 sm:p-5 space-y-3">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <Sparkles className="w-4 h-4 text-accent" />
+                      <h3 className="text-[14px] font-semibold text-ink">
+                        周五分层蒸馏与减法（Dream Consolidation）
+                      </h3>
+                      {activeDream?.dry_run && (
+                        <span className="chip text-[11px]">只读预览态</span>
+                      )}
+                    </div>
+                    <p className="mt-1 text-[12px] text-ink-3">
+                      自动休眠 14 天零命中的试运行规则、扫描超期经验卡、识别触发词重合规则与 21 天零调用 Skill。
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={dreamBusy}
+                      onClick={() => handleDreamAction(true)}
+                      className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[var(--radius-control)] border border-line bg-surface text-[12px] font-medium text-ink-2 hover:text-ink disabled:opacity-50"
+                    >
+                      {dreamBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
+                      <span>预览蒸馏建议（只读）</span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={dreamBusy}
+                      onClick={() => handleDreamAction(false)}
+                      className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[var(--radius-control)] bg-accent text-accent-contrast text-[12px] font-semibold hover:opacity-95 disabled:opacity-50"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                      <span>立即执行蒸馏</span>
+                    </button>
+                  </div>
+                </div>
+
+                {activeDream && (
+                  <div className="flex flex-wrap gap-3 text-[12px] text-ink-2 num">
+                    <span>周期：{activeDream.period_key}</span>
+                    <span>·</span>
+                    <span>待休眠规则：{activeDream.auto_dormant_rules.length} 条</span>
+                    <span>·</span>
+                    <span>超期经验卡：{activeDream.expired_cards.length} 篇</span>
+                    <span>·</span>
+                    <span>规则合并候选：{activeDream.merge_candidates.length} 对</span>
+                    <span>·</span>
+                    <span>Skill 告警：{activeDream.skill_alerts.length} 个</span>
+                    <span>·</span>
+                    <span>未决分歧：{activeDream.open_dissents_count} 条</span>
+                  </div>
+                )}
+
+                {activeDream && activeDream.proposals.length > 0 && (
+                  <ul className="list-disc pl-5 space-y-1 text-[12.5px] text-ink-2">
+                    {activeDream.proposals.map((item, idx) => (
+                      <li key={idx}>{item}</li>
+                    ))}
+                  </ul>
+                )}
+
+                {latestEv && (
+                  <div className="pt-2 border-t border-line-soft text-[11.5px] text-ink-4 num">
+                    最近正式执行（{formatShanghaiTimestamp(latestEv.created_at)}）：{latestEv.summary}
+                  </div>
+                )}
+              </div>
+            )
+          })()}
         </div>
       </section>
-
-      {/* Card 3: Background Daemon Watchdogs */}
       <section
         id="automation-sec-daemons"
         className="card p-5 sm:p-6 space-y-4 scroll-mt-6"
@@ -816,7 +922,7 @@ export const AutomationsPage: React.FC<Props> = ({
               <span>自动化执行记录</span>
             </h2>
             <p className="mt-0.5 text-[12.5px] text-ink-3">
-              展示近期定时触发与手动触发的沉淀批次，点击可跳转至「每日沉淀」查看八节点详情与审批。
+              展示近期定时触发与手动触发的沉淀批次，点击可跳转至「沉淀与审批」查看八节点详情与审批。
             </p>
           </div>
           <div className="flex items-center gap-2">

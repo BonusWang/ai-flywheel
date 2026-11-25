@@ -34,6 +34,9 @@ class MigrationsMixin:
             self._migrate_to_v2(conn, preexisting=preexisting)
             self._migrate_to_v3(conn, preexisting=preexisting)
             self._migrate_approval_recovery(conn)
+            # Bi-temporal rule lineage: additive columns only, so a database
+            # written before lineage existed keeps every row it had.
+            self._migrate_rule_lineage(conn)
             # The delivery ledger gets its managed-delivery columns here, not in
             # the Feishu layer: the schema must be the same whether or not the
             # Feishu channel is enabled at startup.
@@ -266,6 +269,21 @@ class MigrationsMixin:
         self._ensure_column(conn, "decision_cards", "failed_node", "TEXT")
         # A lock row without expiry can never be taken over nor expired; treat as debris.
         conn.execute("DELETE FROM workflow_lock WHERE expires_at IS NULL")
+
+    def _migrate_rule_lineage(self, conn: sqlite3.Connection) -> None:
+        """The bi-temporal rule lineage columns (idempotent, additive).
+
+        ``supersedes_rule_id`` records which rule a new one replaces;
+        ``effective_from`` / ``effective_to`` bracket the window in which the
+        rule is in force. Existing rows keep every value they had; their lineage
+        stays NULL until a lifecycle transition fills it in.
+        """
+        self._ensure_column(conn, "rules", "supersedes_rule_id", "TEXT")
+        self._ensure_column(conn, "rules", "effective_from", "TEXT")
+        self._ensure_column(conn, "rules", "effective_to", "TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rules_supersedes ON rules(supersedes_rule_id)"
+        )
 
     def _ensure_outbox_columns(self, conn: sqlite3.Connection) -> None:
         """The managed-delivery columns of ``card_deliveries`` (idempotent).

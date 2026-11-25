@@ -4,15 +4,21 @@ import type {
   AutomationsSnapshot,
   ConfigSaveResponse,
   ConnectPayload,
+  CoreCardPayload,
   DissentRecord,
+  DreamResult,
+  DreamStatusPayload,
+  FeishuCheckStatus,
   GrowthMetricsPayload,
   KnowledgeDocSummary,
   MistakeObservation,
+  OutcomeRecord,
   OverviewResponse,
   PreflightResponse,
   RetroItem,
   RuleRecord,
   SessionRecord,
+  SkillAssetRecord,
   SkillPreview,
   WorkflowLock,
   WorkflowRunRecord,
@@ -143,10 +149,21 @@ export const api = {
     }),
 
   growthMetrics: () => req<GrowthMetricsPayload>('/api/site/growth-metrics'),
-  coreCard: () =>
-    req<{ path: string; lines: number; bytes: number; content: string; source?: string }>(
-      '/api/site/core-card'
+  coreCard: () => req<CoreCardPayload>('/api/site/core-card'),
+  refreshCoreCard: () =>
+    req<CoreCardPayload>('/api/site/core-card/refresh', { method: 'POST' }),
+  listOutcomes: () => req<{ outcomes: OutcomeRecord[] }>('/api/site/outcomes'),
+  listSkills: () => req<{ skills: SkillAssetRecord[]; probed_count: number }>('/api/site/skills'),
+  listDissents: (status?: string) =>
+    req<{ dissents: DissentRecord[] }>(
+      status ? `/api/site/dissents?status=${encodeURIComponent(status)}` : '/api/site/dissents'
     ),
+  getDream: () => req<DreamStatusPayload>('/api/site/dream'),
+  runDream: (dryRun = false) =>
+    req<{ result: DreamResult; latest_event: AuditEventRecord | null }>('/api/site/dream/run', {
+      method: 'POST',
+      body: JSON.stringify({ dry_run: dryRun }),
+    }),
 
   listRetro: () => req<{ items: RetroItem[] }>('/api/site/retro'),
   updateRetroStatus: (retroId: string, status: RetroItem['status']) =>
@@ -173,10 +190,12 @@ export const api = {
 
   listKnowledge: () =>
     req<{ sink_type: string; root: string; documents: KnowledgeDocSummary[] }>('/api/site/knowledge'),
-  feishuCheckStatus: () =>
-    req<{ state: string; valid?: boolean; reason?: string; listener?: { state: string; reason: string } | null }>(
-      '/api/site/feishu-check'
-    ),
+  feishuCheckStatus: () => req<FeishuCheckStatus>('/api/site/feishu-check'),
+  startFeishuCheck: (waitSeconds = 120) =>
+    req<{ started: boolean; wait_seconds: number }>('/api/site/feishu-check', {
+      method: 'POST',
+      body: JSON.stringify({ wait_seconds: waitSeconds }),
+    }),
   readKnowledgeDoc: (path: string) =>
     req<{ doc_path: string; content: string; sha256: string }>(
       `/api/site/knowledge/doc?path=${encodeURIComponent(path)}`

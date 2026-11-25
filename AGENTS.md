@@ -27,7 +27,9 @@ policies, the knowledge sink is pluggable, and the wiki gate is contract-driven.
 
 | Path | Owns |
 |---|---|
-| `backend/ai_flywheel/core/` | The domain engine: `orchestrator` (the P00–P07 state machine), `automation` (hot-reloadable Shanghai-tz scheduler & daemon control plane), `activation` (preflight & rules), `triage` (session triage), `dream` (weekly distillation), `core_card` (the derived index card), `privacy`, `receipts`, `heartbeat`, `feishu_*` (card / channel / listener / self-check), `time_utils` |
+| `backend/ai_flywheel/core/` | The domain engine: `orchestrator` (thin compatibility facade re-exporting `core/pipeline/`), `approval_channel` (the channel contract the orchestrator and runtime depend on), `automation` (hot-reloadable Shanghai-tz scheduler & daemon control plane), `activation` (preflight & rules), `triage` (session triage), `dream` (weekly distillation & read-only preview), `core_card` (the derived index card), `doctor` (read-only environment diagnostics), `onboarding` (`init-client` MCP config merger), `privacy`, `receipts`, `heartbeat`, `time_utils`. The `feishu_*` modules here are thin re-export shims; the implementation lives under `adapters/channels/feishu/` |
+| `backend/ai_flywheel/core/pipeline/` | The P00–P07 state machine: `constants` (node registry, source labels, pipeline errors), `events` (the SSE broker), `helpers` (candidate normalisation, promotion, routing), `recovery` (heartbeat, lock checkpoints, the terminal paths), `git_commit` (opt-in P04 local Git trail), `coordinator` (`WorkflowOrchestrator`, the stage sequence). `core/orchestrator.py` re-exports this package and is the seam a monkeypatch targets |
+| `backend/ai_flywheel/adapters/channels/` | Outbound notification & approval channels: `feishu/` (`card`, `channel`, `listen`, `check`) and `webhook.py` (vendor-neutral sanitized JSON webhook with optional HMAC-SHA256 signing) |
 | `backend/ai_flywheel/adapters/runners/` | The execution layer: `clients` (CLI + OpenAI-compatible API), `heuristic` (dry-run), `contracts` (the wire contract + diagnostics), `prompts`, `normalizers`, `outcomes` |
 | `backend/ai_flywheel/adapters/wiki/` | The mounted-wiki contract: `schema` (`.wiki-schema.md`), `router` (routing candidates & evidence), `gate` (pre-write validation), `validator`, `t5_adapter`, `postflight` |
 | `backend/ai_flywheel/adapters/knowledge.py` | The knowledge sink: privacy gate → schema gate → atomic LF write → read-back verification → FTS refresh |
@@ -35,7 +37,7 @@ policies, the knowledge sink is pluggable, and the wiki gate is contract-driven.
 | `backend/ai_flywheel/adapters/lark_cli.py`, `adapters/delivery.py` | Outbound delivery: the native `lark-cli` invocation and the delivery adapter |
 | `backend/ai_flywheel/storage/db/` | SQLite, split per repository (`workflow_repo`, `session_repo`, `rule_repo`, `knowledge_repo`, `asset_repo`, `audit_repo`) + `schema.py` / `migrations.py` |
 | `backend/ai_flywheel/storage/` | `fs_store` (immutable receipts), `outbox` (managed delivery outbox), `clock` (injectable clock), `seed` |
-| `backend/ai_flywheel/` | `app.py` (REST + SSE + lifespan), `mcp_server.py`, `cli.py`, `config.py`, `models.py`, `runtime.py` (the dependency container) |
+| `backend/ai_flywheel/` | `app.py` (assembly: lifespan, MCP mount, CORS, SSE, SPA hosting), `routes/` (the portal API split by domain: `overview`, `governance`, `runs`, `automations`), `mcp_server.py`, `cli.py`, `config.py`, `models.py`, `runtime.py` (the dependency container) |
 | `frontend/src/` | The console: `pages/` (Home, Workflows, Automations, Rules, Connect, About), `components/`, `api.ts`, `types.ts`, `lib/labels.ts` |
 | `profile/` | Methodology policies and the portal branding — decoupled from the knowledge base |
 | `openspec/` | Spec-driven development: `config.yaml` (injected into every generated artifact), `specs/` (the baseline), `changes/` (in flight and archived) |
@@ -59,7 +61,7 @@ something the contract does not list is a bug, even when the batch still ends `P
 | `P01_BEGIN` | 独占启动 | sessions, budget | the workflow lock | One exclusive lock per run; the admission budget is decided here |
 | `P02_REVIEW` | 全文审查 | the admitted sessions | **the run record only** | **Read-only**: mistakes and dissents are *candidates* and stay in the node payload until the batch is approved |
 | `P03_ROUTE_PLAN` | 路由与写入计划 | rules, skills, the mounted wiki contract | **the run record only** | **Read-only** for knowledge / observations / dissents / skills: it produces a *plan*, never a write |
-| `P04_WRITE_VERIFY` | 受控写入与验收 | the plan | **the one controlled write stage** | The only stage that writes knowledge documents, rules and Skills — and the first stage that may persist mistake observations and dissent records (after approval) |
+| `P04_WRITE_VERIFY` | 受控写入与验收 | the plan | **the one controlled write stage** | The only stage that writes knowledge documents, rules and Skills — and the first stage that may persist mistake observations and dissent records (after approval). With `knowledge_sink.auto_git_commit` on, it also commits exactly the written files to their local Git repository (never a push; a Git failure is audited, never fatal) |
 | `P05_SETTLE` | 台账与队列结算 | the run record | session status, the `retro_queue`, the core card | Idempotent settlement: reviewed sessions become `processed`, unreviewed ones go back to `pending`; one core-card refresh; the FTS index is rebuilt **once for the whole batch** (not once per document) |
 | `P06_REPORT` | 机器报告与摘要 | everything so far | the run digest | Read-only for the knowledge base |
 | `P07_DELIVER` | 交付与终态释锁 | the digest | delivery records, the ask card, the lock | The terminal state: the exclusive lock is released here, never earlier |
@@ -82,7 +84,7 @@ written" and "half of it was written" must never look the same.
 | What date is "today"? | `core/time_utils.py` — every product-facing date is a **Shanghai** date, never a host date |
 | What counts as a secret? | `core/privacy.py` → `SECRET_PATTERNS` — one set shared by the write gate, the receipt store and the card renderer |
 | What does the run look like? | The `workflow_runs` row plus its normalized child tables (`workflow_nodes`, `planned_writes`, `run_sessions`, `decision_cards`) — the portal, the API and MCP read the same projection |
-| Which node ids exist? | `core/orchestrator.py` → `NODE_TEMPLATES` (the frontend labels cover exactly these ids) |
+| Which node ids exist? | `core/pipeline/constants.py` → `NODE_TEMPLATES` (re-exported by `core/orchestrator.py`; the frontend labels cover exactly these ids) |
 
 If two layers disagree about one of these, one of them is wrong — and the invariant test
 in `tests/test_arch_invariants.py` says which.
@@ -157,7 +159,8 @@ This repository is spec-driven. The flow is **Explore → Propose → Apply → 
 
 ### Hot-file discipline
 
-`core/orchestrator.py`, `core/feishu_*.py`, `adapters/runners/*` and `storage/db/*` are hot
+`core/pipeline/*` (the P00–P07 state machine; `core/orchestrator.py` is only its
+facade), `core/feishu_*.py`, `adapters/runners/*` and `storage/db/*` are hot
 files: several people and agents edit them. **Serialize the edits** — do not stack
 concurrent changes on the same pipeline module before the previous one is archived. When
 two changes must touch the same hot file, land one, archive it, then start the next.

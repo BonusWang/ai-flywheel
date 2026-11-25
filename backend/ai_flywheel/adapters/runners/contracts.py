@@ -234,13 +234,18 @@ def _clean_title(raw_title: str, fallback_text: str = "", fallback_label: str = 
     return fallback_label
 
 
+_PRIVATE_TAG_STRIP_RE = re.compile(r"<private>.*?</private>", re.DOTALL | re.IGNORECASE)
+
+
 def _slugify(text: str) -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9一-鿿]+", "-", text).strip("-").lower()
+    stripped = _PRIVATE_TAG_STRIP_RE.sub("", text or "")
+    cleaned = re.sub(r"[^a-zA-Z0-9一-鿿]+", "-", stripped).strip("-").lower()
     return cleaned[:42] or "session-lesson"
 
 
 def _ascii_slug(text: str, fallback: str = "custom-workflow") -> str:
-    cleaned = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    stripped = _PRIVATE_TAG_STRIP_RE.sub("", text or "")
+    cleaned = re.sub(r"[^a-z0-9]+", "-", stripped.lower()).strip("-")
     if len(cleaned) < 2:
         return fallback
     return cleaned[:48]

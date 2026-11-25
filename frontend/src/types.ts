@@ -30,6 +30,9 @@ export interface RuleRecord {
   last_hit_at?: string | null
   dormant_at?: string | null
   root_cause_key?: string | null
+  supersedes_rule_id?: string | null
+  effective_from?: string | null
+  effective_to?: string | null
   created_at: string
   updated_at: string
 }
@@ -280,6 +283,101 @@ export interface KnowledgeDocSummary {
   title: string
   size_bytes: number
   excerpt: string
+  freshness_tier?: 'volatile' | 'evolving' | 'evergreen' | string
+  last_verified_at?: string | null
+  valid_until?: string | null
+  freshness_state?: string
+  is_expired?: boolean
+  surface_count?: number
+  helped_count?: number
+}
+
+export interface SkillAssetRecord {
+  skill_name: string
+  source_dir: string
+  description: string
+  origin: string
+  sha256: string
+  version: number
+  invoke_count: number
+  verified_pass_count: number
+  fail_count: number
+  last_used_at?: string | null
+  health_state: string
+  last_run_id?: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface OutcomeCheckItem {
+  name: string
+  result: 'pass' | 'fail' | 'unknown' | 'skipped'
+  kind: 'real' | 'test' | 'static' | 'unknown'
+  required?: boolean
+  rule_id?: string | null
+  evidence?: string[]
+  notes?: string
+}
+
+export interface OutcomeRecord {
+  outcome_id: string
+  session_key: string
+  client: string
+  session_id: string
+  turn_id: string
+  preflight_receipt_id?: string | null
+  origin: string
+  status: 'success' | 'partial' | 'failed' | 'unverified'
+  summary: string
+  checks: OutcomeCheckItem[]
+  applied_rule_ids: string[]
+  used_skills: string[]
+  artifacts: string[]
+  used_knowledge_paths: string[]
+  receipt_hash: string
+  revalidation_effects: Array<Record<string, any>>
+  created_at: string
+}
+
+export interface CoreCardPayload {
+  path: string
+  lines: number
+  bytes: number
+  content: string
+  source?: string
+}
+
+export interface DreamResult {
+  dry_run?: boolean
+  period_key: string
+  auto_dormant_rules: Array<{ rule_id: string; title: string; created_at?: string }>
+  expired_cards: Array<{
+    doc_path: string
+    freshness_tier?: string
+    valid_until?: string | null
+    freshness_state?: string
+  }>
+  merge_candidates: Array<{
+    rule_a: string
+    title_a: string
+    rule_b: string
+    title_b: string
+    trigger_overlap: number
+  }>
+  skill_alerts: Array<{
+    skill_name: string
+    reason: string
+    kind: string
+  }>
+  open_dissents_count: number
+  proposals: string[]
+  snapshot: Record<string, any> | null
+}
+
+export interface DreamStatusPayload {
+  latest_event: AuditEventRecord | null
+  recent_events: AuditEventRecord[]
+  preview: DreamResult
 }
 
 export interface McpToolSummary {
@@ -414,4 +512,21 @@ export interface AutomationsSnapshot {
   }
   lock: WorkflowLock | null
   recent_runs: AutomationRunSummary[]
+}
+
+export interface FeishuCheckStatus {
+  enabled?: boolean
+  interactive?: boolean
+  interaction_ready?: boolean
+  availability?: string
+  state?: string
+  running?: boolean
+  valid?: boolean
+  reason?: string
+  at?: string
+  listener?: {
+    state: string
+    reason: string
+    ready?: boolean
+  } | null
 }

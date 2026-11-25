@@ -1,8 +1,10 @@
 """What happens after the document was written.
 
-Two scripts of the mounted Wiki may judge the result: the topic lint (a topic card only)
-and the D2 postflight (the Wiki's own index/validator sync). Both are optional; when the
-sink requires them, a missing script is an error rather than a silent skip.
+Two hooks of the mounted contract may judge the result: the topic lint (a topic card only)
+and the post-write hook (the contract's own index/validator sync, configured through the
+neutral ``postflight_hook_script`` name or the legacy ``wiki_d2_postflight_script`` alias).
+Both are optional; when the sink requires them, a missing script is an error rather than a
+silent skip.
 """
 from __future__ import annotations
 
@@ -136,11 +138,14 @@ def run_postflight(
     root: Path,
     evidence_dir: Path,
 ) -> None:
-    """Run the Wiki's D2 postflight script over the written document."""
-    script = sink.wiki_d2_postflight_script.strip()
+    """Run the contract's D2 postflight script over the written document."""
+    script = sink.effective_postflight_script
     if not script:
         if sink.wiki_gate_require_scripts:
-            result.error("D2_SCRIPT_MISSING", "wiki_d2_postflight_script is not configured.")
+            result.error(
+                "D2_SCRIPT_MISSING",
+                "postflight_hook_script (or the legacy wiki_d2_postflight_script) is not configured.",
+            )
         else:
             result.postflight = {"status": "skipped", "reason": "d2_script_not_configured"}
         return
@@ -213,7 +218,7 @@ def resync_after_rollback(
     evidence_dir: Path,
 ) -> dict[str, Any]:
     """Re-run index sync only after a failed write has been rolled back."""
-    script = sink.wiki_d2_postflight_script.strip()
+    script = sink.effective_postflight_script
     if not script:
         return {"status": "skipped", "reason": "d2_script_not_configured"}
     python = sink.wiki_python.strip() or sys.executable

@@ -11,6 +11,13 @@ from pathlib import Path
 import uvicorn
 
 from ai_flywheel.app import create_app
+from ai_flywheel.config import load_config
+from ai_flywheel.core.doctor import PASS, run_doctor
+from ai_flywheel.core.onboarding import (
+    SUPPORTED_CLIENTS,
+    apply_init_client,
+    plan_init_client,
+)
 from ai_flywheel.runtime import FlywheelRuntime
 from ai_flywheel.storage.seed import seed_demo_data
 
@@ -50,7 +57,88 @@ def main(argv: list[str] | None = None) -> int:
     p_fcheck.add_argument("--url", default="http://127.0.0.1:8765", help="Base URL of the running ai-flywheel serve")
     p_fcheck.add_argument("--wait", type=int, default=120, help="Seconds the server waits for your click (long mode: 600)")
 
+    p_doctor = sub.add_parser(
+        "doctor",
+        help="Read-only diagnostics: is this installation able to run as configured?",
+    )
+    p_doctor.add_argument("--json", action="store_true", help="Print the full report as JSON")
+
+    p_init = sub.add_parser(
+        "init-client",
+        help="Render (dry-run) or merge the ai-flywheel MCP entry into a client configuration",
+    )
+    p_init.add_argument("client", choices=list(SUPPORTED_CLIENTS), help="Which MCP client to configure")
+    p_init.add_argument(
+        "--transport",
+        choices=["http", "stdio"],
+        default=None,
+        help="MCP transport (default: the client's native one)",
+    )
+    p_init.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the merged configuration (a .bak backup is kept); default is a dry-run",
+    )
+    p_init.add_argument("--target", default=None, help="Explicit configuration file path")
+    p_init.add_argument("--json", action="store_true", help="Print the result as JSON")
+
     args = parser.parse_args(argv)
+
+    if args.command == "doctor":
+        try:
+            cfg = load_config(config_path=args.config, base_dir=args.base_dir)
+        except Exception as exc:
+            print(f"cannot load configuration: {exc}", file=sys.stderr)
+            return 1
+        report = run_doctor(cfg)
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            print(f"AI Flywheel doctor · v{report['version']}")
+            print(f"{'STATUS':<7} {'CHECK':<15} SUMMARY")
+            for check in report["checks"]:
+                print(f"{check['status']:<7} {check['name']:<15} {check['summary']}")
+                if check["status"] != PASS:
+                    print(f"{'':<7} {'':<15} {check['detail']}")
+            counts = report["counts"]
+            verdict = "OK" if report["ok"] else "FAILED"
+            print(
+                f"{verdict}: {counts['PASS']} passed, {counts['WARN']} warning(s), "
+                f"{counts['FAIL']} failure(s)"
+            )
+        return 0 if report["ok"] else 1
+
+    if args.command == "init-client":
+        try:
+            cfg = load_config(config_path=args.config, base_dir=args.base_dir)
+        except Exception as exc:
+            print(f"cannot load configuration: {exc}", file=sys.stderr)
+            return 2
+        run = apply_init_client if args.apply else plan_init_client
+        result = run(cfg, args.client, transport=args.transport, target=args.target)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        elif not result["ok"]:
+            print(f"init-client failed: {result['error']}", file=sys.stderr)
+        else:
+            print(f"client:    {result['client']} ({result['label']})")
+            print(f"transport: {result['transport']}")
+            print(f"target:    {result['target']}")
+            print(f"format:    {result['format']}")
+            print(f"mode:      {result['mode']}")
+            print(f"action:    {result['action']}")
+            print(f"entry:     {json.dumps(result['entry'], ensure_ascii=False)}")
+            merge = result["merge"]
+            print(
+                f"merge:     target_exists={merge['target_exists']} "
+                f"existing_servers={len(merge['existing_servers'])} "
+                f"replaces_entry={merge['replaces_existing_entry']}"
+            )
+            if result["backup"]:
+                print(f"backup:    {result['backup']}")
+            print("entry preview:")
+            print(result["entry_preview"], end="" if result["entry_preview"].endswith("\n") else "\n")
+        return 0 if result["ok"] else 1
 
     if args.command == "feishu-check":
         base = args.url.rstrip("/")

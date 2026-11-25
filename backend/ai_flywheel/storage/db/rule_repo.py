@@ -26,8 +26,9 @@ class RuleRepoMixin:
                     forbidden_routes_json, applicable_skills_json, source_pointers_json,
                     status, version, origin_session_key, hit_count, natural_pass_count,
                     recurrence_count, revalidation_history_json, last_hit_at, dormant_at,
-                    root_cause_key, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    root_cause_key, supersedes_rule_id, effective_from, effective_to,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(rule_id) DO UPDATE SET
                     title = excluded.title,
                     domain = excluded.domain,
@@ -46,6 +47,9 @@ class RuleRepoMixin:
                     last_hit_at = COALESCE(excluded.last_hit_at, rules.last_hit_at),
                     dormant_at = excluded.dormant_at,
                     root_cause_key = COALESCE(excluded.root_cause_key, rules.root_cause_key),
+                    supersedes_rule_id = COALESCE(excluded.supersedes_rule_id, rules.supersedes_rule_id),
+                    effective_from = COALESCE(excluded.effective_from, rules.effective_from),
+                    effective_to = excluded.effective_to,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -68,6 +72,9 @@ class RuleRepoMixin:
                     rule.last_hit_at,
                     rule.dormant_at,
                     rule.root_cause_key,
+                    rule.supersedes_rule_id,
+                    rule.effective_from,
+                    rule.effective_to,
                     rule.created_at,
                     now,
                 ),
@@ -96,6 +103,9 @@ class RuleRepoMixin:
             last_hit_at=row["last_hit_at"] if "last_hit_at" in keys else None,
             dormant_at=row["dormant_at"] if "dormant_at" in keys else None,
             root_cause_key=row["root_cause_key"] if "root_cause_key" in keys else None,
+            supersedes_rule_id=row["supersedes_rule_id"] if "supersedes_rule_id" in keys else None,
+            effective_from=row["effective_from"] if "effective_from" in keys else None,
+            effective_to=row["effective_to"] if "effective_to" in keys else None,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -451,10 +461,10 @@ class RuleRepoMixin:
                 conn.execute(
                     """
                     UPDATE rules
-                    SET status = ?, dormant_at = ?, updated_at = ?
+                    SET status = ?, dormant_at = ?, effective_to = ?, updated_at = ?
                     WHERE rule_id = ?
                     """,
-                    (RuleStatus.DORMANT.value, now, now, r["rule_id"]),
+                    (RuleStatus.DORMANT.value, now, now, now, r["rule_id"]),
                 )
                 conn.execute(
                     """

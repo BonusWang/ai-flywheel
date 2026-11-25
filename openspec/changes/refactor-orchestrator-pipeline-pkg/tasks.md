@@ -1,0 +1,14 @@
+# Tasks: refactor-orchestrator-pipeline-pkg
+
+- [x] 1. 新增 `backend/ai_flywheel/core/pipeline/` 包：`constants`（节点表、来源标签、错误与失败调用遥测）、`events`（`EventBroker`）、`helpers`（候选归一化、双轨晋升、路由与部分写入）、`recovery`（心跳、锁检查点、三条终态路径）、`coordinator`（`WorkflowOrchestrator`）、`git_commit`（可选本地提交）与包入口；编排器实现按职责迁入，阶段序列逐行保持【static】（`wc -l`：coordinator 1452、recovery 253、helpers 242、git_commit 233、constants 93、events 50、`__init__` 37）
+- [x] 2. `core/orchestrator.py` 改为少于 100 行的兼容门面（实测 48 行），`WorkflowOrchestrator` / `EventBroker` / `NODE_TEMPLATES` / 来源标签 / 三个错误类型 / `commit_p04_written_files` 再导出且与 `core/pipeline/*` 为同一对象【test】（`test_the_orchestrator_module_is_a_thin_facade_of_the_pipeline_package`）
+- [x] 3. 流水线在调用时经门面解析 `build_runner` / `run_dream_consolidation` / `rebuild_core_card`，`monkeypatch.setattr(core.orchestrator, "build_runner", …)` 继续作用到 P02【test】（`test_a_facade_monkeypatch_of_build_runner_still_reaches_the_pipeline`；既有 `test_p02_review_contract.py` / `test_wiki_route_declaration.py` 的替换点零改动并通过）
+- [x] 4. `KnowledgeSinkConfig.auto_git_commit` 新增，默认 `False`；`flywheel.yaml.example` 用注释写明只提交本批写入路径、不 push、Git 失败不致命【test】（`test_auto_git_commit_defaults_to_false_and_is_documented_in_the_example_config`）
+- [x] 5. 实现 `commit_p04_written_files`：按 `rev-parse --show-toplevel` 分组、只 `git add -- <本批路径>`、`diff --cached` 判空、`git commit --only` 提交、保留仓库已配置身份、缺身份才回退、不 push、任何 Git 问题返回结构化结果【test】（`test_the_git_helper_never_pushes`、`test_the_git_helper_skips_an_empty_write_set` 与下方集成用例）
+- [x] 6. P04 接线：仅当 `auto_git_commit` 为真且本批确有写入时提交；按结果追加 `p04_git_commit` / `p04_git_commit_skipped` / `p04_git_commit_failed` 审计事件，并把结果放进 P04 节点载荷与内部检查【test】
+- [x] 7. 新增 `tests/test_pipeline_git_commit.py`：门面行数与符号身份、门面替换生效、默认关闭零提交、开启时只提交 P04 文件（干扰项不动）、审批来源取自认领事件、仓库外 `skipped` 且运行 `PASS`、提交信息含 `run_id` 与审批来源（9 passed）【test】
+- [x] 8. 同步 `AGENTS.md`：包地图新增 `core/pipeline/`、P04 副作用列补可选本地提交、节点表位置改为 `core/pipeline/constants.py`、hot-file 列表改为 `core/pipeline/*`【static】
+- [x] 9. 执行 `.venv/Scripts/python.exe -m pytest tests/test_pipeline_git_commit.py tests/test_wave1a_pipeline_boundary.py tests/test_approval_claim_db.py tests/test_approval_recovery_flow.py tests/test_arch_invariants.py -q` → **79 passed in 34.55s**【test】
+- [x] 10. 执行 `openspec validate --all --strict` → **13 passed, 0 failed**【test】
+- [x] 11. 执行 `.venv/Scripts/python.exe scripts/verify_repo.py` → hygiene 273 files clean / openspec pass / pytest **407 passed in 149.62s**，3/3 通过【test】
+- [x] 12. 隔离沙箱真实验证：临时 Git 仓库内预置一个已修改的已跟踪文件与一个未跟踪文件，`flywheel seed` 后 `flywheel run --auto-approve`。`auto_git_commit: true`：运行 `run-655bd2f677` 为 `PASS`，提交数 1→2，HEAD 只含两篇 P04 写出的 `data/knowledge/lessons/*.md`，主题 `flywheel(p04): run-655bd2f677 (2 file(s))`，正文含 `run_id` 与 `approval_source: auto`，两个干扰项状态不变，审计出现 `p04_git_commit`；`auto_git_commit: false`：运行 `run-2846e1054a` 为 `PASS`，提交数与工作区状态不变，无 Git 审计事件。临时目录仅在本机 temp 下，未触碰真实知识库【real】

@@ -56,6 +56,9 @@ CREATE TABLE IF NOT EXISTS rules (
     natural_pass_count INTEGER NOT NULL DEFAULT 0,
     recurrence_count INTEGER NOT NULL DEFAULT 0,
     revalidation_history_json TEXT NOT NULL DEFAULT '[]',
+    supersedes_rule_id TEXT,
+    effective_from TEXT,
+    effective_to TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );

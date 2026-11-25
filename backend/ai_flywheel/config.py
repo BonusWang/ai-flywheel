@@ -82,6 +82,12 @@ class KnowledgeSinkConfig(BaseModel):
     # missing, writes fail closed instead of silently skipping index/validator.
     wiki_gate_enabled: bool = True
     wiki_gate_require_scripts: bool = True
+    # Neutral name of the post-write verification hook (SchemaWriteGate). Any
+    # schema-governed root can supply one; it need not be a Wiki-specific D2 script.
+    postflight_hook_script: str = ""
+    # Legacy name of the same hook. Kept 100% backward compatible: existing
+    # configurations and env vars keep working, and `effective_postflight_script`
+    # falls back to it whenever the neutral name is unset.
     wiki_d2_postflight_script: str = ""
     wiki_lint_script: str = ""
     wiki_python: str = ""
@@ -100,6 +106,21 @@ class KnowledgeSinkConfig(BaseModel):
     # surfaced. Set this to a project directory name (a folder under the projects partition that
     # has 实战笔记/) to catch the evidence-routed cards instead.
     practice_fallback_project: str = ""
+
+    # Opt-in P04 audit trail: after a batch's writes are verified, commit exactly those
+    # written files to the local Git repository they live in (one commit per repository,
+    # only the written paths staged, never a push). A path outside a repository, a missing
+    # git binary or a failing commit is recorded as an audit event and never fails P04.
+    auto_git_commit: bool = False
+
+    @property
+    def effective_postflight_script(self) -> str:
+        """The post-write hook that actually runs.
+
+        The neutral `postflight_hook_script` wins; the legacy `wiki_d2_postflight_script`
+        stays a fully supported alias and is used whenever the neutral name is blank.
+        """
+        return self.postflight_hook_script.strip() or self.wiki_d2_postflight_script.strip()
 
 
 class WorkflowConfig(BaseModel):
@@ -150,9 +171,22 @@ class GitClosureConfig(BaseModel):
     branch: str = "main"
 
 
-class WebhookConfig(BaseModel):
+class WebhookDeliveryConfig(BaseModel):
+    """A generic JSON webhook: the outbound channel that is not tied to one vendor.
+
+    Every string the channel sends passes the privacy gate first, and the payload
+    is signed when ``secret`` is set. The secret is never logged and is masked in
+    every configuration dump.
+    """
+
     enabled: bool = False
     url: str = ""
+    # Optional HMAC-SHA256 signing key. When non-empty, every request carries
+    # ``X-Flywheel-Signature: sha256=<hex>`` over the raw UTF-8 JSON body.
+    secret: str = ""
+    timeout_seconds: int = 10
+    # Routine 'fyi' notices are opt-in; approval and failure notices are not.
+    notify_on_fyi: bool = False
 
 
 class FeishuCliConfig(BaseModel):
@@ -189,7 +223,7 @@ class FeishuCliConfig(BaseModel):
 class DeliveryConfig(BaseModel):
     local_portal: bool = True
     git_closure: GitClosureConfig = Field(default_factory=GitClosureConfig)
-    webhook: WebhookConfig = Field(default_factory=WebhookConfig)
+    webhook: WebhookDeliveryConfig = Field(default_factory=WebhookDeliveryConfig)
     feishu_cli: FeishuCliConfig = Field(default_factory=FeishuCliConfig)
 
 
@@ -345,6 +379,7 @@ def _apply_env_knowledge_sink(raw: dict[str, Any]) -> dict[str, Any]:
         if val is not None:
             sink[field_name] = val.strip().lower() in {"1", "true", "yes", "on"}
     str_map = {
+        "FLYWHEEL_POSTFLIGHT_HOOK_SCRIPT": "postflight_hook_script",
         "FLYWHEEL_WIKI_D2_POSTFLIGHT": "wiki_d2_postflight_script",
         "FLYWHEEL_WIKI_LINT_SCRIPT": "wiki_lint_script",
         "FLYWHEEL_WIKI_PYTHON": "wiki_python",
@@ -361,6 +396,24 @@ def _apply_env_knowledge_sink(raw: dict[str, Any]) -> dict[str, Any]:
             sink["wiki_gate_timeout_seconds"] = int(timeout)
         except ValueError:
             pass
+    return raw
+
+
+def _apply_env_delivery(raw: dict[str, Any]) -> dict[str, Any]:
+    """Environment overrides for the webhook endpoint and its signing secret.
+
+    A deployment can keep the secret entirely out of ``flywheel.yaml`` by setting
+    ``FLYWHEEL_WEBHOOK_SECRET``. An empty or absent variable never overwrites a
+    configured value.
+    """
+    webhook = raw.setdefault("delivery", {}).setdefault("webhook", {})
+    for env_key, field_name in (
+        ("FLYWHEEL_WEBHOOK_URL", "url"),
+        ("FLYWHEEL_WEBHOOK_SECRET", "secret"),
+    ):
+        val = os.environ.get(env_key)
+        if val:
+            webhook[field_name] = val
     return raw
 
 
@@ -394,6 +447,7 @@ def load_config(config_path: str | Path | None = None, base_dir: str | Path | No
 
     raw = _apply_env_valves(raw)
     raw = _apply_env_knowledge_sink(raw)
+    raw = _apply_env_delivery(raw)
     cfg = FlywheelConfig.model_validate(raw)
     cfg.base_dir = resolved_base
     cfg.config_path = target_path

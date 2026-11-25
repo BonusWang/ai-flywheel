@@ -151,6 +151,12 @@ class RuleRecord(BaseModel):
     last_hit_at: str | None = None
     dormant_at: str | None = None
     root_cause_key: str | None = None
+    # Lightweight bi-temporal lineage. `supersedes_rule_id` names the rule this
+    # one replaces; `effective_from` / `effective_to` bracket the window in which
+    # it is in force (`effective_to` NULL means it still is).
+    supersedes_rule_id: str | None = None
+    effective_from: str | None = None
+    effective_to: str | None = None
     revalidation_history: list[dict[str, Any]] = Field(default_factory=list)
     created_at: str = Field(default_factory=utc_now_iso)
     updated_at: str = Field(default_factory=utc_now_iso)
@@ -167,6 +173,8 @@ class CreateRuleRequest(BaseModel):
     applicable_skills: list[str] = Field(default_factory=list)
     source_pointers: list[str] = Field(default_factory=list)
     origin_session_key: str | None = None
+    # When set, registering this rule also retires the rule it replaces.
+    supersedes_rule_id: str | None = None
 
 
 class PreflightResponse(BaseModel):

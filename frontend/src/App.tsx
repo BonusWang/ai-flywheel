@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import {
-  BookOpen,
+  Activity,
   Clock,
   GitBranch,
   Info,
@@ -122,10 +122,10 @@ export function App() {
     icon: React.FC<{ className?: string }>
     dot?: boolean
   }> = [
-    { key: 'home', label: '每日成果', icon: BookOpen },
-    { key: 'runs', label: '每日沉淀', icon: GitBranch, dot: hasApprovalWaiting },
-    { key: 'automations', label: '自动化任务', icon: Clock },
-    { key: 'rules', label: '规则与规矩', icon: Shield },
+    { key: 'home', label: '今日态势', icon: Activity },
+    { key: 'runs', label: '沉淀与审批', icon: GitBranch, dot: hasApprovalWaiting },
+    { key: 'automations', label: '自动化调度', icon: Clock },
+    { key: 'rules', label: '规则与进化', icon: Shield },
     { key: 'settings', label: '接入与设置', icon: Settings },
   ]
 
@@ -265,6 +265,7 @@ export function App() {
           {page === 'settings' && (
             <ConnectPolicyPage
               initialTab={settingsInitialTab}
+              onNavigate={setPage}
               onGlobalRefresh={refreshAll}
             />
           )}

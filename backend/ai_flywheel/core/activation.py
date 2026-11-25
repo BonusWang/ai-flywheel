@@ -237,6 +237,7 @@ class ActivationEngine:
         rid = req.rule_id or f"rule-{uuid.uuid4().hex[:8]}"
         existing = self.db.get_rule(rid)
         if existing:
+            now = utc_now_iso()
             existing.title = safe_title
             existing.domain = req.domain
             existing.projects = req.projects or existing.projects
@@ -248,18 +249,25 @@ class ActivationEngine:
             if root_cause_key:
                 existing.root_cause_key = root_cause_key
             existing.version += 1
+            if existing.effective_from is None:
+                existing.effective_from = now
             if existing.status in {RuleStatus.NEEDS_REVISION, RuleStatus.DORMANT}:
                 existing.status = RuleStatus.UNVERIFIED_ACTIVE
                 existing.dormant_at = None
+                # Reactivation opens a fresh effective window.
+                existing.effective_from = now
+                existing.effective_to = None
                 existing.revalidation_history.append(
                     {
-                        "at": utc_now_iso(),
+                        "at": now,
                         "event": "revised_and_reactivated",
                         "version": existing.version,
                     }
                 )
             return self.db.upsert_rule(existing)
 
+        now = utc_now_iso()
+        supersedes_id = (req.supersedes_rule_id or "").strip() or None
         rule = RuleRecord(
             rule_id=rid,
             title=safe_title,
@@ -274,15 +282,49 @@ class ActivationEngine:
             version=1,
             origin_session_key=req.origin_session_key,
             root_cause_key=root_cause_key,
+            supersedes_rule_id=supersedes_id,
+            effective_from=now,
             revalidation_history=[
                 {
-                    "at": utc_now_iso(),
+                    "at": now,
                     "event": "registered_unverified_active",
                     "version": 1,
                 }
             ],
         )
-        return self.db.upsert_rule(rule)
+        saved = self.db.upsert_rule(rule)
+        if supersedes_id:
+            self._retire_superseded_rule(supersedes_id, saved.rule_id, now)
+        return saved
+
+    def _retire_superseded_rule(self, superseded_id: str, new_rule_id: str, now: str) -> None:
+        """Close the superseded rule's effective window and record why.
+
+        A rule that is already retired is left untouched: the first supersession
+        is the one that gets the history entry and the audit event, so replaying
+        the same registration does not pile up duplicate evidence.
+        """
+        superseded = self.db.get_rule(superseded_id)
+        if superseded is None or superseded.status == RuleStatus.RETIRED:
+            return
+        superseded.status = RuleStatus.RETIRED
+        superseded.effective_to = now
+        superseded.revalidation_history.append(
+            {
+                "at": now,
+                "event": "superseded",
+                "superseded_by": new_rule_id,
+            }
+        )
+        self.db.upsert_rule(superseded)
+        self.db.append_audit_event(
+            entity_type="rule",
+            entity_id=superseded_id,
+            event_type="rule_superseded",
+            actor="activation",
+            summary=f"规则 {superseded_id} 被新规则 {new_rule_id} 替代并停用",
+            payload={"superseded_by": new_rule_id},
+        )
 
     def promote_observation(
         self, obs_id: str, *, actor: str = "user"
@@ -358,6 +400,8 @@ class ActivationEngine:
                 rule.natural_pass_count += 1
                 if rule.status == RuleStatus.UNVERIFIED_ACTIVE:
                     rule.status = RuleStatus.VERIFIED_ACTIVE
+                if not rule.effective_from:
+                    rule.effective_from = utc_now_iso()
                 rule.revalidation_history.append(
                     {
                         "at": utc_now_iso(),
@@ -423,17 +467,26 @@ class ActivationEngine:
         rule = self.db.get_rule(rule_id)
         if not rule:
             return None
+        now = utc_now_iso()
         prev = rule.status.value
         rule.status = new_status
         if new_status in {RuleStatus.UNVERIFIED_ACTIVE, RuleStatus.VERIFIED_ACTIVE}:
             rule.dormant_at = None
-        elif new_status == RuleStatus.DORMANT:
-            rule.dormant_at = utc_now_iso()
+            # Activation opens the effective window: fill a missing start, and
+            # refresh it when the rule comes back from dormant or retired.
+            if not rule.effective_from or prev in {RuleStatus.DORMANT.value, RuleStatus.RETIRED.value}:
+                rule.effective_from = now
+            rule.effective_to = None
+        elif new_status in {RuleStatus.DORMANT, RuleStatus.RETIRED}:
+            if new_status == RuleStatus.DORMANT:
+                rule.dormant_at = now
+            # Leaving service closes the window at the moment it happened.
+            rule.effective_to = now
         if new_status == RuleStatus.UNVERIFIED_ACTIVE and prev == RuleStatus.NEEDS_REVISION.value:
             rule.version += 1
         rule.revalidation_history.append(
             {
-                "at": utc_now_iso(),
+                "at": now,
                 "event": "manual_transition",
                 "from": prev,
                 "to": new_status.value,

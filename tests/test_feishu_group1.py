@@ -633,7 +633,7 @@ def test_check_persists_the_running_state_for_startup_cleanup(tmp_path: Path):
 
 
 def test_check_source_has_no_dead_branch():
-    source = (Path(__file__).resolve().parent.parent / "backend" / "ai_flywheel" / "core" / "feishu_check.py").read_text(
+    source = (Path(__file__).resolve().parent.parent / "backend" / "ai_flywheel" / "adapters" / "channels" / "feishu" / "check.py").read_text(
         encoding="utf-8"
     )
     assert "if False" not in source

@@ -4,11 +4,10 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-import httpx
-
+from ai_flywheel.adapters.channels.webhook import WebhookChannel
 from ai_flywheel.adapters.lark_cli import LarkCliRunner
 from ai_flywheel.config import FlywheelConfig
-from ai_flywheel.models import WorkflowRunRecord
+from ai_flywheel.models import PlannedWrite, WorkflowRunRecord
 
 
 class DeliveryAdapter:
@@ -17,11 +16,19 @@ class DeliveryAdapter:
     Feishu notifications (alert / optional fyi) go through the shared LarkCliRunner so
     they never pass through a cmd.exe shim; status distinguishes sent / failed /
     unknown (timeout or killed process — the message may still have been delivered).
+    Webhook notifications go through the generic channel, which sanitizes every
+    outbound string and never raises on a transport error.
     """
 
-    def __init__(self, cfg: FlywheelConfig, lark_runner: LarkCliRunner | None = None) -> None:
+    def __init__(
+        self,
+        cfg: FlywheelConfig,
+        lark_runner: LarkCliRunner | None = None,
+        webhook_channel: WebhookChannel | None = None,
+    ) -> None:
         self.cfg = cfg
         self._lark = lark_runner
+        self._webhook = webhook_channel
 
     def set_lark_runner(self, runner: LarkCliRunner | None) -> None:
         """Share one resolved lark-cli invocation with the rest of the process.
@@ -39,6 +46,72 @@ class DeliveryAdapter:
             self._lark = LarkCliRunner(fcfg.command, fcfg.command_args, identity=fcfg.identity)
         return self._lark
 
+    def _webhook_channel(self) -> WebhookChannel:
+        """The webhook bound to the *current* configuration.
+
+        A saved settings patch replaces ``cfg.delivery`` wholesale, so the
+        channel is built per notification unless a test injected one.
+        """
+        if self._webhook is not None:
+            return self._webhook
+        return WebhookChannel(self.cfg.delivery.webhook)
+
+    # ---------------- Webhook notifications ----------------
+
+    def notify_approval_needed(
+        self,
+        *,
+        run: WorkflowRunRecord,
+        reasons: list[str],
+        planned_writes: list[PlannedWrite | dict[str, Any]],
+        portal_url: str,
+        title: str = "",
+    ) -> dict[str, Any]:
+        """Tell the webhook that a batch is waiting for a human decision."""
+        return self._webhook_channel().notify(
+            event_type="awaiting_approval",
+            run=run,
+            title=title or f"AI 飞轮待审批（{run.batch_date or run.run_id}）",
+            summary=f"批次 {run.batch_date or run.run_id} 等待人工确认，共 {len(planned_writes)} 项写入计划。",
+            portal_url=portal_url,
+            reasons=list(reasons),
+            planned_writes=list(planned_writes),
+        )
+
+    def notify_run_completed(self, run: WorkflowRunRecord) -> dict[str, Any]:
+        """Tell the webhook that a batch reached its terminal PASS state."""
+        return self._webhook_channel().notify(
+            event_type="run_completed",
+            run=run,
+            title=f"AI 飞轮批次完成（{run.batch_date or run.run_id}）",
+            summary=run.digest_markdown or f"批次 {run.run_id} 已完成。",
+        )
+
+    def notify_failure(
+        self,
+        *,
+        run: WorkflowRunRecord,
+        failed_node: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Tell the webhook that a batch failed at one node."""
+        return self._webhook_channel().notify(
+            event_type="run_failed",
+            run=run,
+            title=f"AI 飞轮运行异常（{run.batch_date or run.run_id}）",
+            summary=f"失败环节：{failed_node}；原因：{reason}",
+            reasons=[reason],
+        )
+
+    def notify_fyi(self, *, title: str, summary: str, run: WorkflowRunRecord | None = None) -> dict[str, Any]:
+        """A routine notice. Sent only when ``delivery.webhook.notify_on_fyi`` is on."""
+        return self._webhook_channel().notify(
+            event_type="fyi",
+            run=run,
+            title=title,
+            summary=summary,
+        )
+
     def deliver(self, run: WorkflowRunRecord, written_paths: list[str]) -> dict[str, Any]:
         results: dict[str, Any] = {
             "local_portal": "PASS" if self.cfg.delivery.local_portal else "SKIPPED",
@@ -55,7 +128,12 @@ class DeliveryAdapter:
             results["git_closure"] = self._git_closure(written_paths, run.run_id)
 
         if self.cfg.delivery.webhook.enabled and self.cfg.delivery.webhook.url:
-            results["webhook"] = self._post_webhook(run)
+            webhook_res = self.notify_run_completed(run)
+            results["webhook"] = (
+                f"PASS ({webhook_res['status_code']})"
+                if webhook_res["sent"]
+                else f"FAILED ({webhook_res['reason']})"
+            )
 
         if self.cfg.delivery.feishu_cli.enabled and self.cfg.delivery.feishu_cli.notify_on_fyi:
             fres = self.send_feishu_text_notice(
@@ -182,17 +260,3 @@ class DeliveryAdapter:
         if push.returncode != 0:
             raise RuntimeError(f"git push {remote} {branch} failed: {push.stderr or push.stdout}")
         return f"; pushed to {remote}/{branch}"
-
-    def _post_webhook(self, run: WorkflowRunRecord) -> str:
-        resp = httpx.post(
-            self.cfg.delivery.webhook.url,
-            json={
-                "run_id": run.run_id,
-                "status": run.status.value,
-                "phase": run.phase,
-                "digest": run.digest_markdown,
-            },
-            timeout=10.0,
-        )
-        resp.raise_for_status()
-        return f"PASS ({resp.status_code})"

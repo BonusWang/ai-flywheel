@@ -51,11 +51,20 @@ knowledge_sink:
   # `{project}/项目配置/`.
   #
   # Script paths are intentionally empty in this public template.  Supply
-  # them in the gitignored flywheel.yaml (or via FLYWHEEL_WIKI_* env vars).
-  # With `wiki_gate_require_scripts: true`, a Wiki-root write fails closed
-  # when the D2 script is not configured.
+  # them in the gitignored flywheel.yaml (or via the FLYWHEEL_WIKI_* /
+  # FLYWHEEL_POSTFLIGHT_HOOK_SCRIPT env vars).  With
+  # `wiki_gate_require_scripts: true`, a schema-governed write fails closed
+  # when the postflight hook is not configured.
   wiki_gate_enabled: true
   wiki_gate_require_scripts: true
+  # Schema write gate (SchemaWriteGate): after a document is written, this hook
+  # runs the mounted contract's own index/validator sync.  It applies to any
+  # schema-governed root, not only a Wiki.  With `wiki_gate_require_scripts:
+  # true`, a write fails closed when the hook is not configured.
+  postflight_hook_script: ""     # or FLYWHEEL_POSTFLIGHT_HOOK_SCRIPT
+  # Legacy name of the same hook.  Fully supported: existing configurations and
+  # FLYWHEEL_WIKI_D2_POSTFLIGHT keep working, and it is used whenever
+  # `postflight_hook_script` is empty.  When both are set, the neutral name wins.
   wiki_d2_postflight_script: ""
   wiki_lint_script: ""
   wiki_python: ""          # default: the flywheel process interpreter
@@ -74,6 +83,16 @@ knowledge_sink:
   # `planned_doc_unrouted` audit event. Set a project directory name (a folder with 实战笔记/ under
   # the projects partition) to catch the evidence-routed cards instead.
   practice_fallback_project: ""
+
+  # Opt-in audit trail for P04 (default off). When true, the files a batch just wrote
+  # and verified are committed to the local Git repository they live in — one commit
+  # per repository, staging ONLY those written paths (`git add -- <paths>`); unrelated
+  # modified or untracked files in the same working tree are never touched, and nothing
+  # is ever pushed. A path outside a Git repository, a missing git binary or a failing
+  # commit is recorded as an audit event (`p04_git_commit_skipped` /
+  # `p04_git_commit_failed`) and never fails the batch. The knowledge root must be
+  # inside a repository and not git-ignored for commits to land.
+  auto_git_commit: false
 
 # Autonomous workflow P00-P07 execution engine
 workflow:
@@ -129,6 +148,13 @@ delivery:
   webhook:
     enabled: false
     url: ""
+    # Optional HMAC-SHA256 signing key. When non-empty, every request carries
+    # X-Flywheel-Signature: sha256=<hex> over the raw UTF-8 JSON body. Keep the
+    # value out of this file if it is shared: FLYWHEEL_WEBHOOK_SECRET overrides it.
+    secret: ""
+    timeout_seconds: 10
+    # Routine "fyi" notices are opt-in; approval and failure notices are not.
+    notify_on_fyi: false
   # Feishu via local lark-cli (bot identity). All ids are open ids (ou_...);
   # keep personal values in the gitignored flywheel.yaml.
   feishu_cli:

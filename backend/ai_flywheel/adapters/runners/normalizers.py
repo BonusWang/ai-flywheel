@@ -46,6 +46,16 @@ class _DropItem(Exception):
 _SENTENCE_END_RE = re.compile(r"[。！？!?；;\n]")
 
 
+def _append_reason(base: str, suffix: str) -> str:
+    left = (base or "").strip().rstrip("。；; ")
+    right = (suffix or "").strip().lstrip("。；; ")
+    if not left:
+        return right
+    if not right:
+        return left
+    return f"{left}；{right}"
+
+
 def _draft_frontmatter(content: str) -> dict[str, Any]:
     """Top-level YAML mapping of a markdown draft, or an empty dict when there is none."""
     text = (content or "").strip()
@@ -295,9 +305,10 @@ def _normalize_planned_write(
             if not pw.approval_reason:
                 pw.approval_reason = "本批建议优化已有 Skill，需确认后更新技能文件"
             if relabeled:
-                pw.approval_reason += "；目标 Skill 已存在，按更新处理"
-            pw.approval_reason += (
-                f"；在现有文件末尾追加小节，原有 {int(existing_info.get('line_count') or 0)} 行完整保留，原文件自动备份"
+                pw.approval_reason = _append_reason(pw.approval_reason, "目标 Skill 已存在，按更新处理")
+            pw.approval_reason = _append_reason(
+                pw.approval_reason,
+                f"在现有文件末尾追加小节，原有 {int(existing_info.get('line_count') or 0)} 行完整保留，原文件自动备份",
             )
         else:
             # Ensure content_preview has valid SKILL.md YAML frontmatter

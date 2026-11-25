@@ -1,21 +1,39 @@
 import React, { useEffect, useState } from 'react'
 import {
+  Activity,
+  AlertTriangle,
   BookOpen,
   CalendarClock,
+  CheckCircle2,
   ChevronRight,
   FileText,
   GitBranch,
+  Layers,
   PauseCircle,
   Shield,
+  ShieldAlert,
   X,
 } from 'lucide-react'
 import type { PageKey } from '../App'
 import { api } from '../api'
 import { MarkdownView } from '../components/MarkdownView'
 import { AsideCard, ReadingLayout } from '../components/PageLayout'
+import { CoreCardModal } from '../components/rules/CoreCardModal'
 import { StatusBadge } from '../components/StatusBadge'
-import { formatDateYMD, labelOf, RULE_STATUS_LABELS, SINK_TYPE_LABELS } from '../lib/labels'
-import type { KnowledgeDocSummary, OverviewResponse } from '../types'
+import {
+  APPROVAL_MODE_LABELS,
+  formatDateYMD,
+  labelOf,
+  RULE_STATUS_LABELS,
+  SINK_TYPE_LABELS,
+} from '../lib/labels'
+import type {
+  AutomationsSnapshot,
+  CoreCardPayload,
+  GrowthMetricsLive,
+  KnowledgeDocSummary,
+  OverviewResponse,
+} from '../types'
 
 interface Props {
   overview: OverviewResponse | null
@@ -29,10 +47,20 @@ function todayFormatted() {
   return `${now.getMonth() + 1}月${now.getDate()}日 · ${week}`
 }
 
+const FRESHNESS_TIER_SHORT: Record<string, string> = {
+  volatile: '30天',
+  evolving: '90天',
+  evergreen: '180天',
+}
+
 export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
   const [docs, setDocs] = useState<KnowledgeDocSummary[]>([])
   const [docsLoaded, setDocsLoaded] = useState(false)
   const [sinkInfo, setSinkInfo] = useState<{ sink_type: string; root: string } | null>(null)
+  const [automations, setAutomations] = useState<AutomationsSnapshot | null>(null)
+  const [growth, setGrowth] = useState<GrowthMetricsLive | null>(null)
+  const [coreCard, setCoreCard] = useState<CoreCardPayload | null>(null)
+  const [showCoreCardModal, setShowCoreCardModal] = useState(false)
   const [readingDoc, setReadingDoc] = useState<{
     doc_path: string
     content: string
@@ -40,15 +68,27 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
   } | null>(null)
 
   useEffect(() => {
-    api
-      .listKnowledge()
-      .then((res) => {
-        setDocs(res.documents)
-        setSinkInfo({ sink_type: res.sink_type, root: res.root })
-      })
-      .catch(() => {})
-      .finally(() => setDocsLoaded(true))
-  }, [overview?.metrics.workflow_runs_total])
+    let cancelled = false
+    Promise.all([
+      api.listKnowledge().catch(() => null),
+      api.automations().catch(() => null),
+      api.growthMetrics().catch(() => null),
+      api.coreCard().catch(() => null),
+    ]).then(([kRes, aRes, gRes, cRes]) => {
+      if (cancelled) return
+      if (kRes) {
+        setDocs(kRes.documents)
+        setSinkInfo({ sink_type: kRes.sink_type, root: kRes.root })
+      }
+      if (aRes) setAutomations(aRes)
+      if (gRes) setGrowth(gRes.live)
+      if (cRes) setCoreCard(cRes)
+      setDocsLoaded(true)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [overview?.metrics.workflow_runs_total, overview?.metrics.preflight_activations])
 
   const openDoc = async (path: string) => {
     try {
@@ -60,24 +100,54 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
   }
 
   if (!overview) {
-    return <div className="py-20 text-center text-[13px] text-ink-4">正在加载每日成果...</div>
+    return <div className="py-20 text-center text-[13px] text-ink-4">正在加载控制面态势...</div>
   }
 
-  const { site, metrics, latest_run, recent_rules } = overview
+  const { site, metrics, latest_run, recent_rules, safety_valves } = overview
   const brand = site.brand
   const verifiedRules = metrics.rules_by_status.verified_active || 0
   const unverifiedRules = metrics.rules_by_status.unverified_active || 0
+  const dormantRules = metrics.rules_by_status.dormant || 0
   const activeRulesCount = verifiedRules + unverifiedRules
   const awaitingApproval = latest_run?.status === 'AWAITING_APPROVAL'
 
+  const openDissents = growth?.open_dissent_count ?? 0
+  const expiredCards = growth?.expired_card_count ?? 0
+  const staleSkills = growth?.stale_skill_count ?? 0
+  const governanceAlertsCount =
+    (awaitingApproval ? 1 : 0) +
+    (openDissents > 0 ? 1 : 0) +
+    (expiredCards > 0 ? 1 : 0) +
+    (staleSkills > 0 ? 1 : 0)
+
+  const sched = automations?.scheduler
+  const policy = automations?.policy
+  const scheduleSummaryText = sched
+    ? sched.enabled
+      ? `${sched.human_schedule}${sched.friday_weekly_enabled ? '（含周五蒸馏）' : ''}`
+      : '自动调度已暂停（可随时手动触发）'
+    : '读取调度状态中…'
+
+  const effectiveApprovalLabel = policy
+    ? labelOf(APPROVAL_MODE_LABELS, policy.effective_approval_mode, policy.effective_approval_mode)
+    : safety_valves.auto_approve_writes
+      ? '全部自动'
+      : '智能审批'
+
+  // Extract P00 triage stats from latest run if present
+  const p00Node = latest_run?.nodes.find((n) => n.node_id === 'P00_PREPARE')
+  const triageReport = (p00Node?.payload as any)?.triage_report as
+    | { checked?: number; skipped?: number; admitted?: number }
+    | undefined
+
   const aside = (
     <>
-      {/* Card 1: Active rules (plain & scannable) */}
+      {/* Card 1: Active rules */}
       <AsideCard
         title={
           <span className="inline-flex items-center gap-1.5">
             <Shield className="w-3.5 h-3.5 text-accent" />
-            生效中的避坑规则
+            高频生效避坑规则
           </span>
         }
       >
@@ -93,7 +163,7 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
                 <div className="text-[13px] font-medium text-ink leading-snug">{r.title}</div>
                 <div className="mt-1.5 flex items-center justify-between gap-2 text-[11.5px] text-ink-4">
                   <span className="text-ink-3">{labelOf(RULE_STATUS_LABELS, r.status)}</span>
-                  <span className="num">已提醒 {r.hit_count} 次</span>
+                  <span className="num">已拦截/提醒 {r.hit_count} 次</span>
                 </div>
               </div>
             ))}
@@ -104,25 +174,67 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
           onClick={() => onNavigate('rules')}
           className="mt-3.5 inline-flex items-center gap-0.5 text-[12px] font-semibold text-accent hover:text-accent-ink"
         >
-          查看全部规则与规矩
+          进入规则与进化中心
           <ChevronRight className="w-3.5 h-3.5" />
         </button>
       </AsideCard>
 
-      {/* Card 2: Daily sedimentation rhythm */}
+      {/* Card 2: Derived Core Index Card */}
+      <AsideCard
+        title={
+          <span className="inline-flex items-center gap-1.5">
+            <Layers className="w-3.5 h-3.5 text-accent" />
+            跨端核心索引卡
+          </span>
+        }
+      >
+        <p className="text-[12px] text-ink-3 leading-relaxed">
+          通过 <code className="mono text-[11px] text-ink-2">flywheel://core-card</code>{' '}
+          暴露给多端智能体的热态治理摘要（≤200 行硬上限）。
+        </p>
+        {coreCard && (
+          <div className="mt-2.5 flex items-center justify-between text-[12px] text-ink-3">
+            <span>当前占用</span>
+            <span className="num font-medium text-ink">
+              {coreCard.lines} / 200 行 · {(coreCard.bytes / 1024).toFixed(1)} KB
+            </span>
+          </div>
+        )}
+        <button
+          type="button"
+          onClick={() => setShowCoreCardModal(true)}
+          className="mt-3 inline-flex items-center gap-1 text-[12px] font-semibold text-accent hover:text-accent-ink"
+        >
+          预览 FLYWHEEL-CORE.md
+          <ChevronRight className="w-3.5 h-3.5" />
+        </button>
+      </AsideCard>
+
+      {/* Card 3: Live Scheduler & Safety Valves */}
       <AsideCard
         title={
           <span className="inline-flex items-center gap-1.5">
             <CalendarClock className="w-3.5 h-3.5 text-accent" />
-            每日沉淀节奏
+            调度与安全阀实况
           </span>
         }
         className="!bg-panel-quiet"
       >
         <div className="space-y-2.5 text-[12.5px]">
+          <div className="flex items-start justify-between gap-2">
+            <span className="text-ink-3 shrink-0">自动调度</span>
+            <span className="text-ink font-medium text-right">{scheduleSummaryText}</span>
+          </div>
           <div className="flex items-center justify-between gap-2">
-            <span className="text-ink-3">自动整理</span>
-            <span className="text-ink font-medium">每天 20:00（周五加周复盘）</span>
+            <span className="text-ink-3">有效审批模式</span>
+            <span className="text-ink font-medium">{effectiveApprovalLabel}</span>
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-ink-3">安全阀护栏</span>
+            <span className="text-ink-2 text-[12px]">
+              {safety_valves.workflow_enabled ? '流水线开' : '流水线关'} ·{' '}
+              {safety_valves.auto_approve_writes ? '允许全自动' : '强制审批否决'}
+            </span>
           </div>
           <div className="flex items-center justify-between gap-2">
             <span className="text-ink-3">最近批次</span>
@@ -135,19 +247,13 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
               <span className="text-ink-4">暂无</span>
             )}
           </div>
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-ink-3">已沉淀规则</span>
-            <span className="num text-ink font-medium">
-              {activeRulesCount} 条（{verifiedRules} 条已生效）
-            </span>
-          </div>
         </div>
         <button
           type="button"
-          onClick={() => onNavigate('runs')}
+          onClick={() => onNavigate('automations')}
           className="mt-3.5 inline-flex items-center gap-0.5 text-[12px] font-semibold text-accent hover:text-accent-ink"
         >
-          打开每日沉淀流水线
+          管理自动化调度与蒸馏
           <ChevronRight className="w-3.5 h-3.5" />
         </button>
       </AsideCard>
@@ -156,16 +262,19 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
 
   return (
     <ReadingLayout aside={aside}>
-      <div className="space-y-6">
-        {/* 1. Calm AIHOT-style Header */}
+      <div className="space-y-5">
+        {/* 1. Control Plane Header */}
         <header className="pb-4 border-b border-line">
           <div className="flex flex-wrap items-baseline justify-between gap-2">
-            <h1 className="text-[24px] font-semibold leading-[1.3] text-ink">每日成果</h1>
+            <div className="flex items-center gap-2">
+              <h1 className="text-[24px] font-semibold leading-[1.3] text-ink">今日态势</h1>
+              <span className="chip">治理与进化控制面</span>
+            </div>
             <span className="num text-[12.5px] text-ink-4">{todayFormatted()}</span>
           </div>
           <div className="mt-2 flex flex-wrap items-center justify-between gap-3">
             <p className="text-[13.5px] text-ink-3">
-              {brand.name} · 每天把 AI 协作里的有效结论整理成笔记和避坑规则。
+              {brand.name} · 开工查规矩、完工交证据、沉淀经审批、经验抗腐烂。
             </p>
             <button
               type="button"
@@ -173,21 +282,21 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
               className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[var(--radius-control)] border border-line bg-surface text-ink-2 text-[12.5px] font-medium hover:border-line-strong hover:text-ink transition-colors"
             >
               <GitBranch className="w-3.5 h-3.5 text-accent" />
-              每日沉淀流水线
+              沉淀与审批台
             </button>
           </div>
         </header>
 
-        {/* 2. Only surface a calm prompt when a batch actually needs the maintainer's approval */}
+        {/* 2. Actionable Governance Alerts */}
         {awaitingApproval && latest_run && (
           <section className="rounded-[var(--radius-card)] border border-amber/40 bg-amber-soft/50 px-4 py-3 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2 text-[13px] text-ink">
               <PauseCircle className="w-4 h-4 text-amber-ink shrink-0" />
               <span>
                 <strong className="num font-semibold">{formatDateYMD(latest_run.started_at)}</strong>{' '}
-                批次整理出了{' '}
+                批次生成了{' '}
                 <strong className="num font-semibold">{latest_run.planned_writes.length}</strong>{' '}
-                项写入建议，等你确认
+                项受控写入计划，等待你的审批
               </span>
             </div>
             <button
@@ -201,15 +310,114 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
           </section>
         )}
 
-        {/* 3. Latest Digest (Clean Readable Report) */}
+        {!awaitingApproval && governanceAlertsCount > 0 && (
+          <section className="rounded-[var(--radius-card)] border border-line-strong bg-surface-2 px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 text-[12.5px]">
+            <div className="flex flex-wrap items-center gap-2 text-ink-2">
+              <AlertTriangle className="w-4 h-4 text-amber-ink shrink-0" />
+              <span>当前治理待办：</span>
+              {openDissents > 0 && (
+                <span className="chip">{openDissents} 条未决分歧</span>
+              )}
+              {expiredCards > 0 && (
+                <span className="chip">{expiredCards} 篇经验卡待复核</span>
+              )}
+              {staleSkills > 0 && (
+                <span className="chip">{staleSkills} 个 Skill 待检修/清理</span>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => onNavigate('rules')}
+              className="inline-flex items-center gap-0.5 text-[12px] font-semibold text-accent hover:text-accent-ink"
+            >
+              去处理
+              <ChevronRight className="w-3.5 h-3.5" />
+            </button>
+          </section>
+        )}
+
+        {/* 3. 4-Card Governance KPI Strip */}
+        <section className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+          <div className="card p-4">
+            <div className="flex items-center justify-between text-[11.5px] text-ink-4">
+              <span>真实证据通过率</span>
+              <CheckCircle2 className="w-3.5 h-3.5 text-ok" />
+            </div>
+            <div className="mt-1.5 text-[22px] font-bold text-ink num">
+              {metrics.real_verification_rate !== null
+                ? `${metrics.real_verification_rate}%`
+                : '暂无样本'}
+            </div>
+            <div className="mt-1 text-[11.5px] text-ink-4 num">
+              预检激活 {metrics.preflight_activations} 次 · 验收 {metrics.natural_outcomes_total} 次
+            </div>
+          </div>
+
+          <div className="card p-4">
+            <div className="flex items-center justify-between text-[11.5px] text-ink-4">
+              <span>规则健康度</span>
+              <Shield className="w-3.5 h-3.5 text-accent" />
+            </div>
+            <div className="mt-1.5 text-[22px] font-bold text-ink num">
+              {activeRulesCount}{' '}
+              <span className="text-[12.5px] font-normal text-ink-3">条生效</span>
+            </div>
+            <div className="mt-1 text-[11.5px] text-ink-4 num">
+              {verifiedRules} 已验证 · {unverifiedRules} 试运行 · {dormantRules} 休眠
+            </div>
+          </div>
+
+          <div className="card p-4">
+            <div className="flex items-center justify-between text-[11.5px] text-ink-4">
+              <span>错题观察池</span>
+              <ShieldAlert className="w-3.5 h-3.5 text-amber-ink" />
+            </div>
+            <div className="mt-1.5 text-[22px] font-bold text-ink num">
+              {growth ? growth.observing_pool_count : metrics.open_retro_count}{' '}
+              <span className="text-[12.5px] font-normal text-ink-3">待观察</span>
+            </div>
+            <div className="mt-1 text-[11.5px] text-ink-4 num">
+              {growth && growth.red_count > 0 ? (
+                <span className="text-hot font-medium">🔴 {growth.red_count} 沉默错</span>
+              ) : (
+                <span>无沉默高危错</span>
+              )}
+              {' · '}
+              {growth?.sample_sufficient
+                ? `自查拦截 ${Math.round(growth.self_catch_rate * 100)}%`
+                : `复盘线索 ${metrics.open_retro_count}`}
+            </div>
+          </div>
+
+          <div className="card p-4">
+            <div className="flex items-center justify-between text-[11.5px] text-ink-4">
+              <span>会话与自动化</span>
+              <Activity className="w-3.5 h-3.5 text-accent" />
+            </div>
+            <div className="mt-1.5 text-[22px] font-bold text-ink num">
+              {metrics.sessions_pending}{' '}
+              <span className="text-[12.5px] font-normal text-ink-3">待审会话</span>
+            </div>
+            <div className="mt-1 text-[11.5px] text-ink-4 truncate">
+              {sched?.running ? `调度中 · ${sched.human_schedule.replace('（上海时间）', '')}` : '自动调度已暂停'}
+            </div>
+          </div>
+        </section>
+
+        {/* 4. Latest P00-P07 Governance Digest */}
         <section className="card p-5">
           <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-line-soft">
             <div className="flex items-center gap-2">
               <FileText className="w-4 h-4 text-accent" />
-              <h2 className="text-[15.5px] font-bold text-ink">最近一次沉淀总结</h2>
+              <h2 className="text-[15.5px] font-bold text-ink">最近一次治理批次摘要</h2>
             </div>
             {latest_run && (
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                {triageReport && (triageReport.checked || 0) > 0 && (
+                  <span className="chip num">
+                    初筛 {triageReport.checked} → 跳过噪音 {triageReport.skipped || 0}
+                  </span>
+                )}
                 <span className="num text-[12px] text-ink-4">
                   {formatDateYMD(latest_run.started_at)}
                 </span>
@@ -223,7 +431,7 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
                 <MarkdownView content={latest_run.digest_markdown} />
               ) : (
                 <p className="text-[13px] text-ink-4 py-2">
-                  这一批还在等待确认，审批完成后会在这里展示总结内容。
+                  这一批还在等待审批或执行中，完成后会在这里展示摘要报告。
                 </p>
               )}
               <div className="mt-4 pt-2.5 border-t border-line-soft flex justify-end">
@@ -232,49 +440,70 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
                   onClick={() => onNavigate('runs')}
                   className="inline-flex items-center gap-0.5 text-[12px] font-medium text-accent hover:text-accent-ink"
                 >
-                  查看这一批的完整进度
+                  查看 8 节点流水线与审计轨迹
                   <ChevronRight className="w-3.5 h-3.5" />
                 </button>
               </div>
             </div>
           ) : (
             <p className="text-[13px] text-ink-4 py-6 text-center">
-              还没有沉淀记录，去「每日沉淀」启动第一轮吧。
+              还没有批次记录，去「沉淀与审批」启动第一轮治理流水线吧。
             </p>
           )}
         </section>
 
-        {/* 4. Recently Saved Notes */}
+        {/* 5. Controlled Write Assets (secondary, with freshness status) */}
         <section className="card p-5">
-          <div className="flex items-center justify-between pb-3 border-b border-line-soft">
+          <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-line-soft">
             <div className="flex items-center gap-2">
               <BookOpen className="w-4 h-4 text-ok" />
-              <h2 className="text-[15.5px] font-bold text-ink">近期沉淀的笔记</h2>
+              <h2 className="text-[15px] font-bold text-ink">近期受控写入的 Markdown 资产</h2>
             </div>
-            {sinkInfo && (
-              <span className="chip">{labelOf(SINK_TYPE_LABELS, sinkInfo.sink_type)}</span>
-            )}
+            <div className="flex items-center gap-2">
+              {sinkInfo && (
+                <span className="chip">{labelOf(SINK_TYPE_LABELS, sinkInfo.sink_type)}</span>
+              )}
+              <button
+                type="button"
+                onClick={() => onNavigate('rules')}
+                className="text-[12px] text-accent hover:text-accent-ink font-medium"
+              >
+                保鲜明细 →
+              </button>
+            </div>
           </div>
           {!docsLoaded ? (
-            <p className="text-[13px] text-ink-4 py-6 text-center">正在加载近期笔记...</p>
+            <p className="text-[13px] text-ink-4 py-6 text-center">正在加载受控资产...</p>
           ) : docs.length === 0 ? (
-            <p className="text-[13px] text-ink-4 py-6 text-center">知识库里还没有笔记文档。</p>
+            <p className="text-[13px] text-ink-4 py-6 text-center">当前落点还没有受控写入的文档。</p>
           ) : (
             <div className="divide-y divide-line-soft mt-1">
-              {docs.slice(0, 10).map((d) => (
+              {docs.slice(0, 8).map((d) => (
                 <button
                   key={d.doc_path}
                   type="button"
                   onClick={() => openDoc(d.doc_path)}
-                  className="w-full text-left py-3 px-2 -mx-2 rounded-[var(--radius-tile)] hover:bg-bg-sunk/70 transition-colors flex items-center justify-between gap-3"
+                  className="w-full text-left py-2.5 px-2 -mx-2 rounded-[var(--radius-tile)] hover:bg-bg-sunk/70 transition-colors flex items-center justify-between gap-3"
                 >
                   <div className="min-w-0">
-                    <div className="text-[14px] font-medium text-ink truncate">{d.title}</div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[13.5px] font-medium text-ink truncate">{d.title}</span>
+                      {d.is_expired && (
+                        <span className="px-1.5 py-0.5 rounded bg-amber-soft text-amber-ink text-[10.5px] font-semibold shrink-0">
+                          ⚠️ 待复核
+                        </span>
+                      )}
+                    </div>
                     <div className="mono text-[11.5px] text-ink-4 truncate mt-0.5">{d.doc_path}</div>
                   </div>
-                  <span className="num text-[11.5px] text-ink-4 shrink-0">
-                    {(d.size_bytes / 1024).toFixed(1)} KB
-                  </span>
+                  <div className="flex items-center gap-2 shrink-0 text-[11.5px] text-ink-4 num">
+                    {d.freshness_tier && (
+                      <span className="chip text-[10.5px]">
+                        {FRESHNESS_TIER_SHORT[d.freshness_tier] || d.freshness_tier}
+                      </span>
+                    )}
+                    <span>{(d.size_bytes / 1024).toFixed(1)} KB</span>
+                  </div>
                 </button>
               ))}
             </div>
@@ -305,6 +534,14 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
           </div>
         </div>
       )}
+
+      {/* Core Card Modal */}
+      <CoreCardModal
+        open={showCoreCardModal}
+        card={coreCard}
+        onClose={() => setShowCoreCardModal(false)}
+        onRebuilt={setCoreCard}
+      />
     </ReadingLayout>
   )
 }

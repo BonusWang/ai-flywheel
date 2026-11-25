@@ -1,47 +1,126 @@
 # AI Flywheel
 
-> **以目标开局，以证据执行，以复盘提炼，以沉淀复用，以再验证迭代**
+> **面向多 AI 编码工具的本地优先「治理与进化控制面」**
 >
-> *经验 · 证据 · 分歧 · 蒸馏 · 复用 — 缺一不算真飞轮*
+> *开工查规矩 · 完工交证据 · 沉淀经审批 · 经验抗腐烂*
 
-**AI Flywheel** 是一个**本地优先、策略与知识库彻底解耦、面向多 AI 工具的证据驱动协作飞轮产品**。它通过标准 **MCP** 与可选极薄转发 Hook 接入 **Codex、Claude Code、Claude Desktop、Antigravity** 等主流 AI 工具，后台自主运转 **P00–P07 固定 8 节点工作流**，并提供极简 `5+1` 控制台（含可视化「自动化任务」调度控制面）、自动派生核心索引卡与周五分层蒸馏机制。
+**AI Flywheel** 是一个本地优先、方法论策略与知识存储彻底解耦的 **AI 协作治理与进化控制面（Governance & Evolution Control Plane）**。它通过标准 **MCP**（及可选极薄转发 Hook）旁路接入 **Claude Code、Codex、Claude Desktop、Antigravity** 等 AI 编码工具，用**执行期证据门禁 + 后台 P00–P07 受控沉淀流水线 + 抗熵增蒸馏机制**，把日常会话转化为可审计、可复用、不会越攒越乱的规则、本地 Markdown 知识与 `SKILL.md`。
 
 ---
 
-## 核心特性（v0.4）
+## 为什么需要 AI Flywheel？
 
-1. **方法论策略与知识库彻底解耦**
-   - 反偷懒执行契约（`baseline` / `execution`）、8 步闭环、死循环保护阈值、证据分级（`real / test / static / unknown`）及个人协作偏好由飞轮独立托管（`profile/policies/`），无需绑定外部 Wiki。
-   - 知识库作为可插拔落点（默认内置 `./data/knowledge` 开箱即用，也可挂载本地 Markdown / Obsidian Wiki 并启用 Schema 写入门禁）。
-2. **两级会话初筛选器（过滤临时闲聊，只沉淀高价值会话）**
-   - **一级规则硬筛（0 Token）**：扫盘自动过滤 `agent-*` / `subagent-*` 内部碎片与极短/空会话；自动解析 JSONL 真实 `workspace` 并剥离系统提示词包装；正式项目/知识目录高优放行，临时聊天目录（`*Chat`）走灰名单（需足够深度与知识/工程信号），手工/MCP 显式录入豁免。
-   - **二级 AI 语义价值闸门（P02）**：授权模型对一次性翻译、闲聊、简单查命令直接判定 `worthy: false` 跳过归档，严禁硬凑笔记。
-3. **双轨错题观察池 + 分歧反例保留（防规则膨胀 & 补齐五判据）**
-   - 失误按 `red_silent`（🔴 沉默错误）/ `yellow_caught`（🟡 自查拦截）/ `green_minor`（🟢 轻微）分级入池；普通失误按 `root_cause_key` 聚类满 **3 次（事不过三）** 才晋升规则，高危沉默错误可首次直通试运行。
-   - 规则复测失败或新会话出现例外时，自动记录 `dissent_records`（保留反例与例外条件，绝不静默覆盖原规则），并在下次预检（`preflight_activate`）与规则卡片中一并提醒。
-4. **写时隐私门禁 + 经验卡时效保鲜（防记忆投毒）**
-   - 所有知识文档、Skill 与规则写入前均经过隐私门：自动脱敏 `<private>...</private>` 区块，硬拦截 API Key / Token / 私钥泄露（`SecretLeakError`）。
-   - 经验卡按 `freshness_tier`（`volatile` 30 天 / `evolving` 90 天 / `evergreen` 180 天）管理有效期；过期卡在检索与核心索引卡中自动降权并标注 `⚠️ [已过复核期，执行前请先核实]`；在真实任务中通过 `real` 验证并传回 `used_knowledge_paths` 时自动续期。
-5. **派生核心索引卡 + 周五分层蒸馏 + 反 Skill 表演**
-   - 自动在 `data/FLYWHEEL-CORE.md` 派生 ≤200 行 / ≤24 KB 的跨智能体只读索引卡，并通过 MCP Resource `flywheel://core-card` 暴露给任意智能体。
-   - 每周五 20:00 自动执行分层蒸馏：14 天零命中试运行规则自动转入 `dormant`（可一键唤醒，全程审计留痕）；标记超期经验卡；检测触发词高重合规则、21 天零调用的闲置 Skill 与连续失败 Skill（`used_skills` 实效账本），通过门户与飞书决策卡推送精简建议；保存每周成长指标快照（样本 `< 5` 条显式提示）。
-6. **合同驱动的 Wiki 路由 + 反静默回退契约（模型说了什么，就写什么）**
-   - 挂载带 `.wiki-schema.md` 的 Wiki 时，P03 从 Wiki 现场发现候选页面类型与项目目录，把候选集交给模型**声明**路由（`page_type` / `project` / `reason`），再由工作区与草稿证据**校验**该声明：声明不在候选集、声明无归属或与证据冲突的笔记**不写入**，只记 `planned_doc_unrouted` 审计事件——归属永远不猜。
-   - `api` / `cli` 模式下，模型给出的写入计划或会话审查不可用时，该节点**直接失败**并留下原因码与结构化诊断，绝不偷偷换成本地启发式却仍报 `api:<model>`；P02 与 P03 的来源（API 模型 / 本地 CLI / 本地启发式）在节点摘要与载荷里写明。
-   - P02 只产出候选：错题与分歧留在节点载荷里，审批通过后才在 P04 入库；整批只重建一次全文索引。
-7. **Skill 追加式无损更新 + 控制台并排预览（不重写，只追加）**
-   - `action="update"` 的语义是「在现有 `SKILL.md` 末尾追加一节」：旧文件的每一个字节都是新文件的前缀，写前备份、原子替换、回读比对 SHA-256，并把原有行尾（CRLF 仍是 CRLF）保持不变。
-   - 控制台提供只读预览接口 `GET /api/site/skills/{name}/preview`（现有文件大小、H2 大纲与全文）；审批卡在更新项上直接展示已有大纲，并提供「与现有文件对比」的展开面板——**写进去的和预览的逐字一致**。
-   - 零配置 `dry_run` 计划不再生成模板化的 `SKILL.md`；重复流程只作为候选上报。
-8. **模型调用可靠性 + 原子审批 + 崩溃恢复（可观测、可恢复）**
-   - `runner.api.reasoning_effort` 可选（留空即不发送该参数，非空时进入缓存键）；`runner.api.transport_retries` 对超时与连接错误**立即重试且不退避**（超时不是限流），HTTP 状态错误不重试且只报状态码、不带网关地址。
-   - 每次调用都留痕：尝试次数、耗时、实际服务模型、prompt / completion / reasoning token，用量随 P02 与 P03 的节点载荷走；模型回复**通过语义校验之后**才写缓存，坏输出不会污染下一批。
-   - 审批认领是原子的：认领、状态迁移、已批条目、决策卡与审计事件在同一个写事务里落盘，并发审批或「批准 / 取消」竞态只有一个赢家；执行中的批次每 15 秒续锁并打心跳，`serve` 启动时与每 30 秒收割心跳停止的批次（下游 `SKIPPED`、会话回到 `pending`、决策卡置为失败）。被拒绝的批次终态是 `CANCELLED`，与「做了一半」的 `PARTIAL` 严格区分。
-9. **智能审批、Skill 封装写入与多端闭环**
-   - 支持 `smart`（常规笔记与试运行规则自动放行，Skill 变更 / 高风险 / 超批量自动挂起审批 + 飞书 CLI 通知）、`always`、`auto` 三种审批模式；混合批次提供「仅同意常规项」。安全阀 `safety_valves.auto_approve_writes = False` 拥有最终否决权，会把 `approval_mode = auto` 降级为 `smart` 而不是绕过审批。
-   - 飞书交互审批（可选）：挂起时发送带按钮的卡片，在手机上即可批准或取消，执行结果回到同一张卡；链路未验证前一律退回文本通知（见「飞书交互审批」一节）。
-   - 标准 MCP Server（`Streamable HTTP /mcp` + `stdio`），暴露 6 个核心 Tool + 4 个只读 Resource（含 `flywheel://core-card`）与 `/llms.txt`。
-   - 极简 `5+1` 控制台（`每日成果` / `每日沉淀` / `自动化任务` / `规则与规矩` / `接入与设置` + `关于`），提供 GitLab-CI 风格 8 节点流水线批次视图、上海时区定时调度热管理（可视化编辑 Cron / 启停 / 守护巡检与执行记录）及全链路审计日志。
+如果你已经重度使用 AI 编码工具，大概率遇到过这三个真实痛点：
+
+1. **AI 总是反复犯同一个错，而且爱「口头宣称已完成」**
+   - 上周刚踩过的坑，换个会话或换个工具照样重犯；交付时没有真实测试/运行证据就敢报 `done`。
+   - **飞轮的解法**：任务前通过 `flywheel_preflight_activate` 下发反偷懒契约、命中规则与历史反例；交付时通过 `flywheel_record_outcome` 做提交期证据硬门禁（`real / test / static / unknown`），没证据不给过。
+2. **自动记忆工具用几个月就成垃圾场，规则越攒越冲突**
+   - 很多 AI 记忆工具只管“往里塞”：闲聊也记、一次性报错也记、旧经验永不过期、新例外静默覆盖旧规则，最后上下文越喂越脏。
+   - **飞轮的解法**：两级噪音初筛（先硬筛再 AI 价值判定）+ 错题观察池（普通失误满 3 次才晋升规则）+ 分歧反例保留 + 30/90/180 天新鲜度衰减 + 周五自动蒸馏淘汰僵尸规则与表演型 Skill。
+3. **不敢让后台模型静默改写你的知识库和 `SKILL.md`**
+   - 怕密钥写进笔记、怕模型乱塞目录、怕覆盖掉辛苦写好的 Skill、怕坏输出静默污染资产。
+   - **飞轮的解法**：P02/P03 严格只读、审批后 P04 唯一受控写入；Schema 路由契约找不到归属宁可不写；写前密钥硬拦截；Skill 更新永远只追加不重写；安全阀对自动审批拥有最终否决权。
+
+---
+
+## 与上下文数据库 / AI Memory 工具（如 OpenViking、Mem0）的区别
+
+**AI Flywheel 不是另一个向量库或黑盒记忆数据库，而是站在它们上游/侧面的「治理与进化控制面」。两者是正交互补关系，不是替代关系：**
+
+| 维度 | 上下文数据库 / Memory 引擎（如 OpenViking、Mem0） | AI Flywheel（治理与进化控制面） |
+|---|---|---|
+| **核心问题** | 解决「记性问题」：怎么存得全、查得准、省 Token | 解决「守规矩 + 长记性问题」：怎么防复发、控写入、抗腐烂、验真伪 |
+| **核心抽象** | 向量库 / 虚拟文件系统（如 `viking://`）+ 分层检索 | 执行期证据契约 + P00–P07 受控状态机 + 规则/经验生命周期 |
+| **写入哲学** | 低摩擦、异步自动抽取写入内部存储 | 高门槛受控写入：初筛 → 路由校验 → 隐私拦截 → 人机审批 → 原子落盘 |
+| **抗熵增治理** | 偏增量沉淀 | 事不过三晋升、反例不覆盖、时效衰减、周五蒸馏、Skill 实效账本 |
+| **执行期约束** | 只提供上下文召回，不约束交付质量 | 任务前强制预检（Preflight），任务后证据门禁（Outcome Gate） |
+| **资产归属** | 收敛在引擎内部库 | 零锁定：直接写入人类可读、可进 Git 的 Markdown / Obsidian / `SKILL.md` |
+
+```mermaid
+flowchart LR
+    Agents["AI 编码工具\n(Claude Code / Codex / Antigravity)"]
+    FW["AI Flywheel\n(治理与进化控制面)"]
+    Assets["人类可读资产\n(本地 Markdown / Obsidian / SKILL.md)"]
+    Search["可选语义检索引擎\n(如 OpenViking / 本地向量库)"]
+
+    Agents -- "1. 开工预检 & 完工证据 (MCP)" --> FW
+    Agents -- "2. 会话入队 / 扫盘" --> FW
+    FW -- "3. 初筛 · 路由 · 审批 · 蒸馏后受控写入" --> Assets
+    Assets -. "4. 只读建索引 / 语义召回 (可选)" .-> Search
+    Search -. "检索候选" .-> Agents
+```
+
+---
+
+## 工作原理：一条执行闭环 + 一条受控进化流水线
+
+### 1. 执行期闭环（标准 MCP：6 Tools + 4 Resources）
+
+AI 工具通过 `http://127.0.0.1:8765/mcp`（Streamable HTTP）或 `flywheel mcp-stdio` 接入：
+
+- **开工前**：调用 `flywheel_preflight_activate` 获取反偷懒契约、个人协作偏好、命中先例规则及已知反例，并签发不可变预检回执；也可随时读取 `flywheel://core-card`（≤200 行跨端热态索引卡）。
+- **执行中**：遇到死循环、高危动作或规则复发时，通过 `flywheel_report_signal` 记入复盘队列。
+- **交付时**：调用 `flywheel_record_outcome` 提交结构化验收结果——声明 `status=success` 必须所有必填检查项通过，`real + pass` 必须附带真实证据，并同步回传 `used_knowledge_paths`（自动续期经验卡）与 `used_skills`（记录 Skill 真实调用）。
+- **会话入队**：通过 `flywheel_register_session` / `flywheel_ingest_session` 或后台定时扫盘，进入受控进化流水线。
+
+### 2. 后台受控进化流水线（P00–P07 固定 8 节点）
+
+每个阶段有严格的**副作用边界**（写越界即视为缺陷），状态机全链路可观测、可中断、可崩溃恢复：
+
+| 阶段 | 名称 | 副作用边界 |
+|---|---|---|
+| `P00_PREPARE` | 准备与对账 | 一级规则硬筛与会话对账，不触碰知识库 |
+| `P01_BEGIN` | 独占启动 | 抢占批次独占锁，按预算准入待审会话 |
+| `P02_REVIEW` | 全文审查 | **严格只读**：AI 语义价值闸门过滤闲聊，产出错题与分歧*候选*（不入库） |
+| `P03_ROUTE_PLAN` | 路由与写入计划 | **严格只读**：基于 `.wiki-schema.md` 候选集与证据生成写入计划 |
+| `P04_WRITE_VERIFY` | 受控写入与验收 | **唯一受控写入阶段**：审批通过后执行隐私门 → Schema 门 → 原子写入 → 回读校验 |
+| `P05_SETTLE` | 台账与队列结算 | 幂等结算会话状态、整批仅重建一次 FTS5、刷新派生核心索引卡 |
+| `P06_REPORT` | 机器报告与摘要 | 生成批次摘要与审计报告，不触碰知识库 |
+| `P07_DELIVER` | 交付与终态释锁 | 推送通知 / 审批卡片，释放独占锁 |
+
+> **失败与拒绝契约**：任意节点失败时，下游节点显式 `SKIPPED`、已准入会话退回 `pending`、锁释放且批次终态为 `FAILED`；审批被拒终态为 `CANCELLED`，与写了一半的 `PARTIAL` 严格区分。
+
+---
+
+## 核心能力（v0.6）
+
+### 1. 策略与知识解耦 + 执行期实证门禁
+- 反偷懒契约、循环保护阈值、证据分级（`real / test / static / unknown`）与个人协作偏好独立托管在 `profile/policies/`，无需绑定特定知识库。
+- 知识落点完全可插拔：默认内置 `./data/knowledge`（零配置开箱即用），也可无侵入挂载任意本地 Markdown / Obsidian Wiki。
+
+### 2. 抗熵增进化引擎（防记忆投毒、敢做减法、规则可回溯）
+- **两级会话初筛**：一级 0-Token 规则硬筛自动过滤内部子代理碎片与空会话；二级 P02 语义价值闸门直接丢弃翻译、闲聊与一次性问答，绝不硬凑笔记。
+- **双轨错题观察池**：失误分 `red_silent`（🔴 沉默错误）/ `yellow_caught`（🟡 自查拦截）/ `green_minor`（🟢 轻微）；普通失误按 `root_cause_key` 聚类满 **3 次（事不过三）** 才晋升规则，高危沉默错误支持首次直通试运行。
+- **分歧反例保留 + 轻量规则双时态沿革**：规则复测失败或出现例外时写入 `dissent_records` 绝不静默覆盖；规则替代与停用自动记录 `supersedes_rule_id`、`effective_from`、`effective_to`（纯 SQLite 幂等迁移，无需图库），完整保留规则演进时间线。
+- **经验卡新鲜度保鲜**：按 `volatile`（30 天）/ `evolving`（90 天）/ `evergreen`（180 天）管理有效期；超期自动降权并提示复核，在真实任务中通过 `real` 验证引用时自动续期。
+- **周五分层蒸馏 + 反 Skill 表演**：支持只读预览（`GET /api/site/dream` / 控制台一键预览）与自动/手动执行——将 14 天零命中试运行规则转入 `dormant`、标记超期经验、检测触发词重合规则及 21 天零调用或连续失败 Skill。
+
+### 3. 人机可控的资产变更、Git 审计与多通道通知
+- **合同驱动的 Schema 写入门禁**：挂载含 `.wiki-schema.md` 的 Wiki 时，P03 由模型从现场候选集中声明路由并经证据交叉校验（归属不明或冲突绝不写入，记 `planned_doc_unrouted`）；支持中性 `postflight_hook_script` 写后校验钩子（向后兼容 `wiki_d2_postflight_script`）。
+- **写时隐私与密钥门禁**：自动脱敏 `<private>...</private>` 区块（含文件名 slug 剥离），硬拦截 API Key / Token / 私钥（`SecretLeakError`）。
+- **Skill 追加式无损更新**：`action="update"` 只在现有 `SKILL.md` 末尾追加新节——旧文件逐字节为新文件前缀，写前备份、原子替换、SHA-256 回读校验并保留原有换行符；审批卡提供现有大纲与全文对照。
+- **可选 P04 本地 Git 审计提交**：开启 `knowledge_sink.auto_git_commit: true` 后，P04 写入验收完成时仅对本批写入路径执行 `git commit --only`（带 `run_id` 与审批来源，绝不触碰无关文件、绝不 `push`）。
+- **分层审批、安全阀与多通道通知**：支持 `smart` / `always` / `auto` 审批模式，安全阀 `safety_valves.auto_approve_writes = false` 拥有最终否决权；支持 Web 控制台、通用 **Webhook**（隐私脱敏 + 可选 HMAC-SHA256 `X-Flywheel-Signature` 签名 + 非致命投递）以及可选飞书交互卡片审批。
+
+### 4. 工程级可靠性与可观测性
+- **反静默回退**：`api` / `cli` 模式下模型输出不可用时节点直接失败并留下原因码与结构化诊断，绝不偷偷退回本地启发式却伪报模型来源。
+- **校验后缓存与调用追踪**：仅在回复通过语义校验后写入 `api_cache/`；记录尝试次数、耗时、实际服务模型与 prompt / completion / reasoning token 用量，在控制台节点详情直接透出。
+- **原子审批与崩溃恢复**：认领审批、状态迁移与审计事件在同一事务落盘；执行中每 15 秒续锁打心跳，`serve` 进程每 30 秒自动收割僵尸批次。
+
+### 5. 极简 `5+1` 控制面与零摩擦引导 CLI
+- **控制面 Web UI**：`今日态势`（实证通过率 / 规则健康 / 错题池 / 实时调度与安全阀 / 核心索引卡）/ `沉淀与审批`（噪音过滤漏斗 / 模型遥测 / 审批抽屉）/ `自动化调度`（上海时区 Cron 热重载 / 周五蒸馏预览与触发 / 守护巡检）/ `规则与进化`（避坑规则含沿革徽标 / 错题与分歧 / Skill 实效与经验保鲜 / 证据台账 / 执行规矩）/ `接入与设置` + `关于`。
+- **引导与诊断 CLI**：内置只读环境体检 `flywheel doctor [--json]` 与多端 MCP 配置向导 `flywheel init-client <claude-code|codex|claude-desktop|antigravity> [--apply]`（默认安全 dry-run，应用时自动备份并幂等合并）。
+
+---
+
+## 非目标（What AI Flywheel Does NOT Do）
+
+为了保持清晰边界，AI Flywheel **刻意不做**以下事情：
+
+- **不做重型向量数据库或文档解析器**：内置 SQLite FTS5 只做零依赖轻量兜底，不内嵌 Embedding 运维、PDF/PPT 解析或代码 AST 索引；需要大规模语义检索时，建议将治理后的 Markdown 目录交由 OpenViking 等专业检索引擎索引。
+- **不做全量聊天记录黑盒记忆库**：不追求记住随口聊天的每一句生活细节，只聚焦高信号工程经验、防复发规则与可复用 Skill。
+- **不做通用 Agent Runtime 或聊天机器人框架**：保持无侵入旁路控制面定位，让你继续使用自己顺手的 AI 编码工具。
 
 ---
 
@@ -71,14 +150,22 @@ npm run build
 cd ..
 ```
 
-### 3. 一键启动
+### 3. 一键启动与引导自检
 
 ```bash
-flywheel serve --seed
+flywheel doctor           # 只读环境与配置自检（支持 --json）
+flywheel serve --seed     # 启动本地控制面与 MCP 服务
+```
+
+快速生成并合并客户端 MCP 配置（默认安全 dry-run，确认后加 `--apply` 自动备份并合并）：
+
+```bash
+flywheel init-client claude-code
+flywheel init-client codex --apply
 ```
 
 启动后访问：
-- **飞轮控制台**：`http://127.0.0.1:8765`
+- **控制面 Web UI**：`http://127.0.0.1:8765`
 - **MCP Streamable HTTP 端点**：`http://127.0.0.1:8765/mcp`
 - **Agent 发现文档**：`http://127.0.0.1:8765/llms.txt`
 
@@ -92,113 +179,88 @@ flywheel mcp-stdio
 
 ## 配置与外部挂载
 
-复制 `flywheel.yaml.example` 为 `flywheel.yaml`（已被 `.gitignore` 忽略），即可无侵入挂载私有配置覆盖包、Skills 目录、本地知识库、OpenAI 兼容 API 网关及飞书通知通道：
+复制 [`flywheel.yaml.example`](./flywheel.yaml.example) 为 `flywheel.yaml`（已被 `.gitignore` 忽略），即可无侵入挂载私有策略覆盖包、本地 Skills 目录、Markdown / Obsidian Wiki 与 OpenAI 兼容模型端点：
 
 ```yaml
 profile:
-  override_dir: "/path/to/your-home-repo/flywheel-profile"  # 可选：私有偏好与规则覆盖包
+  override_dir: "/path/to/your-private-profile"   # 可选：私有偏好与规则覆盖包
 
 capabilities:
   skills_dirs:
-    - "/path/to/your-skills"                                # 可选：本地 SKILL.md 目录
+    - "/path/to/your-skills"                      # 可选：本地 SKILL.md 目录
 
 knowledge_sink:
-  type: "local_markdown_wiki"                               # builtin_kb | local_markdown_wiki
-  root: "/path/to/your-wiki"                                # 挂载任意本地 Markdown / Obsidian 目录
-  # 挂载带 .wiki-schema.md 的 Wiki 时，P03 按合同路由知识文档：模型从 Wiki 动态发现的候选集里声明页面类型与项目；
-  # 声明不在候选集、声明无归属或与工作区/草稿证据冲突时不写入，记入 planned_doc_unrouted 审计事件。
+  type: "local_markdown_wiki"                     # builtin_kb | local_markdown_wiki
+  root: "/path/to/your-wiki"                      # 挂载任意本地 Markdown / Obsidian 目录
+  auto_git_commit: false                          # 可选：P04 写完后仅提交本批文件到本地 Git（绝不 push）
+  postflight_hook_script: ""                      # 可选：SchemaWriteGate 写后校验脚本（兼容 wiki_d2_postflight_script）
+
+delivery:
+  webhook:
+    enabled: false                                # 可选：通用 Webhook 通知（隐私脱敏 + HMAC-SHA256 签名）
+    url: ""
+    secret: ""                                    # 也可通过 FLYWHEEL_WEBHOOK_SECRET 注入
+    notify_on_fyi: false
 
 workflow:
-  approval_mode: "smart"                                    # smart | always | auto
+  approval_mode: "smart"                          # smart | always | auto
   friday_weekly_enabled: true
 
 runner:
-  mode: "api"                                               # dry_run | api | cli
+  mode: "api"                                     # dry_run | api | cli
   api:
-    base_url: "http://127.0.0.1:8000/v1"                     # 任意 OpenAI 兼容端点
-    model: "your-model"                                     # 端点提供的模型名
-    timeout_seconds: 240                                    # 单次调用的墙钟上限（秒）
-    reasoning_effort: ""                                    # 留空则不发送该参数；非空时进入缓存键
-    transport_retries: 1                                    # 超时/连接错误的即时重试次数（0 关闭）
+    base_url: "http://127.0.0.1:8000/v1"          # 任意 OpenAI 兼容端点
+    model: "your-model"
+    timeout_seconds: 240
+    reasoning_effort: ""                          # 留空则不发送该参数
+    transport_retries: 1                          # 超时/连接错误即时重试次数
 
 safety_valves:
-  # 安全阀拥有最终否决权：auto_approve_writes 为 false 时，approval_mode: auto 会被降级为 smart，
-  # 而不是绕过审批；model_execution_enabled 关闭后，所有会调用模型或本地 CLI 的执行器都退回 dry_run。
-  auto_approve_writes: false
-  model_execution_enabled: null                             # 留空则沿用旧的 cli_execution_enabled
+  auto_approve_writes: false                      # 拥有最终否决权：false 会将 auto 降级为 smart
+  model_execution_enabled: null
 ```
 
-> 完整字段与逐项注释见 [`flywheel.yaml.example`](./flywheel.yaml.example)；本仓是公开仓库，
-> 示例里不写任何个人绝对路径——私有配置只进被 `.gitignore` 忽略的 `flywheel.yaml`。
+<details>
+<summary><strong>可选集成：飞书交互卡片审批（点击展开）</strong></summary>
 
-### 飞书交互审批（可选）
-
-在飞书卡片上直接批准 / 仅批准常规项 / 取消一次沉淀批次，结果回到同一张卡：
+在手机飞书卡片上直接批准 / 仅批准常规项 / 取消一次沉淀批次，执行结果回写到同一张卡；链路未通过自检或不可信时自动降级为纯文本通知：
 
 ```yaml
 delivery:
   feishu_cli:
     enabled: true
-    command: "lark-cli"        # 需要 lark-cli >= 1.0.64（本机 npm 安装即可）
+    command: "lark-cli"        # 需要 lark-cli >= 1.0.64
     identity: "bot"
-    user_id: "ou_xxx"          # 私聊接收人（open id）；交互卡片只发私聊
+    user_id: "ou_xxx"          # 私聊接收人 open_id
     notify_on_fyi: false
-    interactive: true           # 打开交互审批
-    approver_open_ids: []       # 额外审批人（默认 user_id 本人可批）
+    interactive: true
+    approver_open_ids: []      # 额外审批人（默认 user_id 本人可批）
 ```
 
-首次启用三步：
+**首次启用三步：**
+1. 在飞书开发者后台为应用订阅「卡片回传交互」（`card.action.trigger`，长连接方式）并发布版本。
+2. 重启 `flywheel serve`。
+3. 运行 `flywheel feishu-check`（或在控制台「接入与设置」页一键触发自检）并在测试卡上点击确认；通过前通知均为纯文本。
 
-1. 在飞书开发者后台为 lark-cli 绑定的应用订阅「卡片回传交互」（`card.action.trigger`，长连接方式），并发布一个版本——平台侧没有预检，只能靠下一步验证。
-2. 重启 `flywheel serve`（`command` / `command_args` / `identity` 改动都需要重启生效）。
-3. 运行 `flywheel feishu-check` 并在收到的测试卡上点一下；通过之前，所有审批通知都是纯文本，不会出现点了没反应的按钮。
+**关键安全边界**：仅配置的审批人在目标消息上的首次点击生效；敏感项附带内容哈希与摘录并注明「摘录不等于全文」；同一个飞书应用的卡片监听仅允许一个活跃 `serve` 实例。
 
-说明与边界：
-
-- 自检是闸门：lark-cli 版本或文件、审批人、接收人任一变化都会使自检失效并退回文本，重新运行 `flywheel feishu-check` 即可恢复。
-- 审批卡按摘录批准：敏感情项（Skill 变更 / 删除 / 覆盖核心文件）展示动作、路径、理由、正文摘录与内容校验哈希，并注明「摘录不等于全文」；全文始终可在门户逐项核对。
-- 链路不可信时自动降级：`serve` 未运行、监听重连中、自检失效或交互卡连续发送失败，审批通知退回纯文本并写明原因；已送达的卡片会把按钮收掉、提示到电脑前处理。
-- 同一个飞书应用的卡片点击只允许一个监听者：不要在两台机器上同时开交互模式。
-- 点击校验：只有配置的审批人、在送达的那条消息上、对这张卡提供的选项的点击才生效；重复点击与门户并发作答只有一次生效（见 `fix-approval-claim-and-recovery` 的原子认领）。
+</details>
 
 详见 [CHANGELOG.md](./CHANGELOG.md) 了解各版本演进与 SQLite 自动迁移说明。
 
 ---
 
-## 开发流程（OpenSpec 规格驱动）
+## 开发规范与一键验收
 
-本仓库用 [OpenSpec](https://github.com/Fission-AI/OpenSpec) 管理行为契约与变更，约定见 `openspec/config.yaml`（生成产物时自动注入）：
+本仓库采用 **OpenSpec** 规格驱动开发（`openspec/specs/` 为现行基线，`openspec/changes/` 管理变更），架构地图、P00–P07 副作用矩阵与不可协商护栏见 [`AGENTS.md`](./AGENTS.md)。
 
-- `openspec/specs/`：现行基线规格。首轮已建 `knowledge-write-gate`（知识文档受控写入与 Wiki 门禁）与 `workflow-orchestration`（P00–P07 编排）；其余能力在首次触及时补基线。
-- `openspec/changes/`：进行中的变更（proposal → specs → design → tasks）与 `archive/` 已归档变更。
-- 流程：Explore 澄清 → Propose 产出四类产物 → Apply 实现 → Verify（test / real 两级证据）→ 确认后 Archive。
-
-```bash
-openspec new change fix-<kebab-case-name>   # 新建变更（修复 fix- / 新能力 feat- / 治理 chore-）
-openspec status --change <name>             # 产物完成度
-openspec validate --all --strict            # 规格校验
-```
-
-代码图谱：在仓库根执行 `codegraph init` 建立本机索引（`.codegraph/` 不入库）；改动前用 `codegraph callers|impact <symbol>` 看影响面，改动后 `codegraph sync`。
-
-## 验收与自动化测试
-
-一条命令跑完全部验收——公开仓卫生、CHANGELOG 标题检查、规格校验、测试套件（可选前端构建）：
+提交或宣称完成前，运行一条命令完成全量门禁（公开仓卫生 → CHANGELOG 检查 → OpenSpec 严格校验 → pytest 含跨层不变量测试 → 前端构建）：
 
 ```bash
 python scripts/verify_repo.py --frontend
 ```
 
-它只在有检查失败时返回非零，**不会自动修任何东西**：失败就是一份报告。也可以单独跑其中几项：
-
-```bash
-pytest tests -q                              # 测试套件
-openspec validate --all --strict             # 规格校验
-cd frontend && npm run build                 # 前端产物
-```
-
-跨层不变量（版本四处一致、前端状态联合 ↔ 后端枚举、敏感情项判定、提示词骨架、`serve` 角色冒烟、Windows 契约、公开仓卫生）固化在 [`tests/test_arch_invariants.py`](./tests/test_arch_invariants.py)；
-架构地图、P00–P07 副作用矩阵与不可协商的护栏见 [`AGENTS.md`](./AGENTS.md)。
+---
 
 ## License
 

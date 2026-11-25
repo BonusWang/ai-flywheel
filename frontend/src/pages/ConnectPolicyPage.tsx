@@ -1,17 +1,21 @@
 import React, { useEffect, useState } from 'react'
-import { Save, Zap } from 'lucide-react'
+import { CheckCircle2, ChevronRight, RefreshCw, Save, Shield, Zap } from 'lucide-react'
+import type { PageKey } from '../App'
 import { api } from '../api'
 import { CodeBlock, CopyButton } from '../components/CodeBlock'
 import { PillTabs } from '../components/PageLayout'
-import type { ConnectPayload, PreflightResponse } from '../types'
+import { FEISHU_LISTENER_STATE_LABELS, labelOf } from '../lib/labels'
+import type { ConnectPayload, FeishuCheckStatus, PreflightResponse } from '../types'
 
 interface Props {
   initialTab?: 'connect' | 'storage' | 'test'
+  onNavigate?: (page: PageKey) => void
   onGlobalRefresh: () => void
 }
 
 export const ConnectPolicyPage: React.FC<Props> = ({
   initialTab = 'connect',
+  onNavigate,
   onGlobalRefresh,
 }) => {
   const [tab, setTab] = useState<'connect' | 'storage' | 'test'>(initialTab)
@@ -40,13 +44,18 @@ export const ConnectPolicyPage: React.FC<Props> = ({
   const [cliCmd, setCliCmd] = useState('')
   const [cliArgs, setCliArgs] = useState('')
   const [approvalMode, setApprovalMode] = useState('smart')
-  const [fridayWeekly, setFridayWeekly] = useState(true)
   const [workflowEnabled, setWorkflowEnabled] = useState(true)
   const [skillWriteEnabled, setSkillWriteEnabled] = useState(true)
   const [scheduleEnabled, setScheduleEnabled] = useState(false)
+  const [dailyCron, setDailyCron] = useState('0 20 * * *')
   const [feishuEnabled, setFeishuEnabled] = useState(false)
   const [feishuUserId, setFeishuUserId] = useState('')
   const [feishuNotifyFyi, setFeishuNotifyFyi] = useState(false)
+  const [feishuInteractive, setFeishuInteractive] = useState(false)
+  const [feishuApproverIds, setFeishuApproverIds] = useState('')
+  const [feishuCheck, setFeishuCheck] = useState<FeishuCheckStatus | null>(null)
+  const [feishuCheckBusy, setFeishuCheckBusy] = useState(false)
+  const [feishuCheckError, setFeishuCheckError] = useState<string | null>(null)
 
   useEffect(() => {
     setTab(initialTab)
@@ -82,18 +91,40 @@ export const ConnectPolicyPage: React.FC<Props> = ({
           ? 'auto'
           : configuredMode
     setApprovalMode(resolvedMode)
-    setFridayWeekly(cfg.workflow?.friday_weekly_enabled !== false)
     setWorkflowEnabled(cfg.safety_valves?.workflow_enabled !== false)
     setSkillWriteEnabled(cfg.safety_valves?.skill_write_enabled !== false)
     setScheduleEnabled(Boolean(cfg.workflow?.schedule_enabled))
+    setDailyCron(String(cfg.workflow?.daily_cron || '0 20 * * *'))
     setFeishuEnabled(Boolean(cfg.delivery?.feishu_cli?.enabled))
     setFeishuUserId(cfg.delivery?.feishu_cli?.user_id || '')
     setFeishuNotifyFyi(Boolean(cfg.delivery?.feishu_cli?.notify_on_fyi))
+    setFeishuInteractive(Boolean(cfg.delivery?.feishu_cli?.interactive))
+    setFeishuApproverIds((cfg.delivery?.feishu_cli?.approver_open_ids || []).join(', '))
+    api
+      .feishuCheckStatus()
+      .then((st) => setFeishuCheck(st))
+      .catch(() => setFeishuCheck(null))
   }
 
   useEffect(() => {
     loadAll().catch(() => {})
   }, [])
+
+  useEffect(() => {
+    if (!feishuCheck?.running) return
+    const timer = window.setInterval(() => {
+      api
+        .feishuCheckStatus()
+        .then((st) => {
+          setFeishuCheck(st)
+          if (!st.running) {
+            onGlobalRefresh()
+          }
+        })
+        .catch(() => {})
+    }, 2000)
+    return () => window.clearInterval(timer)
+  }, [feishuCheck?.running, onGlobalRefresh])
 
   const showToast = (msg: string) => {
     setNotice(msg)
@@ -144,8 +175,6 @@ export const ConnectPolicyPage: React.FC<Props> = ({
         },
       },
       workflow: {
-        schedule_enabled: scheduleEnabled,
-        friday_weekly_enabled: fridayWeekly,
         approval_mode: approvalMode,
         auto_approve_writes: approvalMode === 'auto',
       },
@@ -154,6 +183,11 @@ export const ConnectPolicyPage: React.FC<Props> = ({
           enabled: feishuEnabled,
           user_id: feishuUserId.trim(),
           notify_on_fyi: feishuNotifyFyi,
+          interactive: feishuInteractive,
+          approver_open_ids: feishuApproverIds
+            .split(/[\s,，]+/)
+            .map((s) => s.trim())
+            .filter(Boolean),
         },
       },
       safety_valves: {
@@ -170,6 +204,36 @@ export const ConnectPolicyPage: React.FC<Props> = ({
     } else {
       setRestartNotice([])
       showToast('设置已保存')
+    }
+  }
+
+  const runFeishuCheck = async () => {
+    if (feishuCheckBusy || feishuCheck?.running) return
+    setFeishuCheckError(null)
+    setFeishuCheckBusy(true)
+    try {
+      await api.updateConfig({
+        delivery: {
+          feishu_cli: {
+            enabled: feishuEnabled,
+            user_id: feishuUserId.trim(),
+            notify_on_fyi: feishuNotifyFyi,
+            interactive: feishuInteractive,
+            approver_open_ids: feishuApproverIds
+              .split(/[\s,，]+/)
+              .map((s) => s.trim())
+              .filter(Boolean),
+          },
+        },
+      })
+      await api.startFeishuCheck(120)
+      const st = await api.feishuCheckStatus()
+      setFeishuCheck({ ...st, running: true })
+      showToast('已发出飞书链路自检测试卡，请在飞书点击「我收到了」')
+    } catch (err) {
+      setFeishuCheckError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setFeishuCheckBusy(false)
     }
   }
 
@@ -284,11 +348,74 @@ export const ConnectPolicyPage: React.FC<Props> = ({
         </div>
       )}
 
-      {/* Tab 2: Directories, Model & Schedule */}
+      {/* Tab 2: Safety Valves, Directories, Model & Channels */}
       {tab === 'storage' && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 text-[12.5px]">
+        <div className="space-y-4 text-[12.5px]">
+          <section className="card p-5 space-y-3 border-accent/25">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Shield className="w-4 h-4 text-accent" />
+                <h2 className="text-[14.5px] font-bold text-ink">1. 安全阀与审批护栏（最高优先级）</h2>
+              </div>
+              <span className="chip">安全阀对自动审批拥有最终否决权</span>
+            </div>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-ink-3 mb-1">审批方式</label>
+                <select
+                  value={approvalMode}
+                  onChange={(e) => setApprovalMode(e.target.value)}
+                  className="field-input w-full px-3 py-2 text-[12.5px]"
+                >
+                  <option value="smart">智能审批（推荐：常规笔记与规则自动通过，仅 Skill 或敏感变更需确认）</option>
+                  <option value="always">每次写入都要我手动确认</option>
+                  <option value="auto">全部自动通过并落盘</option>
+                </select>
+              </div>
+              <div className="flex flex-col justify-center gap-2 pt-1 text-[12.5px] text-ink-2">
+                <label className="inline-flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={workflowEnabled}
+                    onChange={(e) => setWorkflowEnabled(e.target.checked)}
+                    className="accent-accent"
+                  />
+                  <span>允许后台沉淀流水线运行（workflow_enabled）</span>
+                </label>
+                <label className="inline-flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={skillWriteEnabled}
+                    onChange={(e) => setSkillWriteEnabled(e.target.checked)}
+                    className="accent-accent"
+                  />
+                  <span>允许审批通过后追加写入 Skill 目录（skill_write_enabled）</span>
+                </label>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-[var(--radius-control)] bg-bg-sunk/70 border border-line-soft px-3 py-2 text-[12px]">
+              <span className="text-ink-3">
+                后台定时调度与周五蒸馏状态：
+                <strong className="text-ink font-medium ml-1">
+                  {scheduleEnabled ? `已开启（Cron: ${dailyCron}）` : '已暂停'}
+                </strong>
+              </span>
+              {onNavigate && (
+                <button
+                  type="button"
+                  onClick={() => onNavigate('automations')}
+                  className="inline-flex items-center gap-0.5 text-accent font-semibold hover:text-accent-ink"
+                >
+                  前往「自动化调度」管理
+                  <ChevronRight className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+          </section>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <section className="card p-5 space-y-3">
-            <h2 className="text-[14.5px] font-bold text-ink">1. 个人配置与技能目录</h2>
+            <h2 className="text-[14.5px] font-bold text-ink">2. 个人策略与技能目录</h2>
             <div>
               <label className="block text-ink-3 mb-1">个人规矩覆盖目录（选填）</label>
               <input
@@ -311,7 +438,7 @@ export const ConnectPolicyPage: React.FC<Props> = ({
           </section>
 
           <section className="card p-5 space-y-3">
-            <h2 className="text-[14.5px] font-bold text-ink">2. 笔记保存位置</h2>
+            <h2 className="text-[14.5px] font-bold text-ink">3. 知识落点目录</h2>
             <div>
               <label className="block text-ink-3 mb-1">保存方式</label>
               <select
@@ -324,7 +451,7 @@ export const ConnectPolicyPage: React.FC<Props> = ({
               </select>
             </div>
             <div>
-              <label className="block text-ink-3 mb-1">笔记根目录</label>
+              <label className="block text-ink-3 mb-1">知识库根目录</label>
               <input
                 value={kbRoot}
                 onChange={(e) => setKbRoot(e.target.value)}
@@ -334,7 +461,7 @@ export const ConnectPolicyPage: React.FC<Props> = ({
           </section>
 
           <section className="card p-5 space-y-3">
-            <h2 className="text-[14.5px] font-bold text-ink">3. 后台整理使用的模型</h2>
+            <h2 className="text-[14.5px] font-bold text-ink">4. 后台整理模型</h2>
             <div>
               <label className="block text-ink-3 mb-1">运行方式</label>
               <select
@@ -413,34 +540,7 @@ export const ConnectPolicyPage: React.FC<Props> = ({
           </section>
 
           <section className="card p-5 space-y-3">
-            <h2 className="text-[14.5px] font-bold text-ink">4. 定时、审批与飞书通知</h2>
-            <div>
-              <label className="block text-ink-3 mb-1">审批方式</label>
-              <select
-                value={approvalMode}
-                onChange={(e) => setApprovalMode(e.target.value)}
-                className="field-input w-full px-3 py-2 text-[12.5px]"
-              >
-                <option value="smart">智能审批（推荐：常规笔记与规则自动通过，仅新建/修改 Skill 或重要变更需确认）</option>
-                <option value="always">每次写入都要我手动确认</option>
-                <option value="auto">全部自动通过并落盘</option>
-              </select>
-            </div>
-            <label className="flex items-center justify-between gap-3 p-2.5 rounded-[var(--radius-control)] bg-bg-sunk/70 border border-line-soft cursor-pointer">
-              <div>
-                <div className="font-medium text-ink">每天 20:00 自动整理（周五附带周复盘）</div>
-                <div className="text-[11.5px] text-ink-4">周一至周四每日沉淀，周五自动叠加本周重复流程与技能复盘</div>
-              </div>
-              <input
-                type="checkbox"
-                checked={scheduleEnabled && fridayWeekly}
-                onChange={(e) => {
-                  setScheduleEnabled(e.target.checked)
-                  setFridayWeekly(e.target.checked)
-                }}
-                className="accent-accent"
-              />
-            </label>
+            <h2 className="text-[14.5px] font-bold text-ink">5. 外部审批与通知通道（可选）</h2>
             <div className="p-2.5 rounded-[var(--radius-control)] bg-bg-sunk/70 border border-line-soft space-y-2">
               <label className="flex items-center justify-between gap-3 cursor-pointer">
                 <div>
@@ -455,46 +555,108 @@ export const ConnectPolicyPage: React.FC<Props> = ({
                 />
               </label>
               {feishuEnabled && (
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
-                  <input
-                    value={feishuUserId}
-                    onChange={(e) => setFeishuUserId(e.target.value)}
-                    placeholder="飞书接收人 open_id（ou_xxx）"
-                    className="field-input mono px-2.5 py-1.5 text-[12px]"
-                  />
-                  <label className="inline-flex items-center gap-2 text-[12px] text-ink-3 cursor-pointer px-1">
+                <div className="space-y-2.5 pt-1">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <input
+                      value={feishuUserId}
+                      onChange={(e) => setFeishuUserId(e.target.value)}
+                      placeholder="飞书接收人 open_id（ou_xxx）"
+                      className="field-input mono px-2.5 py-1.5 text-[12px]"
+                    />
+                    <label className="inline-flex items-center gap-2 text-[12px] text-ink-3 cursor-pointer px-1">
+                      <input
+                        type="checkbox"
+                        checked={feishuNotifyFyi}
+                        onChange={(e) => setFeishuNotifyFyi(e.target.checked)}
+                        className="accent-accent"
+                      />
+                      <span>常规自动通过时也发简报</span>
+                    </label>
+                  </div>
+                  <label className="flex items-start justify-between gap-3 pt-1.5 border-t border-line-soft/70 cursor-pointer">
+                    <div>
+                      <div className="text-[12.5px] font-medium text-ink">
+                        开启飞书交互审批卡片（直接在飞书内点击批准/拒绝）
+                      </div>
+                      <div className="text-[11.5px] text-ink-4">
+                        需要机器人身份、私聊 open_id 且飞书应用已订阅卡片回调，并通过下方链路自检
+                      </div>
+                    </div>
                     <input
                       type="checkbox"
-                      checked={feishuNotifyFyi}
-                      onChange={(e) => setFeishuNotifyFyi(e.target.checked)}
-                      className="accent-accent"
+                      checked={feishuInteractive}
+                      onChange={(e) => setFeishuInteractive(e.target.checked)}
+                      className="accent-accent mt-0.5"
                     />
-                    <span>常规自动通过时也发简报</span>
                   </label>
+                  {feishuInteractive && (
+                    <div className="space-y-2 pt-1">
+                      <input
+                        value={feishuApproverIds}
+                        onChange={(e) => setFeishuApproverIds(e.target.value)}
+                        placeholder="额外审批人 open_id（选填，逗号分隔，默认自动包含接收人）"
+                        className="field-input mono w-full px-2.5 py-1.5 text-[12px]"
+                      />
+                      <div className="flex flex-wrap items-center justify-between gap-2 rounded-[var(--radius-control)] bg-bg-card/80 border border-line-soft px-3 py-2 text-[12px]">
+                        <div className="space-y-0.5">
+                          <div className="flex items-center gap-1.5 text-ink-2">
+                            {feishuCheck?.valid ? (
+                              <CheckCircle2 className="w-3.5 h-3.5 text-ok-ink shrink-0" />
+                            ) : (
+                              <RefreshCw
+                                className={`w-3.5 h-3.5 text-ink-4 shrink-0 ${
+                                  feishuCheck?.running ? 'animate-spin text-accent' : ''
+                                }`}
+                              />
+                            )}
+                            <span>
+                              {feishuCheck?.running
+                                ? '链路自检进行中：请到飞书点击测试卡上的「我收到了」'
+                                : feishuCheck?.valid
+                                ? '飞书交互审批链路已验证通过'
+                                : `监听状态：${labelOf(
+                                    FEISHU_LISTENER_STATE_LABELS,
+                                    feishuCheck?.listener?.state || 'stopped',
+                                    '未知'
+                                  )} · 自检未通过`}
+                            </span>
+                          </div>
+                          {!feishuCheck?.running && !feishuCheck?.valid && feishuCheck?.reason && (
+                            <div className="text-[11px] text-ink-4">
+                              上次说明：{feishuCheck.reason}
+                            </div>
+                          )}
+                          {feishuCheckError && (
+                            <div className="text-[11px] text-hot">{feishuCheckError}</div>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={runFeishuCheck}
+                          disabled={feishuCheckBusy || Boolean(feishuCheck?.running) || !feishuUserId.trim()}
+                          className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-[var(--radius-control)] border border-line bg-bg-sunk text-ink text-[12px] font-medium hover:border-accent hover:text-accent-ink disabled:opacity-50"
+                        >
+                          <RefreshCw
+                            className={`w-3 h-3 ${
+                              feishuCheckBusy || feishuCheck?.running ? 'animate-spin' : ''
+                            }`}
+                          />
+                          <span>
+                            {feishuCheck?.running
+                              ? '等待飞书点击...'
+                              : feishuCheck?.valid
+                              ? '重新自检'
+                              : '保存并运行自检'}
+                          </span>
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
-            <div className="flex flex-wrap gap-4 pt-1 text-[12px] text-ink-2">
-              <label className="inline-flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={workflowEnabled}
-                  onChange={(e) => setWorkflowEnabled(e.target.checked)}
-                  className="accent-accent"
-                />
-                <span>允许后台沉淀运行</span>
-              </label>
-              <label className="inline-flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={skillWriteEnabled}
-                  onChange={(e) => setSkillWriteEnabled(e.target.checked)}
-                  className="accent-accent"
-                />
-                <span>允许批准后写入 Skill 目录</span>
-              </label>
-            </div>
           </section>
+          </div>
         </div>
       )}
 
