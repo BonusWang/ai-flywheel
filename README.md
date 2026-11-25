@@ -63,7 +63,7 @@ AI Flywheel 采用「**3+1**」通用生态定位：最外层是一个不持有�
 - **外部策略与装备仓（可选覆盖）**：通过 `profile.override_dir` 只读挂载 policies / triggers、`skills/` 与 `agents/`；P04 对 `SKILL.md` 只做追加式更新（旧文件逐字节为新文件前缀）。
 - **挂载知识库（本地 Markdown / Obsidian Wiki）**：人类可读、可进 Git 的知识资产；`.wiki-schema.md` 写入门禁、FTS5 回读索引与 P04 审批后受控写入。
 
-> **v0.7.0 更新指引**：新增显式**沉淀队列机制（`distill_queue`）与数据建模底座（SQLite v4）**——统一码值字典表 `sys_dict_items`（`GET /api/site/dicts`）、复用 `audit_events` 作为全系统结构化状态变迁轨迹、落仓权威建模脚本 [`docs/schema.sql`](./docs/schema.sql) 与 [`docs/data-model.md`](./docs/data-model.md)（含不变量测试守护）；实现 **Codex 严格归档制（`archived_sessions` 出现入队/移出撤回/增大增量）**、**Claude Code exit 退出触发（`SessionEnd` 入队 + `resume` 自动撤回）**、第 7 个 MCP 工具 **`flywheel_session_intent`**（对话内一键声明沉淀 / 不沉淀 / 撤回，Hook 透传 `session_key` 精准对齐）、超大上下文 0-Token 瘦身与分片（不丢尾）以及死信隔离（DLQ）；「沉淀与审批」页升级为顶部 6 态库存进度条 + **「沉淀队列（库存）」/「执行流水线（P00–P07）」**双 Tab 控制台。
+> **v0.7.1 补丁指引**：P04 写入项目实战重卡或轻记卡时，现在会把它与对应项目的 `实战笔记/笔记索引.md` 作为同一个受控事务处理。索引目标与新增条目在审批前可见，P04 在索引锁内复核批准范围；并发、重试和重复执行保持去重，任一侧写入或后检失败时两处文件一起回滚。v0.7.0 引入的显式沉淀队列、SQLite v4 数据底座与双端归档触发机制继续适用。
 
 ---
 
@@ -97,13 +97,13 @@ AI 工具通过 `http://127.0.0.1:8765/mcp`（Streamable HTTP）或 `flywheel mc
 
 ---
 
-## 核心能力（v0.7.0）
+## 核心能力（v0.7.1）
 
 ### 1. 策略与知识解耦 + 执行期实证门禁
 - 反偷懒契约、循环保护阈值、证据分级（`real / test / static / unknown`）与个人协作偏好独立托管在 `profile/policies/`，无需绑定特定知识库。
 - 知识落点完全可插拔：默认内置 `./data/knowledge`（零配置开箱即用），也可无侵入挂载任意本地 Markdown / Obsidian Wiki。
 
-### 2. 显式沉淀队列、双端归档机制与统一数据底座（v0.7.0）
+### 2. 显式沉淀队列、双端归档机制与统一数据底座（v0.7.1）
 - **可见的流水线库存（`distill_queue`）**：将客户端会话主档（`sessions`）与流水线沉淀任务解耦，提供 6 态库存（`queued` / `processing` / `processed` / `excluded` / `withdrawn` / `dead_letter`）、按工具分片统计与预计清仓批次数；同一会话支持撤回后再输入增量入队（`rev + 1` 水位线）与独立失败重试/死信隔离。
 - **双端精准触发 + MCP 显式声明**：
   - **Codex（严格归档制）**：仅同步 `archived_sessions/` 归档目录或 MCP 显式声明，移出自动撤回、续聊增大后重归档自动增量入队；

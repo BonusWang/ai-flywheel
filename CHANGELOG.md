@@ -3,6 +3,26 @@
 All notable changes to **AI Flywheel** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] - 2026-11-26
+
+### Added
+- **Atomic project-practice index registration** (`adapters/wiki/practice_index.py`, `adapters/knowledge.py`, `core/pipeline/coordinator.py`):
+  - P03 now carries the exact project notes-index target and entry preview as an approval-visible side effect of `project-practice-note` and `project-practice-lite` writes.
+  - Cards and their project index share a compensating transaction, combined D2 write-set, structured receipts and optional Git commit scope.
+
+### Changed
+- **Project-index write budget and concurrency**:
+  - P03 counts unique card and index paths against `knowledge_sink.max_write_set`; shared indexes count once.
+  - P04 revalidates the approved physical path set before any business side effect, then re-reads under a project-index lock and requires an exact approval match.
+  - Repeated execution deduplicates links and concurrent cards sharing one index preserve each other's entries.
+
+### Fixed
+- **Orphan practice cards after successful P04 writes**:
+  - Missing or moved indexes, legacy plans without index side effects, entry drift and postflight failure now fail closed.
+  - Card or index write/read-back/postflight failures restore both preimages and record rollback/resync evidence.
+- **Version `0.7.1`** (`backend/ai_flywheel/__init__.py`, `pyproject.toml`, `frontend/package.json`, `frontend/package-lock.json`, `profile/site.yaml`, `README.md`):
+  - Bumped the patch release across the current ownership and pinned root metadata fields.
+
 ## [0.7.0] - 2026-11-25
 
 ### Added
