@@ -63,6 +63,13 @@ MCP_TOOL_CATALOG: list[dict[str, str]] = [
         "description": "Push conversation digest or events directly from MCP-only clients (e.g. Claude Desktop).",
     },
     {
+        "name": "flywheel_session_intent",
+        "title_zh": "会话意图",
+        "phase": "采集",
+        "description_zh": "对话内显式声明：enqueue 高优先入队、opt_out 本会话永不沉淀、withdraw 撤回未消费排队项。",
+        "description": "Declare an explicit queue intent for the current session: enqueue | opt_out | withdraw.",
+    },
+    {
         "name": "flywheel_status",
         "title_zh": "健康态势",
         "phase": "观测",
@@ -196,6 +203,9 @@ class PublicationLayer:
                 self._sanitize_rule(r.model_dump(mode="json"), public_mode) for r in active_rules[:6]
             ],
             "recent_retro": [self._sanitize_retro(r.model_dump(mode="json"), public_mode) for r in open_retro[:5]],
+            "queue_summary": self.db.summarize_queue(
+                max_sessions_per_run=self.cfg.workflow.max_sessions_per_run
+            ),
             "safety_valves": self.cfg.safety_valves.model_dump(mode="json"),
             "workflow_lock": self.db.get_workflow_lock(),
         }

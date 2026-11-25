@@ -31,6 +31,28 @@ sessions:
   #   path: "~/.claude/projects"
   #   glob: "**/*.jsonl"
 
+  # Codex strict-archive mode: only sessions that land in an archive directory
+  # (or are declared explicitly through MCP `flywheel_session_intent` / the portal)
+  # enter the distill queue. An active, unarchived Codex session is never queued;
+  # a queued item whose archive file disappears is withdrawn on the next sync.
+  # Example:
+  # - client: "codex"
+  #   path: "~/.codex/archived_sessions"
+  #   glob: "**/*.jsonl"
+  codex_archive_sources: []
+
+  # Distill queue tuning:
+  #   queue_max_item_chars - per-item character cap; a larger session is compacted
+  #                          first and then split into ordered chunks 1/N..N/N so the
+  #                          final conclusions at the tail are never truncated.
+  #   queue_max_retries    - failed attempts before an item is isolated into
+  #                          dead_letter instead of blocking later batches.
+  #   codex_archive_sync_interval_seconds - interval of the lightweight archive
+  #                          reconciliation loop that the `serve` role runs.
+  queue_max_item_chars: 24000
+  queue_max_retries: 3
+  codex_archive_sync_interval_seconds: 60
+
 # Pluggable knowledge sink (decoupled from flywheel policies)
 knowledge_sink:
   # "builtin_kb" writes to ./data/knowledge (zero config)

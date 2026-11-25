@@ -1,3 +1,5 @@
+import type { DictItem } from '../types'
+
 export const STAGE_PLAIN_NAMES: Record<string, string> = {
   P00_PREPARE: '准备检查',
   P01_BEGIN: '选定对话',
@@ -125,6 +127,27 @@ export function labelOf(
 ): string {
   if (!key) return fallback ?? '—'
   return map[key] ?? fallback ?? key
+}
+
+/**
+ * Merge the unified dictionary labels over the local fallback table.
+ *
+ * `sys_dict_items` is the single display source the backend seeds on startup;
+ * the local tables in this file only cover the case where the dictionary has
+ * not loaded yet, so a badge never falls back to a raw enum code.
+ */
+export function dictLabels(
+  dicts: Record<string, DictItem[]> | null | undefined,
+  dictType: string,
+  fallback: Record<string, string>
+): Record<string, string> {
+  const merged: Record<string, string> = { ...fallback }
+  for (const item of dicts?.[dictType] ?? []) {
+    if (item.code && item.label_zh) {
+      merged[item.code] = item.label_zh
+    }
+  }
+  return merged
 }
 
 export function formatDateYMD(iso: string | null | undefined): string {

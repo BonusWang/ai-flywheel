@@ -47,7 +47,13 @@ def build_client_connect_guides(cfg: FlywheelConfig) -> dict[str, Any]:
                 "PreToolUse": [
                     {"hooks": [{"type": "command", "command": _thin_hook_cmd(base_url, "claude-code")}]}
                 ],
-                "Stop": [
+                # Exit-triggered archiving: `Stop` fires after every reply and must
+                # not enqueue; `SessionEnd` queues the finished conversation, and
+                # `SessionStart` withdraws it again when the user resumes.
+                "SessionEnd": [
+                    {"hooks": [{"type": "command", "command": _thin_hook_cmd(base_url, "claude-code")}]}
+                ],
+                "SessionStart": [
                     {"hooks": [{"type": "command", "command": _thin_hook_cmd(base_url, "claude-code")}]}
                 ],
             }
@@ -78,6 +84,12 @@ def build_client_connect_guides(cfg: FlywheelConfig) -> dict[str, Any]:
 3. **收尾闭环**：
    - 若命中规则或完成重要交付，调用 `flywheel_record_outcome` 提交真实证据（区分 `real/test/static/unknown`）；
    - 若当前客户端无本地日志文件（如 Claude Desktop），调用 `flywheel_ingest_session` 推送本轮摘要，交由后台 P00-P07 自主回顾与沉淀。
+
+**显式队列声明**：注入上下文头带有 `session=<client>:<session_id>` 时，原样传给 `flywheel_session_intent`：
+
+- `action="enqueue"`：手工把当前会话提升为高优沉淀任务；
+- `action="opt_out"`：本会话永不沉淀（用户说“本会话不沉淀”“不要沉淀”时调用）；
+- `action="withdraw"`：撤回尚未消费的排队任务（会话继续聊时）。
 """
 
     return {
@@ -96,7 +108,12 @@ def build_client_connect_guides(cfg: FlywheelConfig) -> dict[str, Any]:
                 "mcp_config": codex_mcp_toml,
                 "hook_label": "hooks.json 极薄转发 Hook（零业务逻辑）",
                 "hook_config": codex_hooks_json,
-                "notes": "Hook 只做 1 行 HTTP 转发，反偷懒与死循环规则全由 ai-flywheel 服务统一托管。",
+                "notes": (
+                    "严格归档制：只有 `~/.codex/archived_sessions` 中的归档会话（或 MCP "
+                    "`flywheel_session_intent` 显式声明）会进入沉淀队列，活跃会话不会被自动入队；"
+                    "归档文件被移出后队列项自动撤回。Hook 只做 1 行 HTTP 转发，"
+                    "反偷懒与死循环规则全由 ai-flywheel 服务统一托管。"
+                ),
             },
             {
                 "id": "claude-code",
@@ -106,7 +123,11 @@ def build_client_connect_guides(cfg: FlywheelConfig) -> dict[str, Any]:
                 "mcp_config": claude_code_cli_cmd,
                 "hook_label": ".claude/settings.json 极薄转发 Hook",
                 "hook_config": claude_code_hooks_json,
-                "notes": "配合 ~/.claude/projects/**/*.jsonl 扫盘配置，即使异常退出也不会漏审会话。",
+                "notes": (
+                    "退出触发制：`SessionEnd` 时自动入队，`SessionStart(source=\"resume\")` "
+                    "与会话内新提示自动撤回未消费排队项，`Stop` 不再触发入队。"
+                    "配合 ~/.claude/projects/**/*.jsonl 扫盘配置，即使异常退出也不会漏审会话。"
+                ),
             },
             {
                 "id": "claude",
@@ -116,7 +137,10 @@ def build_client_connect_guides(cfg: FlywheelConfig) -> dict[str, Any]:
                 "mcp_config": claude_desktop_json,
                 "hook_label": "粘贴到 Claude Preferences / Project Instructions",
                 "hook_config": universal_skill_md,
-                "notes": "Claude Desktop 无原生 Hook，通过指令引导收尾调用 flywheel_ingest_session 推入飞轮队列。",
+                "notes": (
+                    "Claude Desktop 无原生 Hook，通过指令引导收尾调用 `flywheel_ingest_session` "
+                    "推入飞轮队列，并用 `flywheel_session_intent` 声明入队 / 不沉淀 / 撤回。"
+                ),
             },
         ],
         "universal_skill_template": universal_skill_md,

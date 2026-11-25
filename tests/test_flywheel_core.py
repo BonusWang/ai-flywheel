@@ -17,6 +17,7 @@ from ai_flywheel.models import (
     OutcomeOrigin,
     OutcomeStatus,
     PreflightRequest,
+    QueueStatus,
     RecordOutcomeRequest,
     RegisterSessionRequest,
     RuleStatus,
@@ -266,6 +267,7 @@ async def test_mcp_tools_and_fastapi_endpoints(isolated_runtime: FlywheelRuntime
         "flywheel_preflight_activate",
         "flywheel_report_signal",
         "flywheel_record_outcome",
+        "flywheel_session_intent",
         "flywheel_status",
     }.issubset(tool_names)
     # G-4 regression gate: record_outcome schema must expose strongly-typed OutcomeCheck definitions
@@ -283,6 +285,25 @@ async def test_mcp_tools_and_fastapi_endpoints(isolated_runtime: FlywheelRuntime
     )
     assert reg_res is not None
     assert rt.db.get_session("claude:mcp-001") is not None
+    # The ingest tool also lands a real distill-queue item, not only a profile row.
+    assert rt.db.list_session_queue_items(
+        "claude:mcp-001", statuses=[QueueStatus.QUEUED]
+    )
+
+    intent_res = await rt.mcp.call_tool(
+        "flywheel_session_intent",
+        {
+            "action": "opt_out",
+            "session_key": "claude:mcp-001",
+            "reason": "联调验证显式不沉淀",
+        },
+    )
+    assert intent_res is not None
+    opted = rt.db.get_session("claude:mcp-001")
+    assert opted is not None and opted.opt_out is True
+    assert not rt.db.list_session_queue_items(
+        "claude:mcp-001", statuses=[QueueStatus.QUEUED]
+    )
 
     # FastAPI endpoints & MCP Streamable HTTP route
     app = create_app(runtime=rt)
@@ -298,7 +319,7 @@ async def test_mcp_tools_and_fastapi_endpoints(isolated_runtime: FlywheelRuntime
         assert about_resp.status_code == 200
         about_data = about_resp.json()
         assert about_data["llms_txt"] == llms_text
-        assert len(about_data["mcp_tools"]) == 6
+        assert len(about_data["mcp_tools"]) == 7
         assert client.get("/api/v1/about").status_code == 200
 
         conn_resp = client.get("/api/site/connect")
@@ -306,7 +327,7 @@ async def test_mcp_tools_and_fastapi_endpoints(isolated_runtime: FlywheelRuntime
         conn_json = conn_resp.json()
         client_ids = [c["id"] for c in conn_json["guides"]["clients"]]
         assert client_ids == ["codex", "claude-code", "claude"]
-        assert len(conn_json["mcp_tools"]) == 6
+        assert len(conn_json["mcp_tools"]) == 7
         assert conn_json["config"]["runner"]["api"]["api_key"] == ""
 
         hook_resp = client.post(

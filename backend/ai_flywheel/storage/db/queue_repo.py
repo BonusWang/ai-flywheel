@@ -309,6 +309,7 @@ class QueueRepoMixin:
         last_error: str | None = None,
         increment_retry: bool = False,
         reset_retry: bool = False,
+        clear_run_id: bool = False,
         actor: str = "system",
         reason_code: str = "",
         summary: str = "",
@@ -319,6 +320,9 @@ class QueueRepoMixin:
         The audit row records ``from_status`` / ``to_status`` / ``reason_code``
         on ``audit_events``, so every entity's state history can be queried the
         same way without a per-domain history table.
+
+        ``run_id`` binds the item to the claiming run; ``clear_run_id`` releases
+        that binding when a batch returns the item to the queue.
         """
         now = self._now_iso()
         new_status = status.value
@@ -344,7 +348,7 @@ class QueueRepoMixin:
                 """
                 UPDATE distill_queue SET
                     status = ?,
-                    run_id = COALESCE(?, run_id),
+                    run_id = CASE WHEN ? THEN NULL ELSE COALESCE(?, run_id) END,
                     exclude_reason_code = COALESCE(?, exclude_reason_code),
                     exclude_reason_detail = COALESCE(?, exclude_reason_detail),
                     last_error = COALESCE(?, last_error),
@@ -356,6 +360,7 @@ class QueueRepoMixin:
                 """,
                 (
                     new_status,
+                    1 if clear_run_id else 0,
                     run_id,
                     exclude_reason_code,
                     exclude_reason_detail,
@@ -375,7 +380,10 @@ class QueueRepoMixin:
                     event_type="status_changed",
                     actor=actor,
                     summary=summary or f"{old_status} -> {new_status}",
-                    payload={"run_id": run_id or row["run_id"], "retry_count": retry_count},
+                    payload={
+                        "run_id": None if clear_run_id else (run_id or row["run_id"]),
+                        "retry_count": retry_count,
+                    },
                     from_status=old_status,
                     to_status=new_status,
                     reason_code=reason_code or (exclude_reason_code or ""),

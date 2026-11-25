@@ -5,7 +5,7 @@
 1. 审批通道契约：飞书通道结构性满足 `ApprovalChannel`，不完整实现不满足；
 2. 兼容导入：`core.feishu_*` 与 `adapters.channels.feishu.*` 解析到同一对象；
 3. 忙碌错误：`ApprovalLockBusy` 属于契约级 `ApprovalBusyError`；
-4. 路由表：拆分后 53 条应用路由逐条一致，HTTP 语义不变。
+4. 路由表：拆分后 63 条应用路由逐条一致，HTTP 语义不变。
 """
 from __future__ import annotations
 
@@ -90,6 +90,12 @@ EXPECTED_ROUTES: tuple[tuple[str, str], ...] = (
     ("GET", "/api/site/skills/{skill_name}/preview"),
     ("GET", "/api/site/sessions"),
     ("POST", "/api/site/sessions"),
+    ("GET", "/api/site/queue"),
+    ("GET", "/api/site/queue/{queue_id}/events"),
+    ("POST", "/api/site/queue/sync"),
+    ("POST", "/api/site/queue/re-triage"),
+    ("POST", "/api/site/queue/bulk-action"),
+    ("POST", "/api/site/queue/{queue_id}/action"),
     ("GET", "/api/site/runs"),
     ("GET", "/api/site/runs/{run_id}"),
     ("GET", "/api/site/runs/{run_id}/events"),
@@ -209,7 +215,7 @@ def test_every_application_route_survives_the_split(tmp_path: Path):
     app = create_app(runtime=_runtime(tmp_path), process_role="cli")
     registered = _registered_routes(app)
     assert registered == set(EXPECTED_ROUTES)
-    assert len(EXPECTED_ROUTES) == 57
+    assert len(EXPECTED_ROUTES) == 63
 
 
 def test_mcp_stays_mounted_and_the_spa_catch_all_stays_last(tmp_path: Path):

@@ -63,7 +63,18 @@ class SessionTriageConfig(BaseModel):
 
 class SessionsConfig(BaseModel):
     scan_sources: list[ScanSourceConfig] = Field(default_factory=list)
+    # Codex strict-archive sources: only sessions that land in one of these
+    # archive directories (or are declared explicitly through MCP / the portal)
+    # enter the distill queue. An active, unarchived session is never queued.
+    codex_archive_sources: list[ScanSourceConfig] = Field(default_factory=list)
     triage: SessionTriageConfig = Field(default_factory=SessionTriageConfig)
+    # Distill queue: per-item character cap (a larger session is compacted, then
+    # split into ordered chunks 1/N..N/N), the retry budget before a poison item
+    # is isolated into the dead-letter state, and the interval of the background
+    # archive reconciliation loop that the serve role runs.
+    queue_max_item_chars: int = 24000
+    queue_max_retries: int = 3
+    codex_archive_sync_interval_seconds: int = 60
 
 
 class KnowledgeSinkConfig(BaseModel):

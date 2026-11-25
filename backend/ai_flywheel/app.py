@@ -54,6 +54,8 @@ def create_app(
 
     recovery_stop: threading.Event | None = None
     recovery_thread: threading.Thread | None = None
+    archive_stop: threading.Event | None = None
+    archive_thread: threading.Thread | None = None
 
     # ---------------- Feishu interactive layer (built in FlywheelRuntime) ----------------
     # The Feishu pieces are read from the runtime at call time, not captured
@@ -61,7 +63,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        nonlocal recovery_stop, recovery_thread
+        nonlocal recovery_stop, recovery_thread, archive_stop, archive_thread
         if effective_role == "serve":
             rt.automation.start(process_role=effective_role)
             # Recovery loop: reap runs whose executor is gone and reconcile ask cards.
@@ -83,12 +85,54 @@ def create_app(
 
             recovery_thread = threading.Thread(target=_recovery_loop, name="flywheel-recovery", daemon=True)
             recovery_thread.start()
+
+            # Codex strict-archive sync: a lightweight poll. It only touches the
+            # disk when archive sources are configured; the stop event makes the
+            # thread leave immediately on shutdown.
+            archive_stop = threading.Event()
+
+            def _archive_sync_loop() -> None:
+                raw_interval = os.environ.get(
+                    "FLYWHEEL_ARCHIVE_SYNC_INTERVAL",
+                    str(rt.cfg.sessions.codex_archive_sync_interval_seconds),
+                )
+                try:
+                    interval = max(1.0, float(raw_interval))
+                except (TypeError, ValueError):
+                    interval = 60.0
+                while True:
+                    try:
+                        if rt.cfg.sessions.codex_archive_sources:
+                            report = rt.queue.reconcile_codex_archives()
+                            if any(
+                                int(report.get(key) or 0) > 0
+                                for key in ("enqueued", "excluded", "withdrawn")
+                            ):
+                                rt.broker.publish(
+                                    "queue_updated",
+                                    {"source": "archive_sync", **report},
+                                )
+                    except Exception:
+                        logging.getLogger("ai_flywheel.archive_sync").exception(
+                            "archive sync pass failed"
+                        )
+                    if archive_stop.wait(interval):
+                        break
+
+            archive_thread = threading.Thread(
+                target=_archive_sync_loop, name="flywheel-archive-sync", daemon=True
+            )
+            archive_thread.start()
             rt.start_feishu()
         async with rt.mcp.session_manager.run():
             yield
         rt.stop_feishu()
         if recovery_stop is not None:
             recovery_stop.set()
+        if archive_stop is not None:
+            archive_stop.set()
+        if archive_thread is not None:
+            archive_thread.join(timeout=10)
         rt.automation.stop()
 
     app = FastAPI(

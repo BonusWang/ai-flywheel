@@ -8,6 +8,7 @@ from mcp.server.mcpserver import MCPServer
 from ai_flywheel import __version__
 from ai_flywheel.core.receipts import OutcomeGateError
 from ai_flywheel.models import (
+    IngressChannel,
     OutcomeCheck,
     OutcomeOrigin,
     OutcomeStatus,
@@ -23,7 +24,7 @@ if TYPE_CHECKING:
 
 
 def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
-    """Create the official MCP Server exposing 6 core tools + 4 read-only resources."""
+    """Create the official MCP Server exposing 7 core tools + 4 read-only resources."""
     mcp = MCPServer(
         name="ai-flywheel",
         title="AI Collaboration Flywheel",
@@ -33,7 +34,9 @@ def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
             "Call flywheel_preflight_activate before non-trivial tasks to receive anti-laziness "
             "policies, collaboration preferences, and matched precedent rules; "
             "call flywheel_register_session or flywheel_ingest_session to enqueue sessions for "
-            "background P00-P07 review; call flywheel_record_outcome with real evidence on major deliveries."
+            "background P00-P07 review; call flywheel_session_intent to declare "
+            "enqueue / opt_out / withdraw for the current session; "
+            "call flywheel_record_outcome with real evidence on major deliveries."
         ),
     )
 
@@ -90,12 +93,62 @@ def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
                 tags=tags or [],
             )
         )
+        items = runtime.queue.on_explicit_enqueue(
+            rec,
+            channel=IngressChannel.MCP_EXPLICIT,
+            actor="mcp",
+            focus_note=title,
+        )
         return {
             "status": "ingested",
             "session_key": rec.session_key,
             "priority": rec.priority,
             "queue_status": rec.status.value,
+            "queue_ids": [item.queue_id for item in items],
+            "queue_items": len(items),
         }
+
+    @mcp.tool()
+    def flywheel_session_intent(
+        action: str,
+        session_key: str = "",
+        client: str = "generic",
+        session_id: str = "",
+        title: str = "",
+        project: str = "generic",
+        workspace: str = "",
+        transcript_path: str | None = None,
+        summary: str | None = None,
+        content: str | None = None,
+        focus_note: str = "",
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Declare an explicit queue intent for the current session.
+
+        Actions:
+        - ``enqueue``: queue this session now at high priority (bypasses the noise filter).
+        - ``opt_out``: this session is never distilled (persistent; clears the queue).
+        - ``withdraw``: pull back still-queued items (the conversation continues).
+
+        Pass the ``session=<client>:<session_id>`` value injected by the
+        UserPromptSubmit hook as ``session_key`` so the declaration lands on the
+        same session the hooks are tracking.
+        """
+        return runtime.queue.handle_session_intent(
+            action,
+            session_key=session_key,
+            client=client,
+            session_id=session_id,
+            title=title,
+            project=project,
+            workspace=workspace,
+            transcript_path=transcript_path,
+            summary=summary,
+            content=content,
+            focus_note=focus_note,
+            reason=reason,
+            actor="mcp",
+        )
 
     @mcp.tool()
     def flywheel_preflight_activate(

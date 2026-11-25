@@ -61,11 +61,14 @@ from ai_flywheel.core.pipeline.helpers import (
 )
 from ai_flywheel.core.pipeline.recovery import RecoveryMixin
 from ai_flywheel.core.policies import PolicyEngine
+from ai_flywheel.core.queue_service import DistillQueueService
 from ai_flywheel.models import (
     CreateRuleRequest,
+    DistillQueueItem,
     NodeExecution,
     NodeStatus,
     PlannedWrite,
+    QueueStatus,
     RetroStatus,
     RunStatus,
     SessionRecord,
@@ -92,6 +95,19 @@ def _facade_module() -> Any:
     return facade
 
 
+def _empty_archive_sync_report() -> dict[str, Any]:
+    """The no-op archive report: P00 always records the field, configured or not."""
+    return {
+        "sources": [],
+        "scanned": 0,
+        "enqueued": 0,
+        "excluded": 0,
+        "unchanged": 0,
+        "withdrawn": 0,
+        "errors": [],
+    }
+
+
 class WorkflowOrchestrator(RecoveryMixin):
     """Autonomous P00-P07 state machine with approval gate, fail-run safety, and SSE visibility."""
 
@@ -110,6 +126,7 @@ class WorkflowOrchestrator(RecoveryMixin):
         heartbeat_interval_seconds: float = 15.0,
         feishu_channel: ApprovalChannel | None = None,
         on_node_begin: Callable[[str, str], None] | None = None,
+        queue: DistillQueueService | None = None,
     ) -> None:
         self.feishu_channel: ApprovalChannel | None = feishu_channel
         self.cfg = cfg
@@ -121,6 +138,10 @@ class WorkflowOrchestrator(RecoveryMixin):
         self.knowledge = knowledge
         self.delivery = delivery
         self.broker = broker
+        # The queue state machine the pipeline claims from and settles into. The
+        # runtime passes its own instance; a directly constructed orchestrator (a
+        # test, a script) gets an equivalent one so nothing has to be wired twice.
+        self.queue = queue or DistillQueueService(cfg, db, sessions, broker=broker)
         self.skill_writer = skill_writer or SkillWriterAdapter(cfg)
         # Optional hook called right after a node starts: (run_id, node_id).
         # Verification harnesses use it to park a run mid-pipeline; production
@@ -178,6 +199,38 @@ class WorkflowOrchestrator(RecoveryMixin):
             if n.node_id == node_id:
                 return n
         raise KeyError(node_id)
+
+    # ---------------- queue plumbing ----------------
+
+    def _claim_queue_item(self, item: DistillQueueItem, run: WorkflowRunRecord) -> DistillQueueItem | None:
+        """Bind one queued item to this run as PROCESSING (the P01 claim)."""
+        return self.db.update_queue_item_status(
+            item.queue_id,
+            QueueStatus.PROCESSING,
+            run_id=run.run_id,
+            actor="p01_begin",
+            reason_code="RUN_CLAIMED",
+            summary=f"claimed by {run.run_id}",
+        )
+
+    def _publish_queue_update(self, source: str, run_id: str, queue_ids: list[str]) -> None:
+        """Tell the portal the inventory of this run changed (one SSE event per stage)."""
+        if not queue_ids:
+            return
+        self.broker.publish(
+            "queue_updated",
+            {"source": source, "run_id": run_id, "queue_ids": list(queue_ids)},
+        )
+
+    def _claimed_queue_ids(self, run: WorkflowRunRecord) -> list[str]:
+        """The ids P01 claimed for this run, read from the node payload."""
+        try:
+            payload = self._get_node(run, "P01_BEGIN").payload
+        except KeyError:
+            return []
+        if not isinstance(payload, dict):
+            return []
+        return [str(qid) for qid in (payload.get("claimed_queue_ids") or [])]
 
     def _emit_run(self, event_type: str, run: WorkflowRunRecord, extra: dict[str, Any] | None = None) -> None:
         data = {
@@ -321,6 +374,7 @@ class WorkflowOrchestrator(RecoveryMixin):
         trigger: str = "manual",
         phase: str = "daily",
         session_keys: list[str] | None = None,
+        queue_ids: list[str] | None = None,
         auto_approve_override: bool | None = None,
         simulate_fail_node: str | None = None,
         run_id: str | None = None,
@@ -377,12 +431,20 @@ class WorkflowOrchestrator(RecoveryMixin):
                 raise RuntimeError("Simulated P00 failure")
             policies = self.policies.list_policies()
             scan_report = self.sessions.reconcile_scan_sources()
+            # Codex is strict-archive only: the archive directories are reconciled
+            # here, before the batch decides what to admit.
+            archive_sync = (
+                self.queue.reconcile_codex_archives()
+                if self.cfg.sessions.codex_archive_sources
+                else _empty_archive_sync_report()
+            )
+            explicit_batch = bool(session_keys or queue_ids)
             open_retro_keys = {
                 r.session_key for r in self.db.list_retro_items(status=RetroStatus.OPEN.value, limit=200)
             }
             triage_report = (
                 self.sessions.sweep_pending_triage(open_retro_keys)
-                if not session_keys
+                if not explicit_batch
                 else {"checked": 0, "admitted": 0, "skipped": 0, "reasons": {}}
             )
             if triage_report["skipped"] > 0:
@@ -394,6 +456,12 @@ class WorkflowOrchestrator(RecoveryMixin):
                     summary=f"规则初筛自动跳过 {triage_report['skipped']} 条临时/碎片会话",
                     payload=triage_report,
                 )
+            # Legacy `register_session` callers have no queue row yet: a normal
+            # batch bridges the still-pending profiles into `distill_queue` so the
+            # queue stays the one source of work inventory.
+            bridged_to_queue = (
+                0 if explicit_batch else self.queue.bridge_pending_sessions_to_queue()
+            )
             if session_keys:
                 # Explicitly named sessions are fetched one by one: filtering a recency-limited
                 # page would silently drop the ones that are not among the most recent.
@@ -401,6 +469,9 @@ class WorkflowOrchestrator(RecoveryMixin):
                 selected_sessions = [
                     record for sk in wanted if (record := self.db.get_session(sk)) is not None
                 ]
+            elif queue_ids:
+                # An explicit queue_ids batch claims exactly those items in P01.
+                selected_sessions = []
             else:
                 # The priority order lives in SQL, so a P0_CORE session beyond the recency
                 # window is never starved by a flood of P1_GENERAL sessions.
@@ -411,17 +482,24 @@ class WorkflowOrchestrator(RecoveryMixin):
                 t0,
                 summary=(
                     f"策略核验通过（{len(policies)} 项），扫盘新登记 {scan_report['newly_registered']} 条，"
+                    f"归档对账入队 {archive_sync.get('enqueued', 0)} 条，桥接入队 {bridged_to_queue} 条，"
                     f"初筛跳过 {triage_report['skipped']} 条临时/噪音会话，待审查 {len(selected_sessions)} 条"
                 ),
                 internal_checks=[
                     {"name": "飞轮内置策略完整性校验", "status": "PASS"},
                     {"name": "会话目录扫盘对账", "status": "PASS", "detail": scan_report},
+                    {"name": "Codex 归档目录严格对账", "status": "PASS", "detail": archive_sync},
                     {"name": "规则初筛（过滤子代理/空会话/低信号闲聊）", "status": "PASS", "detail": triage_report},
                     {"name": "P0/P1/P2 优先级排序", "status": "PASS"},
                 ],
                 payload={
                     "scan_report": scan_report,
                     "triage_report": triage_report,
+                    "archive_sync": archive_sync,
+                    "bridged_to_queue": bridged_to_queue,
+                    "queue_summary": self.db.summarize_queue(
+                        max_sessions_per_run=self.cfg.workflow.max_sessions_per_run
+                    ),
                     "candidate_count": len(selected_sessions),
                 },
             )
@@ -438,27 +516,95 @@ class WorkflowOrchestrator(RecoveryMixin):
                 # leave the surplus unreviewed, so it stays `pending` for the next batch instead
                 # of being admitted, skipped by P02 and silently settled by P05.
                 max_sess = min(max_sess, P02_MAX_SESSIONS)
-            admitted: list[tuple[Any, str]] = []
+            claimed_queue_ids: list[str] = []
+            admitted: list[tuple[SessionRecord, str]] = []
             used_chars = 0
-            for sess in selected_sessions[:max_sess]:
-                text = self.sessions.load_session_text(sess, max_chars=24000)
-                if used_chars + len(text) > max_chars and admitted:
-                    break
-                used_chars += len(text)
-                admitted.append((sess, text))
-                self.db.update_session_status(sess.session_key, SessionStatus.IN_PROGRESS)
-            run.admitted_sessions = [s.session_key for s, _ in admitted]
+            if queue_ids:
+                # An explicit queue_ids batch jumps the line: claim exactly those items.
+                for qid in dict.fromkeys(str(q) for q in queue_ids if str(q).strip()):
+                    item = self.db.get_queue_item(qid)
+                    if item is None:
+                        continue
+                    sess = self.db.get_session(item.session_key)
+                    if sess is None:
+                        continue
+                    text = self.queue.load_queue_item_text(item)
+                    if used_chars + len(text) > max_chars and admitted:
+                        break
+                    if self._claim_queue_item(item, run) is None:
+                        continue
+                    used_chars += len(text)
+                    self.db.update_session_status(sess.session_key, SessionStatus.IN_PROGRESS)
+                    admitted.append((sess, text))
+                    claimed_queue_ids.append(item.queue_id)
+            elif session_keys:
+                # Explicit session_keys keep the historical admission path; any queued
+                # item of an admitted session is claimed along with it.
+                for sess in selected_sessions[:max_sess]:
+                    text = self.sessions.load_session_text(sess, max_chars=24000)
+                    if used_chars + len(text) > max_chars and admitted:
+                        break
+                    used_chars += len(text)
+                    admitted.append((sess, text))
+                    self.db.update_session_status(sess.session_key, SessionStatus.IN_PROGRESS)
+                    for item in self.db.list_session_queue_items(
+                        sess.session_key, statuses=[QueueStatus.QUEUED]
+                    ):
+                        if self._claim_queue_item(item, run) is not None:
+                            claimed_queue_ids.append(item.queue_id)
+            else:
+                # A normal batch claims the prioritized backlog of `distill_queue`.
+                for item in self.db.list_queued_items_prioritized(limit=max_sess):
+                    if len(admitted) >= max_sess:
+                        break
+                    sess = self.db.get_session(item.session_key)
+                    if sess is None:
+                        continue
+                    text = self.queue.load_queue_item_text(item)
+                    if used_chars + len(text) > max_chars and admitted:
+                        break
+                    if self._claim_queue_item(item, run) is None:
+                        continue
+                    used_chars += len(text)
+                    self.db.update_session_status(sess.session_key, SessionStatus.IN_PROGRESS)
+                    admitted.append((sess, text))
+                    claimed_queue_ids.append(item.queue_id)
+                if not admitted:
+                    # A database seeded without queue rows still runs: the P00 bridge
+                    # normally makes this unreachable, never a silent empty batch. An
+                    # opt-out is a hard veto, so an automatic batch skips it.
+                    for sess in selected_sessions[:max_sess]:
+                        if sess.opt_out:
+                            continue
+                        text = self.sessions.load_session_text(sess, max_chars=24000)
+                        if used_chars + len(text) > max_chars and admitted:
+                            break
+                        used_chars += len(text)
+                        admitted.append((sess, text))
+                        self.db.update_session_status(sess.session_key, SessionStatus.IN_PROGRESS)
+            run.admitted_sessions = list(dict.fromkeys(s.session_key for s, _ in admitted))
+            queue_note = (
+                f"，认领队列项 {len(claimed_queue_ids)} 条" if claimed_queue_ids else ""
+            )
             self._finish_node(
                 run,
                 "P01_BEGIN",
                 t0,
-                summary=f"独占锁已获取，准入 {len(admitted)} 个会话单元（共 {used_chars} 字符）",
+                summary=(
+                    f"独占锁已获取，准入 {len(admitted)} 个会话单元（共 {used_chars} 字符）{queue_note}"
+                ),
                 internal_checks=[
                     {"name": "独占锁持有核验", "status": "PASS"},
                     {"name": "预算与字符上限准入", "status": "PASS", "detail": {"chars": used_chars, "limit": max_chars}},
+                    {"name": "队列项认领与 run 绑定", "status": "PASS", "detail": {"claimed": len(claimed_queue_ids)}},
                 ],
-                payload={"admitted_sessions": run.admitted_sessions, "used_chars": used_chars},
+                payload={
+                    "admitted_sessions": run.admitted_sessions,
+                    "used_chars": used_chars,
+                    "claimed_queue_ids": claimed_queue_ids,
+                },
             )
+            self._publish_queue_update("p01_claim", run.run_id, claimed_queue_ids)
 
             # ---------------- P02 REVIEW ----------------
             active_node = "P02_REVIEW"
@@ -952,6 +1098,16 @@ class WorkflowOrchestrator(RecoveryMixin):
         if not ok:
             raise ValueError(f"Run {run_id} is no longer awaiting approval.")
 
+        # A cancelled batch is not a failure: every claimed queue item returns to
+        # `queued` untouched, without a retry penalty.
+        self._release_queue_items_for_run(
+            run_id,
+            error="",
+            increment_retry=False,
+            actor="approval_gate",
+            reason_code="APPROVAL_REJECTED",
+        )
+
         fresh = self.db.get_workflow_run(run_id) or run
         # The claim transaction already wrote the terminal row, released the lock
         # and put the admitted sessions back to pending; only the receipt and the
@@ -1304,13 +1460,65 @@ class WorkflowOrchestrator(RecoveryMixin):
                 reviewed_keys = {str(k) for k in sent_keys if k}
             else:
                 reviewed_keys = set(run.admitted_sessions)
+            # Settle the queue items P01 claimed: reviewed -> processed (and the
+            # consumption watermark moves), everything else returns to the queue.
+            settled_queue_ids: list[str] = []
+            requeued_queue_ids: list[str] = []
+            for qid in dict.fromkeys(self._claimed_queue_ids(run)):
+                self._ensure_lock(run)  # synchronous checkpoint before each settlement
+                item = self.db.get_queue_item(qid)
+                if item is None or item.status is not QueueStatus.PROCESSING:
+                    continue
+                if item.session_key in reviewed_keys:
+                    self.db.update_queue_item_status(
+                        qid,
+                        QueueStatus.PROCESSED,
+                        run_id=run.run_id,
+                        actor="p05_settle",
+                        reason_code="RUN_SETTLED",
+                        summary="reviewed and settled by this run",
+                    )
+                    session = self.db.get_session(item.session_key)
+                    self.db.update_session_watermark(
+                        item.session_key,
+                        last_consumed_turn=max(
+                            session.last_consumed_turn if session else 0,
+                            item.consumed_to_turn,
+                        ),
+                        last_consumed_hash=item.content_hash
+                        or (session.last_consumed_hash if session else ""),
+                    )
+                    settled_queue_ids.append(qid)
+                else:
+                    self.db.update_queue_item_status(
+                        qid,
+                        QueueStatus.QUEUED,
+                        run_id=None,
+                        clear_run_id=True,
+                        actor="p05_settle",
+                        reason_code="UNREVIEWED_REQUEUED",
+                        summary="not reviewed by this run; returned to the queue",
+                    )
+                    requeued_queue_ids.append(qid)
+            self._publish_queue_update(
+                "p05_settle", run.run_id, settled_queue_ids + requeued_queue_ids
+            )
             settled_sessions: list[str] = []
             returned_sessions: list[str] = []
+            deferred_sessions: list[str] = []
             for sk in run.admitted_sessions:
                 self._ensure_lock(run)  # synchronous checkpoint before each settlement
                 if sk not in reviewed_keys:
                     self.db.update_session_status(sk, SessionStatus.PENDING)
                     returned_sessions.append(sk)
+                    continue
+                if self.db.list_session_queue_items(
+                    sk, statuses=[QueueStatus.QUEUED, QueueStatus.PROCESSING]
+                ):
+                    # Another chunk of the same session is still waiting: the profile
+                    # stays pending until the last chunk is settled.
+                    self.db.update_session_status(sk, SessionStatus.PENDING)
+                    deferred_sessions.append(sk)
                     continue
                 if sk in not_worthy_keys:
                     self.db.update_session_status(sk, SessionStatus.ARCHIVED)
@@ -1330,6 +1538,17 @@ class WorkflowOrchestrator(RecoveryMixin):
                 if dream_report
                 else ""
             )
+            queue_settle_note = (
+                f"，队列结算 {len(settled_queue_ids)} 条"
+                + (f"、退回 {len(requeued_queue_ids)} 条" if requeued_queue_ids else "")
+                if settled_queue_ids or requeued_queue_ids
+                else ""
+            )
+            deferred_note = (
+                f"、{len(deferred_sessions)} 个会话仍有未结算分片保持 pending"
+                if deferred_sessions
+                else ""
+            )
             self._finish_node(
                 run,
                 "P05_SETTLE",
@@ -1341,11 +1560,20 @@ class WorkflowOrchestrator(RecoveryMixin):
                         if returned_sessions
                         else ""
                     )
+                    + deferred_note
                     + f"，关闭 {settled_retros} 条待复盘项"
-                    + f"，核心索引卡已刷新（{core_card_info['lines']} 行）{dream_note}"
+                    + f"，核心索引卡已刷新（{core_card_info['lines']} 行）{queue_settle_note}{dream_note}"
                 ),
                 internal_checks=[
                     {"name": "会话队列幂等回写", "status": "PASS"},
+                    {
+                        "name": "沉淀队列结算与水位线推进",
+                        "status": "PASS",
+                        "detail": {
+                            "settled": len(settled_queue_ids),
+                            "requeued": len(requeued_queue_ids),
+                        },
+                    },
                     {"name": "待复盘项结算", "status": "PASS", "detail": {"resolved_retros": settled_retros}},
                     {"name": "核心索引卡 FLYWHEEL-CORE.md 刷新", "status": "PASS", "detail": {"lines": core_card_info["lines"], "bytes": core_card_info["bytes"]}},
                     {"name": "P05 保留独占锁至 P07 终态校验", "status": "PASS"},
@@ -1353,6 +1581,9 @@ class WorkflowOrchestrator(RecoveryMixin):
                 payload={
                     "settled_sessions": settled_sessions,
                     "returned_sessions": returned_sessions,
+                    "deferred_sessions": deferred_sessions,
+                    "settled_queue_ids": settled_queue_ids,
+                    "requeued_queue_ids": requeued_queue_ids,
                     "settled_retro_count": settled_retros,
                     "created_rules": created_rules,
                     "core_card": {"path": core_card_info["path"], "lines": core_card_info["lines"]},

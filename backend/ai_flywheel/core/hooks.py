@@ -3,7 +3,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from ai_flywheel.models import (
+    IngressChannel,
     PreflightRequest,
+    QueueStatus,
     RegisterSessionRequest,
     ReportSignalRequest,
     SignalKind,
@@ -81,6 +83,17 @@ class ThinHookProcessor:
         if not prompt:
             return {"continue": True}
         project = str(payload.get("project") or "generic")
+        session_key = f"{client}:{session_id}" if session_id else ""
+        # Claude Code queues on SessionEnd: typing again means the conversation is
+        # still alive, so any not-yet-consumed item is withdrawn here.
+        if client == "claude-code" and session_key:
+            queued = self.runtime.db.list_session_queue_items(
+                session_key, statuses=[QueueStatus.QUEUED]
+            )
+            if queued:
+                self.runtime.queue.on_withdraw(
+                    session_key, reason_code="SESSION_RESUMED", actor="hook"
+                )
         resp = self.runtime.activation.preflight_activate(
             PreflightRequest(
                 task=prompt,
@@ -91,6 +104,13 @@ class ThinHookProcessor:
             )
         )
         header = f"[ai-flywheel · receipt={resp.receipt_id} · mode={resp.anti_laziness_mode}]"
+        if session_key:
+            # The model passes this back to MCP `flywheel_session_intent`, so the
+            # declaration hits exactly the session the hook is tracking.
+            header = (
+                f"[ai-flywheel · session={session_key} · "
+                f"receipt={resp.receipt_id} · mode={resp.anti_laziness_mode}]"
+            )
         context_text = f"{header}\n{resp.compact_context}"
         return {
             "continue": True,
@@ -190,6 +210,8 @@ class ThinHookProcessor:
         workspace = str(payload.get("cwd") or payload.get("workspace") or "")
         title = str(payload.get("title") or "")
         summary = payload.get("summary")
+        project = str(payload.get("project") or "generic")
+        session_key = f"{client}:{session_id}"
         # A lifecycle hook arrives late: it must not re-open a session the flywheel already
         # settled, nor wipe the triage metadata that decided its fate.
         self.runtime.register_session(
@@ -197,6 +219,7 @@ class ThinHookProcessor:
                 client=client,
                 session_id=session_id,
                 title=title,
+                project=project,
                 workspace=workspace,
                 transcript_path=str(transcript_path) if transcript_path else None,
                 summary=str(summary) if summary else None,
@@ -204,4 +227,30 @@ class ThinHookProcessor:
             ),
             preserve_existing_lifecycle=True,
         )
+        # Claude Code queues on exit; Stop (every reply) never enqueues, and a
+        # resumed conversation withdraws whatever was queued earlier.
+        if event == "SessionEnd" and client == "claude-code":
+            self.runtime.queue.on_archive(
+                client,
+                session_id,
+                title=title,
+                project=project,
+                workspace=workspace,
+                transcript_path=str(transcript_path) if transcript_path else None,
+                summary=str(summary) if summary else None,
+                channel=IngressChannel.CLAUDE_EXIT,
+                actor="hook",
+                source_path=str(transcript_path) if transcript_path else None,
+            )
+        elif event == "SessionStart":
+            is_resume = (
+                str(payload.get("source") or "").strip().lower() == "resume"
+                or bool(payload.get("is_resume"))
+            )
+            if is_resume:
+                self.runtime.queue.on_withdraw(
+                    session_key, reason_code="SESSION_RESUMED", actor="hook"
+                )
+        # Codex is strict-archive only: SessionEnd refreshes the profile metadata
+        # above and never enqueues; the archive sync owns Codex ingestion.
         return {"continue": True}

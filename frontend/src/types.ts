@@ -199,6 +199,42 @@ export interface QueueSummary {
   estimated_batches: number
 }
 
+/** The maintainer interventions the queue control plane accepts. */
+export type QueueAction = 'requeue' | 'exclude' | 'withdraw' | 'opt_out' | 'clear_opt_out'
+
+/** One item's pending transition in a rule re-triage pass. */
+export interface QueueReTriageChange {
+  queue_id: string
+  session_key: string
+  from_status: QueueStatus
+  to_status: QueueStatus
+  reason_code: string
+  detail: string
+}
+
+/** The answer of `POST /api/site/queue/re-triage`. */
+export interface QueueReTriageResult {
+  dry_run: boolean
+  /** How many queued / rule-excluded items the pass looked at. */
+  checked: number
+  /** How many items the pass would change (or did change, when applied). */
+  changed_count: number
+  /** Items a real apply would move to `excluded`. */
+  would_exclude: QueueReTriageChange[]
+  /** Items a real apply would move back to `queued`. */
+  would_admit: QueueReTriageChange[]
+  summary?: QueueSummary
+}
+
+/** The answer of `POST /api/site/queue/sync`. */
+export interface QueueSyncResult {
+  /** The per-source reconcile report (`scanned / enqueued / excluded / withdrawn`). */
+  sync: Record<string, any>
+  /** How many legacy pending sessions were bridged into the queue. */
+  bridged: number
+  summary: QueueSummary
+}
+
 export interface PlannedWrite {
   target_kind: 'knowledge_doc' | 'flywheel_rule' | 'skill_improvement'
   relative_path: string | null

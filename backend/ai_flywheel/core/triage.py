@@ -56,6 +56,84 @@ _KNOWLEDGE_OR_PROJECT_SIGNALS = (
 
 _TURN_MARKER_RE = re.compile(r"^\[(?:user|assistant|human|model)\]", re.IGNORECASE | re.MULTILINE)
 
+#: Tags that veto any distillation for the session they mark.
+OPT_OUT_TAGS = frozenset({"no-flywheel", "no-distill", "opt-out"})
+
+#: Text markers a user can type inside the conversation itself. Matching is
+#: case-insensitive, so `#No-Flywheel` and `#NO-DISTILL` are caught too.
+OPT_OUT_TEXT_MARKERS = (
+    "#no-flywheel",
+    "#no-distill",
+    "本会话不沉淀",
+    "不要沉淀",
+    "不参与沉淀",
+)
+
+#: Triage reasons that mean "admitted": they map to the empty reason code.
+_ADMIT_REASON_MARKERS = (
+    "triage_disabled",
+    "explicit_user_submission",
+    "project_or_knowledge",
+    "open_retro_signal",
+    "deep_knowledge_chat",
+    "general_workspace_qualified",
+)
+
+#: Exclude reason prefix -> standard dictionary code (``exclude_reason`` type).
+_EXCLUDE_REASON_CODE_MAP: tuple[tuple[str, str], ...] = (
+    ("user_opt_out", "USER_OPT_OUT"),
+    ("opt_out", "USER_OPT_OUT"),
+    ("subagent", "SUBAGENT_FRAGMENT"),
+    ("fragment", "SUBAGENT_FRAGMENT"),
+    ("excluded_workspace", "EXCLUDED_WORKSPACE"),
+    ("too_short", "TOO_SHORT"),
+    ("temp_chat", "TEMP_CHAT_LOW_SIGNAL"),
+    ("low_signal", "TEMP_CHAT_LOW_SIGNAL"),
+    ("single_turn", "SINGLE_TURN_LOOKUP"),
+    ("manual", "MANUAL_EXCLUDE"),
+)
+
+
+def has_explicit_opt_out(
+    text: str,
+    tags: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> bool:
+    """Whether the session carries an explicit "do not distill me" decision.
+
+    Three sources are checked, in the order the queue gate evaluates them:
+    a profile metadata flag (``opt_out: true``), an opt-out tag
+    (``no-flywheel`` / ``no-distill`` / ``opt-out``), and a marker typed inside
+    the conversation itself (``#no-flywheel`` / ``本会话不沉淀`` ...).
+    """
+    if isinstance(metadata, dict) and metadata.get("opt_out") is True:
+        return True
+    for raw in tags or []:
+        tag = str(raw).strip().lower().lstrip("#")
+        if tag in OPT_OUT_TAGS:
+            return True
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in OPT_OUT_TEXT_MARKERS)
+
+
+def map_triage_reason_code(reason: str) -> str:
+    """Map a free-form triage reason onto a standard ``exclude_reason`` code.
+
+    An admitted reason (or an empty one) maps to ``""``; an unrecognised
+    exclude reason falls back to ``MANUAL_EXCLUDE`` so the console always has a
+    labelled bucket instead of a raw string.
+    """
+    lowered = str(reason or "").strip().lower()
+    if not lowered:
+        return ""
+    if any(marker in lowered for marker in _ADMIT_REASON_MARKERS):
+        return ""
+    for marker, code in _EXCLUDE_REASON_CODE_MAP:
+        if marker in lowered:
+            return code
+    return "MANUAL_EXCLUDE"
+
+
 
 def extract_jsonl_workspace(path: Path, max_lines: int = 25) -> str:
     """Inspect the opening lines of a Codex/Claude Code JSONL transcript to discover its workspace cwd."""
@@ -137,12 +215,18 @@ def triage_session(
     *,
     has_open_retro: bool = False,
 ) -> dict[str, Any]:
-    """Level-1 deterministic session triage (0-token pre-filter before P02 LLM review)."""
+    """Level-1 deterministic session triage (0-token pre-filter before P02 LLM review).
+
+    ``reason_code`` is the standard ``exclude_reason`` code for a rejected
+    session (``USER_OPT_OUT`` / ``SUBAGENT_FRAGMENT`` / ...) and the empty
+    string for an admitted one; ``reason`` keeps the human-readable detail.
+    """
     if not cfg.enabled:
         return {
             "admit": True,
             "tier": "triage_disabled",
             "reason": "triage_disabled",
+            "reason_code": "",
             "workspace": session.workspace,
         }
 
@@ -152,6 +236,7 @@ def triage_session(
             "admit": True,
             "tier": "explicit",
             "reason": "explicit_user_submission",
+            "reason_code": "",
             "workspace": session.workspace,
         }
 
@@ -162,6 +247,7 @@ def triage_session(
             "admit": False,
             "tier": "skipped",
             "reason": "subagent_or_system_fragment",
+            "reason_code": map_triage_reason_code("subagent_or_system_fragment"),
             "workspace": session.workspace,
         }
 
@@ -176,6 +262,7 @@ def triage_session(
             "admit": False,
             "tier": "skipped",
             "reason": "excluded_workspace",
+            "reason_code": map_triage_reason_code("excluded_workspace"),
             "workspace": workspace,
         }
 
@@ -183,10 +270,12 @@ def triage_session(
     body_text = re.sub(r"^(?:Title|Summary):.*$", "", text or "", flags=re.MULTILINE).strip()
     char_len = len(body_text)
     if char_len < cfg.min_chars and not has_open_retro:
+        reason = f"too_short_or_empty ({char_len}<{cfg.min_chars})"
         return {
             "admit": False,
             "tier": "skipped",
-            "reason": f"too_short_or_empty ({char_len}<{cfg.min_chars})",
+            "reason": reason,
+            "reason_code": map_triage_reason_code(reason),
             "workspace": workspace,
         }
 
@@ -200,6 +289,7 @@ def triage_session(
             "admit": True,
             "tier": "project_or_knowledge",
             "reason": "project_or_knowledge_workspace",
+            "reason_code": "",
             "workspace": workspace,
         }
 
@@ -214,6 +304,7 @@ def triage_session(
             "admit": True,
             "tier": "gray_qualified",
             "reason": "open_retro_signal",
+            "reason_code": "",
             "workspace": workspace,
         }
 
@@ -223,21 +314,26 @@ def triage_session(
                 "admit": True,
                 "tier": "gray_qualified",
                 "reason": f"deep_knowledge_chat (chars={char_len}, signals={','.join(matched_signals[:3])})",
+                "reason_code": "",
                 "workspace": workspace,
             }
+        reason = f"temp_chat_low_signal (chars={char_len}, signals={len(matched_signals)}, turns={turns})"
         return {
             "admit": False,
             "tier": "skipped",
-            "reason": f"temp_chat_low_signal (chars={char_len}, signals={len(matched_signals)}, turns={turns})",
+            "reason": reason,
+            "reason_code": map_triage_reason_code(reason),
             "workspace": workspace,
         }
 
     # 8. Other non-temp workspace with sufficient depth
     if turns < cfg.min_turns and char_len < cfg.gray_workspace_min_chars:
+        reason = f"single_turn_lookup (turns={turns}, chars={char_len})"
         return {
             "admit": False,
             "tier": "skipped",
-            "reason": f"single_turn_lookup (turns={turns}, chars={char_len})",
+            "reason": reason,
+            "reason_code": map_triage_reason_code(reason),
             "workspace": workspace,
         }
 
@@ -245,5 +341,6 @@ def triage_session(
         "admit": True,
         "tier": "project_or_knowledge",
         "reason": "general_workspace_qualified",
+        "reason_code": "",
         "workspace": workspace,
     }

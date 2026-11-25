@@ -13,6 +13,7 @@ from typing import Any, Callable, Iterable
 
 from ai_flywheel.models import (
     NodeStatus,
+    QueueStatus,
     RunStatus,
     SessionStatus,
     WorkflowRunRecord,
@@ -25,6 +26,76 @@ from ai_flywheel.core.pipeline.constants import LockLostError
 
 class RecoveryMixin:
     """Heartbeat, lock checkpoints and the terminal paths of a run."""
+
+    # ---------------- queue items of a run that is closing ----------------
+
+    def _release_queue_items_for_run(
+        self,
+        run_id: str,
+        *,
+        error: str,
+        increment_retry: bool,
+        actor: str,
+        reason_code: str,
+    ) -> list[str]:
+        """Release every ``PROCESSING`` queue item bound to this run.
+
+        The ids P01 recorded are read from the node payload; the fallback query
+        catches anything still bound to the run. An item a half-finished P05
+        already settled is terminal and is never touched again.
+
+        With ``increment_retry`` the item's counter advances and the item lands in
+        the dead-letter state at ``max_retries``; without it (an approval
+        cancellation) the item simply returns to ``queued``.
+        """
+        candidate_ids: list[str] = []
+        run = self.db.get_workflow_run(run_id)
+        if run is not None:
+            try:
+                payload = self._get_node(run, "P01_BEGIN").payload
+            except KeyError:
+                payload = {}
+            if isinstance(payload, dict):
+                candidate_ids.extend(str(qid) for qid in (payload.get("claimed_queue_ids") or []))
+        candidate_ids.extend(
+            item.queue_id
+            for item in self.db.list_queue_items(status=QueueStatus.PROCESSING, limit=1000)
+            if item.run_id == run_id
+        )
+        released: list[str] = []
+        for qid in dict.fromkeys(candidate_ids):
+            item = self.db.get_queue_item(qid)
+            if item is None or item.status is not QueueStatus.PROCESSING or item.run_id != run_id:
+                continue
+            exhausted = increment_retry and item.retry_count + 1 >= item.max_retries
+            new_status = QueueStatus.DEAD_LETTER if exhausted else QueueStatus.QUEUED
+            self.db.update_queue_item_status(
+                qid,
+                new_status,
+                run_id=None,
+                clear_run_id=new_status is QueueStatus.QUEUED,
+                last_error=((error or "")[:500] or None),
+                increment_retry=increment_retry,
+                actor=actor,
+                reason_code="MAX_RETRIES_EXCEEDED" if exhausted else reason_code,
+                summary=(
+                    f"isolated after {item.retry_count + 1} failure(s)"
+                    if exhausted
+                    else "returned to the queue"
+                ),
+            )
+            released.append(qid)
+        if released:
+            self.broker.publish(
+                "queue_updated",
+                {
+                    "source": actor,
+                    "run_id": run_id,
+                    "queue_ids": released,
+                    "reason_code": reason_code,
+                },
+            )
+        return released
 
     # ---------------- heartbeat & lock checkpoint ----------------
 
@@ -85,6 +156,15 @@ class RecoveryMixin:
             )
             if not applied:
                 continue
+            # The executor of this run is gone: its claimed queue items return to
+            # the queue (retry counter advances, poison items are isolated).
+            self._release_queue_items_for_run(
+                run_id,
+                error=reason,
+                increment_retry=True,
+                actor="pipeline_recovery",
+                reason_code="RUN_FAILED_RETRY",
+            )
             self._finalize_terminal_artifacts(
                 run,
                 status=RunStatus.FAILED,
@@ -203,6 +283,16 @@ class RecoveryMixin:
 
         # Mark all unexecuted downstream nodes explicitly as SKIPPED
         self._mark_remaining_nodes_skipped(run, reason=f"因前置节点 {failed_node_id} 失败而跳过")
+
+        # A failing batch advances the retry counter of what it claimed; a poison
+        # item that reached its limit is isolated into the dead-letter state.
+        self._release_queue_items_for_run(
+            run.run_id,
+            error=reason,
+            increment_retry=True,
+            actor="pipeline_recovery",
+            reason_code="RUN_FAILED_RETRY",
+        )
 
         run.status = RunStatus.FAILED
         run.error = reason

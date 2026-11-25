@@ -109,6 +109,9 @@ export function App() {
     es.addEventListener('run_failed', onLive)
     es.addEventListener('run_rejected', onLive)
     es.addEventListener('automation_updated', onLive)
+    // The distill-queue inventory changes on its own (archive sync, pipeline
+    // claims and settle), so the queue panel refreshes on its own event too.
+    es.addEventListener('queue_updated', onLive)
     es.onerror = () => setSseConnected(false)
     return () => es.close()
   }, [refreshAll])

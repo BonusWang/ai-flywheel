@@ -1,0 +1,10 @@
+# Tasks: feat-distill-queue-and-inventory
+
+- [x] 1. 在 `config.py` 与 `flywheel.yaml.example` 扩展 `SessionsConfig`（新增 `codex_archive_sources`、`queue_max_item_chars`、`queue_max_retries`、`codex_archive_sync_interval_seconds`），并在 `core/triage.py` 提供结构化 `reason_code` 映射与显式不沉淀标记（`#no-flywheel` / `本会话不沉淀`）识别【test】
+- [x] 2. 新增 `backend/ai_flywheel/core/queue_service.py`（`DistillQueueService`）：实现四类统一事件（`EXPLICIT_ENQUEUE`、`ARCHIVE`、`WITHDRAW`、`OPT_OUT`）、三级闸门、撤回与增量 revision、0-token 超大上下文瘦身与轮次分片、分片文本加载、Codex `archived_sessions` 严格对账（出现入队/移出撤回/增大增量）、DLQ 重试与规则重筛（含 `dry_run` 预览）【test】
+- [x] 3. 更新 `core/hooks.py`、`core/connect_templates.py`、`mcp_server.py`、`core/publication.py`、`runtime.py` 与 `app.py`：Claude Code 改为 `SessionEnd` 入队 + `SessionStart(resume)`/`UserPromptSubmit` 自动撤回（`Stop` 不入队）；`UserPromptSubmit` 注入 `session=<session_key>`；新增 MCP `flywheel_session_intent` 工具；在 `serve` 角色 lifespan 挂载可干净退出的轻量归档同步守护线程【test】
+- [x] 4. 更新 `core/pipeline/coordinator.py` 与 `core/pipeline/recovery.py` 衔接 `distill_queue`（支持 `queue_ids` 插队、P00 对账与历史会话桥接、P01 优先认领队列项、P05 结算推进水位线、失败重试/死信隔离、审批取消不计重试安全退回），保持既有 P00–P07 副作用契约与单测全绿【test】
+- [x] 5. 在 `routes/runs.py` 新增队列控制面 API（`GET /api/site/queue`、`GET /api/site/queue/{queue_id}/events`、`POST /api/site/queue/sync`、`POST /api/site/queue/{queue_id}/action`、`POST /api/site/queue/bulk-action`、`POST /api/site/queue/re-triage`）并扩展 `POST /api/site/runs` 支持 `queue_ids`，同步更新 `tests/test_approval_channel_abstraction.py` 路由登记与 `tests/test_flywheel_core.py` MCP 工具清单【test】
+- [x] 6. 新增 `frontend/src/components/workflows/QueueInventoryPanel.tsx` 并更新 `frontend/src/pages/WorkflowsPage.tsx`、`frontend/src/api.ts`、`frontend/src/types.ts`：实现顶部常驻库存与进度条、双 Tab（「沉淀队列（库存）」/「执行流水线（P00–P07）」）、消费 `/api/site/dicts` 字典标签、筛选分页、轨迹展开、勾选批量操作、规则重筛预览与批次跳转【test】
+- [x] 7. 新增 `tests/test_distill_queue.py` 全面覆盖 Codex 归档/撤回/增量、Claude Code Stop/SessionEnd/resume、MCP `flywheel_session_intent` 与 `session_key` 对齐、超大上下文瘦身与分片不丢尾、DLQ 隔离、规则重筛预览、P00–P07 队列消费与 REST API【test】
+- [x] 8. 执行全链路真实 `serve` 冒烟验收（Codex 归档目录演练、超大上下文分片、Claude Code Hook 链、MCP opt-out、队列触发 P00–P07 完整跑通并核验库存清零与轨迹）及 `python scripts/verify_repo.py --frontend` 全绿验证【real】

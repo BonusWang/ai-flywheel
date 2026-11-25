@@ -18,9 +18,16 @@ from ai_flywheel.core.hooks import ThinHookProcessor
 from ai_flywheel.core.orchestrator import EventBroker, WorkflowOrchestrator
 from ai_flywheel.core.policies import PolicyEngine
 from ai_flywheel.core.publication import PublicationLayer
+from ai_flywheel.core.queue_service import DistillQueueService
 from ai_flywheel.core.receipts import ReceiptService
 from ai_flywheel.mcp_server import build_mcp_server
-from ai_flywheel.models import RegisterSessionRequest, RetroStatus, SessionRecord, SessionStatus
+from ai_flywheel.models import (
+    IngressChannel,
+    RegisterSessionRequest,
+    RetroStatus,
+    SessionRecord,
+    SessionStatus,
+)
 from ai_flywheel.storage.clock import SystemClock
 from ai_flywheel.storage.db import FlywheelDB
 from ai_flywheel.storage.fs_store import ImmutableFileStore
@@ -44,6 +51,10 @@ class FlywheelRuntime:
         self.delivery = DeliveryAdapter(cfg)
         self.skill_writer = SkillWriterAdapter(cfg)
         self.broker = EventBroker()
+        # The one state machine every queue ingress (archive sync, hooks, MCP,
+        # manual portal) goes through. It publishes `queue_updated` on the same
+        # broker the portal's SSE stream subscribes to.
+        self.queue = DistillQueueService(cfg, self.db, self.sessions, broker=self.broker)
         self.orchestrator = WorkflowOrchestrator(
             cfg=cfg,
             db=self.db,
@@ -55,6 +66,7 @@ class FlywheelRuntime:
             delivery=self.delivery,
             broker=self.broker,
             skill_writer=self.skill_writer,
+            queue=self.queue,
         )
         self.hooks = ThinHookProcessor(self)
         self.publication = PublicationLayer(cfg, self.db, self.policies, self.activation)
@@ -265,6 +277,10 @@ class FlywheelRuntime:
         SessionStart) uses: it must never re-open a session the flywheel already owns.
         An explicit ingestion (MCP / manual) leaves it off, so new content still re-queues
         a processed session.
+
+        A manual portal submission (tag ``manual`` or ``metadata.explicit_ingest``)
+        also lands in the distill queue right away: the portal's manual entry must
+        be a real queued item, not only a session profile row.
         """
         skey = f"{req.client}:{req.session_id}"
         open_retros = [
@@ -286,7 +302,24 @@ class FlywheelRuntime:
             status=SessionStatus.PENDING,
             metadata=req.metadata,
         )
-        return self.db.upsert_session(rec, preserve_existing_lifecycle=preserve_existing_lifecycle)
+        saved = self.db.upsert_session(rec, preserve_existing_lifecycle=preserve_existing_lifecycle)
+        if self._is_explicit_manual_submission(req):
+            self.queue.on_explicit_enqueue(
+                saved,
+                channel=IngressChannel.MANUAL_PORTAL,
+                actor="portal",
+                focus_note=req.title or "",
+            )
+            return self.db.get_session(skey) or saved
+        return saved
+
+    @staticmethod
+    def _is_explicit_manual_submission(req: RegisterSessionRequest) -> bool:
+        """Whether this registration is a manual portal submission (not a hook refresh)."""
+        if "manual" in {str(tag).strip().lower() for tag in (req.tags or [])}:
+            return True
+        metadata = req.metadata if isinstance(req.metadata, dict) else {}
+        return metadata.get("explicit_ingest") is True
 
     # The settings that are read once, at startup: changing them only takes
     # effect after the process is restarted.

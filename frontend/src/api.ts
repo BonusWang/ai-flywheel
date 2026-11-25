@@ -7,6 +7,7 @@ import type {
   CoreCardPayload,
   DictItem,
   DissentRecord,
+  DistillQueueItem,
   DreamResult,
   DreamStatusPayload,
   FeishuCheckStatus,
@@ -16,6 +17,11 @@ import type {
   OutcomeRecord,
   OverviewResponse,
   PreflightResponse,
+  QueueAction,
+  QueueReTriageChange,
+  QueueReTriageResult,
+  QueueSummary,
+  QueueSyncResult,
   RetroItem,
   RuleRecord,
   SessionRecord,
@@ -58,7 +64,12 @@ export const api = {
   getRunEvents: (runId: string) =>
     req<{ events: AuditEventRecord[] }>(`/api/site/runs/${runId}/events`),
   startRun: (
-    body: { phase?: string; auto_approve?: boolean | null },
+    body: {
+      phase?: string
+      auto_approve?: boolean | null
+      queue_ids?: string[]
+      session_keys?: string[]
+    },
     options?: { background?: boolean }
   ) =>
     req<{ run: WorkflowRunRecord | null; run_id?: string; background?: boolean }>(
@@ -100,6 +111,80 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(body),
     }),
+
+  // ---- Distill queue inventory & control plane ----
+  listQueue: (params?: {
+    status?: string
+    client?: string
+    ingress_channel?: string
+    project?: string
+    q?: string
+    limit?: number
+    offset?: number
+  }) => {
+    const search = new URLSearchParams()
+    for (const [key, value] of Object.entries(params ?? {})) {
+      if (value === undefined || value === null || value === '') continue
+      search.set(key, String(value))
+    }
+    const qs = search.toString()
+    return req<{ summary: QueueSummary; items: DistillQueueItem[]; total: number }>(
+      `/api/site/queue${qs ? `?${qs}` : ''}`
+    )
+  },
+  getQueueEvents: (queueId: string) =>
+    req<{ events: AuditEventRecord[] }>(
+      `/api/site/queue/${encodeURIComponent(queueId)}/events`
+    ),
+  syncQueue: () =>
+    req<QueueSyncResult>('/api/site/queue/sync', { method: 'POST' }),
+  queueItemAction: (queueId: string, action: QueueAction, reason = '') =>
+    req<{ item: DistillQueueItem; summary: QueueSummary }>(
+      `/api/site/queue/${encodeURIComponent(queueId)}/action`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ action, reason }),
+      }
+    ),
+  queueBulkAction: (queueIds: string[], action: QueueAction, reason = '') =>
+    req<{ updated: number; summary: QueueSummary }>('/api/site/queue/bulk-action', {
+      method: 'POST',
+      body: JSON.stringify({ queue_ids: queueIds, action, reason }),
+    }),
+  /**
+   * Re-run the triage rules over the inventory.
+   *
+   * The backend reports the change list as `changes` (with `evaluated` /
+   * `change_count`); it is normalized here so the panel always reads the same
+   * `would_exclude` / `would_admit` split regardless of which keys the route
+   * grows.
+   */
+  reTriageQueue: async (dryRun = true): Promise<QueueReTriageResult> => {
+    const raw = await req<{
+      dry_run?: boolean
+      evaluated?: number
+      checked?: number
+      change_count?: number
+      changed_count?: number
+      changes?: QueueReTriageChange[]
+      would_exclude?: QueueReTriageChange[]
+      would_admit?: QueueReTriageChange[]
+      summary?: QueueSummary
+    }>('/api/site/queue/re-triage', {
+      method: 'POST',
+      body: JSON.stringify({ dry_run: dryRun }),
+    })
+    const changes = raw.changes ?? []
+    return {
+      dry_run: raw.dry_run ?? dryRun,
+      checked: raw.checked ?? raw.evaluated ?? 0,
+      changed_count: raw.changed_count ?? raw.change_count ?? changes.length,
+      would_exclude:
+        raw.would_exclude ?? changes.filter((c) => c.to_status === 'excluded'),
+      would_admit: raw.would_admit ?? changes.filter((c) => c.to_status === 'queued'),
+      summary: raw.summary,
+    }
+  },
 
   listRules: () =>
     req<{ rules: RuleRecord[]; dissents_by_rule?: Record<string, DissentRecord[]> }>(
