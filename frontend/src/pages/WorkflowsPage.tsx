@@ -1,7 +1,11 @@
-import React, { useEffect, useMemo, useState } from 'react'
-import { Archive, GitBranch, Inbox, Play, Plus } from 'lucide-react'
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { Archive, GitBranch, Inbox, Loader2, Play, Plus } from 'lucide-react'
+import type { RouteIntent } from '../App'
 import { api } from '../api'
 import { ListToolbar, PaginationBar, usePagination } from '../components/ListControls'
+import { AnimatedNumber } from '../components/ui/AnimatedNumber'
+import { Collapse } from '../components/ui/Collapse'
+import { useToast } from '../components/ui/Toast'
 import {
   ManualSessionModal,
   type ManualSessionInput,
@@ -12,8 +16,11 @@ import type { WorkflowDetailTab } from '../components/workflows/RunDetailPanel'
 import {
   CLIENT_LABELS,
   FEISHU_LISTENER_STATE_LABELS,
+  PHASE_LABELS,
+  TRIGGER_LABELS,
   dictLabels,
   labelOf,
+  preferredScrollBehavior,
 } from '../lib/labels'
 import type {
   AuditEventRecord,
@@ -27,33 +34,27 @@ import type {
 interface Props {
   refreshToken: number
   onGlobalRefresh: () => void
+  intent?: RouteIntent
 }
 
-/**
- * The approver's selection per run.
- *
- * `initCount` is how many planned writes the selection was built from. A run
- * that is still RUNNING has no writes yet; when it reaches AWAITING_APPROVAL
- * it has N of them. Without the count the selection would stay the empty one
- * it was initialized with, and "同意并写入" would approve nothing.
- */
 interface ApprovalSelection {
   selected: number[]
   initCount: number
 }
 
-/** The inventory strip's six clickable status counters, in lifecycle order. */
+const LAST_CLIENT_STORAGE_KEY = 'flywheel-manual-client'
+
 const KPI_STATUSES: Array<{
   status: keyof QueueSummary['by_status']
   label: string
   dot: string
 }> = [
-  { status: 'queued', label: '待处理库存', dot: 'bg-accent' },
+  { status: 'queued', label: '待整理', dot: 'bg-accent' },
   { status: 'processing', label: '处理中', dot: 'bg-amber' },
   { status: 'processed', label: '已沉淀', dot: 'bg-ok' },
-  { status: 'excluded', label: '已排除', dot: 'bg-ink-4' },
+  { status: 'excluded', label: '已移出', dot: 'bg-ink-4' },
   { status: 'withdrawn', label: '已撤回', dot: 'bg-ink-4' },
-  { status: 'dead_letter', label: '异常死信', dot: 'bg-hot' },
+  { status: 'dead_letter', label: '处理失败', dot: 'bg-hot' },
 ]
 
 const EMPTY_QUEUE_SUMMARY: QueueSummary = {
@@ -77,13 +78,16 @@ const EMPTY_QUEUE_SUMMARY: QueueSummary = {
   estimated_batches: 0,
 }
 
-export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }) => {
+export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh, intent }) => {
+  const toast = useToast()
   const [runs, setRuns] = useState<WorkflowRunRecord[]>([])
   const [sessions, setSessions] = useState<SessionRecord[]>([])
   const [queueItems, setQueueItems] = useState<DistillQueueItem[]>([])
   const [queueSummary, setQueueSummary] = useState<QueueSummary>(EMPTY_QUEUE_SUMMARY)
   const [dicts, setDicts] = useState<Record<string, DictItem[]>>({})
+  const [loadedOnce, setLoadedOnce] = useState(false)
   const [expandedRunId, setExpandedRunId] = useState<string | null>(null)
+  const [highlightedRunId, setHighlightedRunId] = useState<string | null>(null)
   const [selectedNodeId, setSelectedNodeId] = useState<string>('P00_PREPARE')
   const [detailTab, setDetailTab] = useState<WorkflowDetailTab>('stages')
   const [runEvents, setRunEvents] = useState<AuditEventRecord[]>([])
@@ -91,23 +95,52 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  // `null` means "the default has not been resolved yet": the first load picks
-  // queue vs. pipeline once, and after that only an explicit click moves it,
-  // so a live refresh never flips the tab out from under the user.
-  const [activeTab, setActiveTab] = useState<'queue' | 'pipeline' | null>(null)
-  const [queueStatusFilter, setQueueStatusFilter] = useState('')
+  const [activeTab, setActiveTab] = useState<'queue' | 'pipeline' | null>(
+    intent?.runsTab ?? (intent?.runId ? 'pipeline' : intent?.queueStatus ? 'queue' : null)
+  )
+  const [queueStatusFilter, setQueueStatusFilter] = useState(intent?.queueStatus ?? '')
   const [syncing, setSyncing] = useState(false)
-  const [syncNotice, setSyncNotice] = useState<string | null>(null)
-  const [pendingJumpRunId, setPendingJumpRunId] = useState<string | null>(null)
+  const [pendingJumpRunId, setPendingJumpRunId] = useState<string | null>(intent?.runId ?? null)
 
   const [showNewSession, setShowNewSession] = useState(false)
-  const [newClient, setNewClient] = useState('claude-code')
+  const [newClient, setNewClient] = useState(() => {
+    try {
+      return localStorage.getItem(LAST_CLIENT_STORAGE_KEY) || 'claude-code'
+    } catch {
+      return 'claude-code'
+    }
+  })
   const [newTitle, setNewTitle] = useState('')
   const [newSummary, setNewSummary] = useState('')
   const [feishuLabel, setFeishuLabel] = useState('未配置')
   const [runQuery, setRunQuery] = useState('')
   const [runStatusFilter, setRunStatusFilter] = useState('all')
   const [runTriggerFilter, setRunTriggerFilter] = useState('all')
+
+  // Sliding underline indicator for the dual workspace tabs
+  const tabListRef = useRef<HTMLDivElement>(null)
+  const queueTabRef = useRef<HTMLButtonElement>(null)
+  const pipeTabRef = useRef<HTMLButtonElement>(null)
+  const [tabBar, setTabBar] = useState<{ x: number; w: number; ready: boolean }>({
+    x: 0,
+    w: 0,
+    ready: false,
+  })
+  const [tabAnimated, setTabAnimated] = useState(false)
+
+  // Apply explicit deep-link navigation intents
+  useEffect(() => {
+    if (!intent?.nonce) return
+    if (intent.runId) {
+      setActiveTab('pipeline')
+      setPendingJumpRunId(intent.runId)
+    } else if (intent.runsTab) {
+      setActiveTab(intent.runsTab)
+    }
+    if (intent.queueStatus !== undefined) {
+      setQueueStatusFilter(intent.queueStatus)
+    }
+  }, [intent?.nonce, intent?.runId, intent?.runsTab, intent?.queueStatus])
 
   useEffect(() => {
     api
@@ -137,36 +170,60 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
       .catch(() => setFeishuLabel('未配置'))
   }, [refreshToken])
 
-  const loadData = async () => {
-    try {
-      const [runsRes, sessRes, queueRes, dictRes] = await Promise.all([
-        api.listRuns(),
-        api.listSessions(),
-        api.listQueue(),
-        api.listDicts(),
-      ])
-      setRuns(runsRes.runs)
-      setSessions(sessRes.sessions)
-      setQueueItems(queueRes.items)
-      setQueueSummary(queueRes.summary)
-      setDicts(dictRes.dicts)
+  const loadData = useCallback(async () => {
+    const [runsOutcome, sessOutcome, queueOutcome, dictOutcome] = await Promise.allSettled([
+      api.listRuns(),
+      api.listSessions(),
+      api.listQueue(),
+      api.listDicts(),
+    ])
 
-      // Resolve the default tab exactly once: a batch waiting for approval is
-      // the most urgent thing on the page, otherwise a non-empty backlog opens
-      // the queue. A refresh never reaches this branch again for that session.
+    const errors: string[] = []
+    let loadedRuns: WorkflowRunRecord[] | null = null
+    let loadedQueueSummary: QueueSummary | null = null
+
+    if (runsOutcome.status === 'fulfilled') {
+      loadedRuns = runsOutcome.value.runs
+      setRuns(loadedRuns)
+    } else {
+      errors.push(runsOutcome.reason?.message || '加载整理批次失败')
+    }
+
+    if (sessOutcome.status === 'fulfilled') {
+      setSessions(sessOutcome.value.sessions)
+    }
+
+    if (queueOutcome.status === 'fulfilled') {
+      setQueueItems(queueOutcome.value.items)
+      loadedQueueSummary = queueOutcome.value.summary
+      setQueueSummary(loadedQueueSummary)
+    } else {
+      const msg = String(queueOutcome.reason?.message || '')
+      if (msg === 'Not Found' || msg.includes('404')) {
+        errors.push('后台服务版本较旧，请重启 flywheel serve 后刷新页面。')
+      } else {
+        errors.push(`加载待整理队列失败：${msg || '未知错误'}`)
+      }
+    }
+
+    if (dictOutcome.status === 'fulfilled') {
+      setDicts(dictOutcome.value.dicts)
+    }
+
+    setError(errors.length > 0 ? errors.join('；') : null)
+    setLoadedOnce(true)
+
+    if (loadedRuns) {
       setActiveTab((prev) => {
         if (prev !== null) return prev
-        const awaiting = runsRes.runs.some((run) => run.status === 'AWAITING_APPROVAL')
-        const hasBacklog = (queueRes.summary.by_status.queued ?? 0) > 0
+        const awaiting = loadedRuns!.some((run) => run.status === 'AWAITING_APPROVAL')
+        const hasBacklog = (loadedQueueSummary?.by_status.queued ?? 0) > 0
         return awaiting || !hasBacklog ? 'pipeline' : 'queue'
       })
 
-      // Default to approving every planned write. The selection is rebuilt
-      // whenever the write count changes, so a run that reaches the approval
-      // gate with N writes is approved as a whole instead of nothing.
       setApprovalSel((prev) => {
         const next = { ...prev }
-        for (const r of runsRes.runs) {
+        for (const r of loadedRuns!) {
           const count = r.planned_writes.length
           const cur = next[r.run_id]
           if (!cur || cur.initCount !== count) {
@@ -179,20 +236,17 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
         return next
       })
 
-      // Auto-expand any run waiting for approval on first load
       setExpandedRunId((prev) => {
-        if (prev && runsRes.runs.some((r) => r.run_id === prev)) return prev
-        const awaiting = runsRes.runs.find((r) => r.status === 'AWAITING_APPROVAL')
+        if (prev && loadedRuns!.some((r) => r.run_id === prev)) return prev
+        const awaiting = loadedRuns!.find((r) => r.status === 'AWAITING_APPROVAL')
         return awaiting ? awaiting.run_id : null
       })
-    } catch (e: any) {
-      setError(e.message)
     }
-  }
+  }, [])
 
   useEffect(() => {
     loadData()
-  }, [refreshToken])
+  }, [refreshToken, loadData])
 
   useEffect(() => {
     if (!expandedRunId) {
@@ -205,14 +259,34 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
       .catch(() => setRunEvents([]))
   }, [expandedRunId, refreshToken])
 
-  useEffect(() => {
-    if (!syncNotice) return
-    const timer = window.setTimeout(() => setSyncNotice(null), 8000)
-    return () => window.clearTimeout(timer)
-  }, [syncNotice])
-
   const awaitingCount = runs.filter((r) => r.status === 'AWAITING_APPROVAL').length
   const showQueueTab = activeTab === 'queue'
+  const tabResolved = activeTab !== null
+
+  const measureTabBar = useCallback(() => {
+    if (!tabResolved) return
+    const el = showQueueTab ? queueTabRef.current : pipeTabRef.current
+    if (!el) return
+    const next = { x: el.offsetLeft, w: el.offsetWidth, ready: true }
+    setTabBar((prev) =>
+      prev.ready && prev.x === next.x && prev.w === next.w ? prev : next
+    )
+  }, [showQueueTab, tabResolved])
+
+  useLayoutEffect(() => {
+    if (!tabResolved) return
+    measureTabBar()
+    const raf = requestAnimationFrame(() => setTabAnimated(true))
+    return () => cancelAnimationFrame(raf)
+  }, [measureTabBar, tabResolved, queueSummary.by_status.queued, runs.length, awaitingCount])
+
+  useEffect(() => {
+    const container = tabListRef.current
+    if (!container || typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => measureTabBar())
+    ro.observe(container)
+    return () => ro.disconnect()
+  }, [measureTabBar])
 
   const clientLabels = useMemo(
     () => dictLabels(dicts, 'client_type', CLIENT_LABELS),
@@ -230,8 +304,6 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
     setBusy(true)
     setError(null)
     try {
-      // Background: the answer comes at once and the batch follows on the SSE
-      // stream, so a long run no longer holds the request open.
       const res = await api.startRun(
         { phase: 'auto', auto_approve: autoApprove },
         { background: true }
@@ -247,16 +319,16 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
         setDetailTab('stages')
         setPendingJumpRunId(res.run_id)
       }
+      toast.push({ tone: 'info', message: '已启动新一轮整理，进度将实时同步' })
       await loadData()
       onGlobalRefresh()
     } catch (e: any) {
-      setError(e.message)
+      toast.push({ tone: 'error', message: e?.message || '启动整理失败' })
     } finally {
       setBusy(false)
     }
   }
 
-  /** Claim exactly these inventory items on the next batch (插队). */
   const triggerQueueIds = async (queueIds: string[]) => {
     if (queueIds.length === 0) return
     setBusy(true)
@@ -274,10 +346,11 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
         setDetailTab('stages')
         setPendingJumpRunId(runId)
       }
+      toast.push({ tone: 'info', message: `已将 ${queueIds.length} 段对话插队送入整理` })
       await loadData()
       onGlobalRefresh()
     } catch (e: any) {
-      setError(e.message)
+      toast.push({ tone: 'error', message: e?.message || '插队整理失败' })
     } finally {
       setBusy(false)
     }
@@ -292,38 +365,40 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
       const scanned = Number(report.scanned ?? 0)
       const enqueued = Number(report.enqueued ?? 0)
       const excluded = Number(report.excluded ?? 0)
-      const withdrawn = Number(report.withdrawn ?? 0)
-      setSyncNotice(
-        `已同步归档：扫描 ${scanned} 个归档文件，新入队 ${enqueued} 条，规则排除 ${excluded} 条，撤回 ${withdrawn} 条${
-          res.bridged > 0 ? `，补录历史会话 ${res.bridged} 条` : ''
-        }。`
+      toast.push(
+        enqueued > 0
+          ? `已同步归档：扫描 ${scanned} 个文件，新加入 ${enqueued} 段待整理对话${
+              excluded > 0 ? `（跳过 ${excluded} 段闲聊）` : ''
+            }`
+          : `已同步归档：扫描 ${scanned} 个文件，没有新的待整理对话`
       )
       await loadData()
       onGlobalRefresh()
     } catch (e: any) {
-      setError(e.message)
+      toast.push({ tone: 'error', message: e?.message || '同步归档失败' })
     } finally {
       setSyncing(false)
     }
   }
 
-  /** Switch to the pipeline tab, expand the batch and scroll it into view. */
   const jumpToRun = (runId: string) => {
     setActiveTab('pipeline')
     setPendingJumpRunId(runId)
   }
 
   const handleApprove = async (run: WorkflowRunRecord) => {
+    const indices = approvalSel[run.run_id]?.selected ?? run.planned_writes.map((_, i) => i)
+    if (indices.length === 0) return
     setBusy(true)
     setError(null)
     try {
-      const indices = approvalSel[run.run_id]?.selected ?? run.planned_writes.map((_, i) => i)
       await api.approveRun(run.run_id, indices, { background: true })
       setDetailTab('digest')
+      toast.push(`已同意写入 ${indices.length} 项建议，正在落盘核验…`)
       await loadData()
       onGlobalRefresh()
     } catch (e: any) {
-      setError(e.message)
+      toast.push({ tone: 'error', message: e?.message || '审批提交失败' })
     } finally {
       setBusy(false)
     }
@@ -333,11 +408,12 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
     setBusy(true)
     setError(null)
     try {
-      await api.rejectRun(run.run_id, '用户在每日沉淀列表中取消本次写入')
+      await api.rejectRun(run.run_id, '用户在沉淀与审批页放弃本次写入')
+      toast.push({ tone: 'info', message: '已放弃本批写入，相关对话已退回待整理队列' })
       await loadData()
       onGlobalRefresh()
     } catch (e: any) {
-      setError(e.message)
+      toast.push({ tone: 'error', message: e?.message || '取消写入失败' })
     } finally {
       setBusy(false)
     }
@@ -356,10 +432,25 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
     })
   }
 
+  const setAllPlanned = (run: WorkflowRunRecord, selectAll: boolean) => {
+    setApprovalSel((prev) => ({
+      ...prev,
+      [run.run_id]: {
+        selected: selectAll ? run.planned_writes.map((_, i) => i) : [],
+        initCount: run.planned_writes.length,
+      },
+    }))
+  }
+
   const submitNewSession = async (data: ManualSessionInput) => {
     setBusy(true)
     setError(null)
     try {
+      try {
+        localStorage.setItem(LAST_CLIENT_STORAGE_KEY, data.client)
+      } catch {
+        // ignore
+      }
       await api.registerSession({
         client: data.client,
         session_id: `manual-${Date.now().toString(36)}`,
@@ -372,10 +463,11 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
       setNewTitle('')
       setNewSummary('')
       setShowNewSession(false)
+      toast.push(`已加入待整理队列：「${data.title}」`)
       await loadData()
       onGlobalRefresh()
     } catch (e: any) {
-      setError(e.message)
+      toast.push({ tone: 'error', message: e?.message || '添加对话失败' })
     } finally {
       setBusy(false)
     }
@@ -409,7 +501,7 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
       .filter((r) =>
         !q
           ? true
-          : `${r.batch_date || ''} ${r.run_id} ${r.phase} ${r.trigger} ${r.runner_mode} ${r.error || ''}`
+          : `${r.batch_date || ''} ${r.run_id} ${r.phase} ${labelOf(PHASE_LABELS, r.phase)} ${r.trigger} ${labelOf(TRIGGER_LABELS, r.trigger)} ${r.runner_mode} ${r.error || ''}`
               .toLowerCase()
               .includes(q)
       )
@@ -422,21 +514,21 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
 
   const runsPager = usePagination(filteredRuns, 10)
   const latestRunId = runs[0]?.run_id
+  const hasRunFilters =
+    Boolean(runQuery.trim()) || runStatusFilter !== 'all' || runTriggerFilter !== 'all'
 
-  // Land a queue-row "batch" click on the pipeline tab: expand the run, move
-  // the pager to its page, then scroll it into view. Runs that have not loaded
-  // yet stay pending until the next refresh brings them.
   useEffect(() => {
     if (!pendingJumpRunId) return
     const targetRunId = pendingJumpRunId
     const index = filteredRuns.findIndex((run) => run.run_id === targetRunId)
     if (index < 0) {
       const exists = runs.some((run) => run.run_id === targetRunId)
-      if (exists && (runQuery || runStatusFilter !== 'all' || runTriggerFilter !== 'all')) {
-        // The active query hides the run: clear the filters so the jump lands.
+      if (exists && hasRunFilters) {
         setRunQuery('')
         setRunStatusFilter('all')
         setRunTriggerFilter('all')
+      } else if (loadedOnce && !exists) {
+        setPendingJumpRunId(null)
       }
       return
     }
@@ -455,12 +547,14 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
       )
       setDetailTab(run.status === 'PASS' ? 'digest' : 'stages')
     }
-    const row = document.getElementById(`run-row-${targetRunId}`)
-    if (row) {
-      row.scrollIntoView({ behavior: 'smooth', block: 'center' })
-    }
+    setHighlightedRunId(targetRunId)
+    requestAnimationFrame(() => {
+      const row = document.getElementById(`run-row-${targetRunId}`)
+      row?.scrollIntoView({ behavior: preferredScrollBehavior(), block: 'center' })
+    })
+    const clearTimer = window.setTimeout(() => setHighlightedRunId(null), 1350)
     setPendingJumpRunId(null)
-    // The effect intentionally follows the pager and filter state it acts on.
+    return () => window.clearTimeout(clearTimer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     pendingJumpRunId,
@@ -468,9 +562,7 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
     runs,
     runsPager.page,
     runsPager.pageSize,
-    runQuery,
-    runStatusFilter,
-    runTriggerFilter,
+    hasRunFilters,
   ])
 
   return (
@@ -480,7 +572,7 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
         <div>
           <h1 className="text-[24px] font-semibold leading-[1.3] text-ink">沉淀与审批</h1>
           <p className="text-[13.5px] text-ink-3 mt-1">
-            工作流是流水线，队列是库存：顶部常驻库存条盯住积压与清仓进度，下方双 Tab 管理待沉淀队列与 P00–P07 批次。
+            汇集各工具的对话记录，自动筛掉简短闲聊，提炼值得留存的知识笔记与避坑规则。
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -488,51 +580,73 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
             type="button"
             onClick={syncArchives}
             disabled={syncing || busy}
-            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[var(--radius-control)] border border-line bg-surface text-[12.5px] font-medium text-ink-2 hover:border-line-strong hover:text-ink disabled:opacity-50"
+            className="pressable inline-flex items-center gap-1.5 h-8 px-3 rounded-[var(--radius-control)] border border-line bg-surface text-[12.5px] font-medium text-ink-2 hover:border-line-strong hover:text-ink disabled:opacity-50"
           >
-            <Archive className="w-3.5 h-3.5" />
-            {syncing ? '同步中…' : '同步归档'}
+            {syncing ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Archive className="w-3.5 h-3.5" />
+            )}
+            <span>{syncing ? '同步中…' : '同步归档'}</span>
           </button>
           <button
             type="button"
             onClick={() => setShowNewSession((v) => !v)}
-            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[var(--radius-control)] border border-line bg-surface text-[12.5px] font-medium text-ink-2 hover:border-line-strong hover:text-ink"
+            aria-expanded={showNewSession}
+            className={`pressable inline-flex items-center gap-1.5 h-8 px-3 rounded-[var(--radius-control)] border text-[12.5px] font-medium ${
+              showNewSession
+                ? 'border-accent/45 bg-accent-soft text-accent-ink'
+                : 'border-line bg-surface text-ink-2 hover:border-line-strong hover:text-ink'
+            }`}
           >
-            <Plus className="w-3.5 h-3.5" />
-            手工补录对话
+            <Plus
+              className={`w-3.5 h-3.5 transition-transform duration-200 ease-[var(--ease-out-quint)] ${
+                showNewSession ? 'rotate-45' : ''
+              }`}
+            />
+            <span>{showNewSession ? '收起补录' : '手工补录'}</span>
           </button>
           <button
             type="button"
             onClick={() => triggerRun(null)}
             disabled={busy}
-            className="inline-flex items-center gap-1.5 h-8 px-3.5 rounded-[var(--radius-control)] bg-accent text-accent-contrast text-[12.5px] font-medium hover:bg-accent-ink disabled:opacity-50"
+            className="pressable inline-flex items-center gap-1.5 h-8 px-3.5 rounded-[var(--radius-control)] bg-accent text-accent-contrast text-[12.5px] font-medium hover:bg-accent-ink disabled:opacity-50"
           >
-            <Play className="w-3.5 h-3.5" />
-            立即跑一轮
+            {busy ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Play className="w-3.5 h-3.5" />
+            )}
+            <span>立即整理一轮</span>
           </button>
         </div>
       </header>
 
-      {syncNotice && (
-        <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 rounded-[var(--radius-card)] bg-ok-soft border border-ok/30 text-[12.5px] text-ok-ink">
-          <span>{syncNotice}</span>
-          <button
-            type="button"
-            onClick={() => setSyncNotice(null)}
-            className="text-[11.5px] text-ok-ink/80 hover:text-ok-ink"
-          >
-            关闭
-          </button>
-        </div>
-      )}
-
       {error && (
-        <div className="px-4 py-3 rounded-[var(--radius-card)] bg-hot-soft border border-hot/30 text-[12.5px] text-hot">
+        <div className="animate-shake px-4 py-3 rounded-[var(--radius-card)] bg-hot-soft border border-hot/30 text-[12.5px] text-hot">
           {error}
         </div>
       )}
 
-      {/* Persistent inventory & progress strip, visible on both tabs */}
+      {/* Smooth collapsible manual quick-entry form */}
+      <Collapse open={showNewSession}>
+        <div className="pb-1">
+          <ManualSessionModal
+            open={showNewSession}
+            busy={busy}
+            client={newClient}
+            title={newTitle}
+            summary={newSummary}
+            onClientChange={setNewClient}
+            onTitleChange={setNewTitle}
+            onSummaryChange={setNewSummary}
+            onClose={() => setShowNewSession(false)}
+            onSubmit={submitNewSession}
+          />
+        </div>
+      </Collapse>
+
+      {/* Persistent queue overview strip (clickable status filter pills) */}
       <div className="card px-3.5 py-3 space-y-2.5">
         <div className="flex flex-wrap items-center gap-1.5">
           {KPI_STATUSES.map((kpi) => {
@@ -547,8 +661,8 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
                   setActiveTab('queue')
                   setQueueStatusFilter((prev) => (prev === kpi.status ? '' : kpi.status))
                 }}
-                title={`切换到沉淀队列并筛选「${kpi.label}」`}
-                className={`inline-flex h-7 items-center gap-1.5 rounded-full border px-2.5 text-[12px] transition-colors ${
+                title={active ? '再次点击取消筛选' : `筛选「${kpi.label}」`}
+                className={`pressable inline-flex h-7 items-center gap-1.5 rounded-full border px-2.5 text-[12px] ${
                   active
                     ? 'border-accent/45 bg-accent-soft font-semibold text-accent-ink'
                     : 'border-line bg-surface text-ink-3 hover:border-line-strong hover:text-ink'
@@ -556,7 +670,7 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
               >
                 <span className={`size-1.5 rounded-full ${kpi.dot}`} />
                 <span>{kpi.label}</span>
-                <span className="num font-semibold text-ink">{count}</span>
+                <AnimatedNumber value={count} className="font-semibold text-ink" />
               </button>
             )
           })}
@@ -564,169 +678,205 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
             {queueSummary.estimated_batches > 0 ? (
               <>
                 预计约{' '}
-                <span className="num font-semibold text-ink-2">
-                  {queueSummary.estimated_batches}
-                </span>{' '}
-                批清空当前库存
+                <AnimatedNumber
+                  value={queueSummary.estimated_batches}
+                  className="font-semibold text-ink-2"
+                />{' '}
+                轮整理完毕
               </>
             ) : (
-              '当前库存已清空'
+              '待整理队列已清空'
             )}
           </span>
         </div>
 
-        <div className="flex flex-wrap items-center gap-1.5 border-t border-line-soft pt-2 text-[11.5px] text-ink-4">
-          <span>按接入工具：</span>
-          {clientPartitions.length === 0 ? (
-            <span>暂无库存分片</span>
-          ) : (
-            clientPartitions.map(([client, bucket]) => (
+        {clientPartitions.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5 border-t border-line-soft pt-2 text-[11.5px] text-ink-4">
+            <span>来源工具：</span>
+            {clientPartitions.map(([client, bucket]) => (
               <span key={client} className="chip num">
                 <span className="font-medium text-ink-2">
-                  {labelOf(clientLabels, client, client)}：
+                  {labelOf(clientLabels, client, client)}
                 </span>
-                <span className="text-ink-4">待处理</span>
+                <span className="text-ink-4">待整理</span>
                 <span className="font-semibold text-ink">{bucket.queued ?? 0}</span>
                 <span className="text-ink-4">/</span>
                 <span className="text-ink-4">已沉淀</span>
                 <span className="font-semibold text-ink">{bucket.processed ?? 0}</span>
               </span>
-            ))
-          )}
-          <span className="ml-auto">
-            共 <span className="num text-ink-2">{queueSummary.total}</span> 条库存记录
-          </span>
-        </div>
+            ))}
+            <span className="ml-auto">
+              共 <AnimatedNumber value={queueSummary.total} className="text-ink-2" /> 段对话
+            </span>
+          </div>
+        )}
       </div>
 
-      {/* Dual tab switcher: inventory vs. pipeline */}
+      {/* Dual tab switcher with measured GPU-sliding underline */}
       <div
-        className="flex flex-wrap items-center gap-1 border-b border-line"
+        ref={tabListRef}
+        className="relative flex flex-wrap items-center gap-1 border-b border-line"
         role="tablist"
         aria-label="沉淀工作区视图"
       >
+        {tabBar.ready && (
+          <span
+            aria-hidden="true"
+            className={`pointer-events-none absolute bottom-0 left-0 h-[2px] rounded-full bg-accent ${
+              tabAnimated
+                ? 'transition-[transform,width] duration-[220ms] ease-[var(--ease-out-quint)]'
+                : ''
+            }`}
+            style={{
+              transform: `translate3d(${tabBar.x}px, 0, 0)`,
+              width: `${tabBar.w}px`,
+            }}
+          />
+        )}
         <button
+          ref={queueTabRef}
           type="button"
           role="tab"
           aria-selected={showQueueTab}
           onClick={() => setActiveTab('queue')}
-          className={`-mb-px inline-flex items-center gap-1.5 border-b-2 px-3 py-2 text-[13px] transition-colors ${
-            showQueueTab
-              ? 'border-accent font-semibold text-ink'
-              : 'border-transparent text-ink-3 hover:text-ink'
+          className={`pressable inline-flex items-center gap-1.5 px-3 py-2 text-[13px] ${
+            showQueueTab ? 'font-semibold text-ink' : 'text-ink-3 hover:text-ink'
           }`}
         >
           <Inbox className="w-4 h-4" />
-          沉淀队列（库存）
+          <span>待整理对话</span>
           <span className="num inline-flex h-[18px] min-w-[20px] items-center justify-center rounded-full bg-bg-sunk px-1.5 text-[11px] font-semibold text-ink-2">
             {queueSummary.by_status.queued}
           </span>
         </button>
         <button
+          ref={pipeTabRef}
           type="button"
           role="tab"
-          aria-selected={!showQueueTab}
+          aria-selected={tabResolved && !showQueueTab}
           onClick={() => setActiveTab('pipeline')}
-          className={`-mb-px inline-flex items-center gap-1.5 border-b-2 px-3 py-2 text-[13px] transition-colors ${
-            !showQueueTab
-              ? 'border-accent font-semibold text-ink'
-              : 'border-transparent text-ink-3 hover:text-ink'
+          className={`pressable inline-flex items-center gap-1.5 px-3 py-2 text-[13px] ${
+            tabResolved && !showQueueTab ? 'font-semibold text-ink' : 'text-ink-3 hover:text-ink'
           }`}
         >
           <GitBranch className="w-4 h-4" />
-          执行流水线（P00–P07）
+          <span>整理批次</span>
           <span className="num inline-flex h-[18px] min-w-[20px] items-center justify-center rounded-full bg-bg-sunk px-1.5 text-[11px] font-semibold text-ink-2">
             {runs.length}
           </span>
           {awaitingCount > 0 && (
-            <span className="inline-flex items-center gap-1 rounded-full bg-amber-soft px-1.5 text-[11px] font-medium text-amber-ink">
-              <span className="size-1.5 rounded-full bg-amber" />
+            <span className="inline-flex items-center gap-1 rounded-full bg-amber-soft px-1.5 py-0.5 text-[11px] font-medium text-amber-ink">
+              <span className="status-dot-live bg-amber" />
               {awaitingCount} 待审批
             </span>
           )}
         </button>
       </div>
 
-      {showNewSession && (
-        <ManualSessionModal
-          busy={busy}
-          client={newClient}
-          title={newTitle}
-          summary={newSummary}
-          onClientChange={setNewClient}
-          onTitleChange={setNewTitle}
-          onSummaryChange={setNewSummary}
-          onSubmit={submitNewSession}
-        />
-      )}
-
-      {showQueueTab ? (
-        <QueueInventoryPanel
-          items={queueItems}
-          dicts={dicts}
-          statusFilter={queueStatusFilter}
-          onStatusFilterChange={setQueueStatusFilter}
-          busy={busy}
-          onRefresh={loadData}
-          onTriggerQueueIds={triggerQueueIds}
-          onJumpToRun={jumpToRun}
-        />
+      {!loadedOnce ? (
+        <div className="card p-5 space-y-3" aria-busy="true">
+          {[0, 1, 2, 3].map((i) => (
+            <div key={i} className="skeleton-block h-14 w-full" />
+          ))}
+        </div>
+      ) : showQueueTab ? (
+        <div key="queue-panel" className="animate-tab-enter">
+          <QueueInventoryPanel
+            items={queueItems}
+            dicts={dicts}
+            statusFilter={queueStatusFilter}
+            onStatusFilterChange={setQueueStatusFilter}
+            busy={busy}
+            onRefresh={loadData}
+            onTriggerQueueIds={triggerQueueIds}
+            onJumpToRun={jumpToRun}
+          />
+        </div>
       ) : (
-        <>
-          {/* Search, filter & sort bar */}
-          <ListToolbar
-            query={runQuery}
-            onQueryChange={(q) => {
-              setRunQuery(q)
-              runsPager.resetPage()
-            }}
-            placeholder="按日期、批次 ID、执行模式或错误信息搜索…"
-          >
-            <select
-              aria-label="批次状态筛选"
-              value={runStatusFilter}
-              onChange={(e) => {
-                setRunStatusFilter(e.target.value)
+        <div key="pipeline-panel" className="animate-tab-enter space-y-3">
+          {runs.length > 0 && (
+            <ListToolbar
+              query={runQuery}
+              onQueryChange={(q) => {
+                setRunQuery(q)
                 runsPager.resetPage()
               }}
-              className="h-8 rounded-[var(--radius-control)] border border-line bg-surface px-2.5 text-[12px] text-ink"
-            >
-              <option value="all">全部状态</option>
-              <option value="AWAITING_APPROVAL">待审批</option>
-              <option value="PASS">已通过</option>
-              <option value="FAILED">已失败</option>
-              <option value="PARTIAL">部分完成</option>
-              <option value="CANCELLED">已取消</option>
-              <option value="RUNNING">运行中</option>
-            </select>
-            <select
-              aria-label="触发方式筛选"
-              value={runTriggerFilter}
-              onChange={(e) => {
-                setRunTriggerFilter(e.target.value)
+              placeholder="按日期、批次号或错误信息搜索…"
+              enableSlashShortcut
+              hasActiveFilters={hasRunFilters}
+              onResetFilters={() => {
+                setRunQuery('')
+                setRunStatusFilter('all')
+                setRunTriggerFilter('all')
                 runsPager.resetPage()
               }}
-              className="h-8 rounded-[var(--radius-control)] border border-line bg-surface px-2.5 text-[12px] text-ink"
             >
-              <option value="all">全部触发</option>
-              <option value="scheduled">定时调度</option>
-              <option value="api">手动触发</option>
-              <option value="cli">CLI 触发</option>
-            </select>
-          </ListToolbar>
+              <select
+                aria-label="批次状态筛选"
+                value={runStatusFilter}
+                onChange={(e) => {
+                  setRunStatusFilter(e.target.value)
+                  runsPager.resetPage()
+                }}
+                className="field-input h-8 px-2.5 text-[12px]"
+              >
+                <option value="all">全部状态</option>
+                <option value="AWAITING_APPROVAL">待审批</option>
+                <option value="PASS">已通过</option>
+                <option value="FAILED">已失败</option>
+                <option value="PARTIAL">部分完成</option>
+                <option value="CANCELLED">已取消</option>
+                <option value="RUNNING">运行中</option>
+              </select>
+              <select
+                aria-label="触发方式筛选"
+                value={runTriggerFilter}
+                onChange={(e) => {
+                  setRunTriggerFilter(e.target.value)
+                  runsPager.resetPage()
+                }}
+                className="field-input h-8 px-2.5 text-[12px]"
+              >
+                <option value="all">全部触发方式</option>
+                <option value="scheduled">定时调度</option>
+                <option value="api">手动触发</option>
+                <option value="cli">命令行触发</option>
+              </select>
+            </ListToolbar>
+          )}
 
-          {/* GitLab-CI-style Daily Batch Pipeline Rows */}
           {filteredRuns.length === 0 ? (
-            <div className="card p-12 text-center text-[13.5px] text-ink-4">
-              {runs.length === 0
-                ? '还没有沉淀批次，点击右上角「立即跑一轮」开始第一次整理。'
-                : '没有符合当前查询或筛选条件的批次记录。'}
+            <div className="card p-12 text-center space-y-3">
+              <p className="text-[13.5px] text-ink-4">
+                {runs.length === 0
+                  ? '还没有整理批次，点击右上角「立即整理一轮」开始第一次沉淀。'
+                  : '没有符合当前筛选条件的整理批次。'}
+              </p>
+              {hasRunFilters && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRunQuery('')
+                    setRunStatusFilter('all')
+                    setRunTriggerFilter('all')
+                  }}
+                  className="pressable inline-flex items-center h-8 px-3 rounded-[var(--radius-control)] border border-line bg-surface text-[12.5px] text-ink-2 hover:border-line-strong hover:text-ink"
+                >
+                  清空筛选条件
+                </button>
+              )}
             </div>
           ) : (
             <div className="card overflow-hidden">
               <div className="divide-y divide-line">
                 {runsPager.pageItems.map((run, idx) => (
-                  <div key={run.run_id} id={`run-row-${run.run_id}`}>
+                  <div
+                    key={run.run_id}
+                    id={`run-row-${run.run_id}`}
+                    className={
+                      highlightedRunId === run.run_id ? 'animate-row-highlight' : ''
+                    }
+                  >
                     <RunPipelineRow
                       run={run}
                       isLatest={run.run_id === latestRunId}
@@ -745,7 +895,8 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
                       onToggleRow={toggleRow}
                       onTabChange={setDetailTab}
                       onSelectNode={setSelectedNodeId}
-                      onToggleIndex={(idx) => togglePlannedIdx(run.run_id, idx)}
+                      onToggleIndex={(pIdx) => togglePlannedIdx(run.run_id, pIdx)}
+                      onSelectAll={(selectAll) => setAllPlanned(run, selectAll)}
                       onApprove={() => handleApprove(run)}
                       onReject={() => handleReject(run)}
                     />
@@ -764,7 +915,7 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh }
               </div>
             </div>
           )}
-        </>
+        </div>
       )}
     </div>
   )

@@ -4,10 +4,18 @@ import { StatusBadge } from '../StatusBadge'
 import { CLIENT_LABELS, formatDateYMD, labelOf } from '../../lib/labels'
 import type { OutcomeRecord } from '../../types'
 
-/**
- * The "证据台账" tab: every outcome submitted through flywheel_record_outcome,
- * sorted by created_at DESC with search, status/client filter, and 10-per-page pagination.
- */
+const CHECK_KIND_LABELS: Record<string, string> = {
+  real: '实测',
+  test: '单测',
+  static: '静态',
+}
+
+const CHECK_RESULT_LABELS: Record<string, string> = {
+  pass: '通过',
+  fail: '失败',
+  skip: '跳过',
+}
+
 export const OutcomesLedgerTab: React.FC<{ outcomes: OutcomeRecord[] }> = ({ outcomes }) => {
   const [query, setQuery] = useState('')
   const [statusFilter, setStatusFilter] = useState('all')
@@ -34,66 +42,77 @@ export const OutcomesLedgerTab: React.FC<{ outcomes: OutcomeRecord[] }> = ({ out
   }, [outcomes, query, statusFilter, clientFilter])
 
   const pager = usePagination(filtered, 10)
+  const hasFilters = Boolean(query.trim()) || statusFilter !== 'all' || clientFilter !== 'all'
 
   return (
     <section className="card p-5 space-y-3.5">
       <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-line-soft">
         <div>
-          <h2 className="text-[15px] font-bold text-ink">执行期证据验收台账（Outcomes）</h2>
+          <h2 className="text-[15px] font-bold text-ink">完工验收记录</h2>
           <p className="text-[12px] text-ink-4 mt-0.5">
-            记录每次通过 flywheel_record_outcome 提交的真实/测试/静态检查项与规则复测晋升效果。
+            每次任务交付时提交的实测/单测检查证据，用于验证避坑规则是否真实有效。
           </p>
         </div>
         <span className="chip num">共 {outcomes.length} 条</span>
       </div>
 
-      <ListToolbar
-        query={query}
-        onQueryChange={(q) => {
-          setQuery(q)
-          pager.resetPage()
-        }}
-        placeholder="搜索交付摘要、回执 ID、规则或 Skill…"
-      >
-        <select
-          aria-label="结果状态筛选"
-          value={statusFilter}
-          onChange={(e) => {
-            setStatusFilter(e.target.value)
+      {outcomes.length > 0 && (
+        <ListToolbar
+          query={query}
+          onQueryChange={(q) => {
+            setQuery(q)
             pager.resetPage()
           }}
-          className="h-8 rounded-[var(--radius-control)] border border-line bg-surface px-2.5 text-[12px] text-ink"
+          placeholder="搜索交付摘要、回执号、规则或 Skill…"
+          enableSlashShortcut
+          hasActiveFilters={hasFilters}
+          onResetFilters={() => {
+            setQuery('')
+            setStatusFilter('all')
+            setClientFilter('all')
+            pager.resetPage()
+          }}
         >
-          <option value="all">全部状态</option>
-          <option value="success">成功</option>
-          <option value="partial">部分完成</option>
-          <option value="failed">失败</option>
-        </select>
-        {clients.length > 1 && (
           <select
-            aria-label="客户端筛选"
-            value={clientFilter}
+            aria-label="验收状态筛选"
+            value={statusFilter}
             onChange={(e) => {
-              setClientFilter(e.target.value)
+              setStatusFilter(e.target.value)
               pager.resetPage()
             }}
-            className="h-8 rounded-[var(--radius-control)] border border-line bg-surface px-2.5 text-[12px] text-ink"
+            className="field-input h-8 px-2.5 text-[12px]"
           >
-            <option value="all">全部客户端</option>
-            {clients.map((c) => (
-              <option key={c} value={c}>
-                {labelOf(CLIENT_LABELS, c)}
-              </option>
-            ))}
+            <option value="all">全部状态</option>
+            <option value="success">已通过</option>
+            <option value="partial">部分完成</option>
+            <option value="failed">未通过</option>
           </select>
-        )}
-      </ListToolbar>
+          {clients.length > 1 && (
+            <select
+              aria-label="来源工具筛选"
+              value={clientFilter}
+              onChange={(e) => {
+                setClientFilter(e.target.value)
+                pager.resetPage()
+              }}
+              className="field-input h-8 px-2.5 text-[12px]"
+            >
+              <option value="all">全部工具</option>
+              {clients.map((c) => (
+                <option key={c} value={c}>
+                  {labelOf(CLIENT_LABELS, c)}
+                </option>
+              ))}
+            </select>
+          )}
+        </ListToolbar>
+      )}
 
       {filtered.length === 0 ? (
         <p className="text-[13px] text-ink-4 py-8 text-center">
           {outcomes.length === 0
-            ? '暂无证据验收记录。当 AI 工具交付任务并调用 flywheel_record_outcome 后会在此留痕。'
-            : '没有符合筛选条件的证据记录。'}
+            ? '暂无完工验收记录，AI 工具交付任务并回传实测证据后会出现在这里。'
+            : '没有符合筛选条件的验收记录。'}
         </p>
       ) : (
         <div className="divide-y divide-line-soft">
@@ -103,7 +122,7 @@ export const OutcomesLedgerTab: React.FC<{ outcomes: OutcomeRecord[] }> = ({ out
                 <div className="flex flex-wrap items-center gap-2">
                   <StatusBadge status={o.status} />
                   <span className="chip">{labelOf(CLIENT_LABELS, o.client)}</span>
-                  <span className="chip">{o.origin === 'natural' ? '自然任务' : o.origin}</span>
+                  <span className="chip">{o.origin === 'natural' ? '真实任务' : o.origin}</span>
                   <span className="mono text-[11px] text-ink-4">{o.outcome_id}</span>
                 </div>
                 <span className="num text-[11.5px] text-ink-4">
@@ -124,7 +143,8 @@ export const OutcomesLedgerTab: React.FC<{ outcomes: OutcomeRecord[] }> = ({ out
                             : 'bg-bg-sunk text-ink-3 border-line-soft'
                       }`}
                     >
-                      [{chk.kind}] {chk.name}: {chk.result}
+                      [{CHECK_KIND_LABELS[chk.kind] || chk.kind}] {chk.name}：
+                      {CHECK_RESULT_LABELS[chk.result] || chk.result}
                     </span>
                   ))}
                 </div>
@@ -140,7 +160,7 @@ export const OutcomesLedgerTab: React.FC<{ outcomes: OutcomeRecord[] }> = ({ out
                     <span>实测 Skill：{o.used_skills.join(', ')}</span>
                   )}
                   {o.used_knowledge_paths.length > 0 && (
-                    <span>续期经验卡：{o.used_knowledge_paths.length} 篇</span>
+                    <span>顺延保鲜笔记：{o.used_knowledge_paths.length} 篇</span>
                   )}
                 </div>
               )}

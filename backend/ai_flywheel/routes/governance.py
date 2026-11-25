@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from ai_flywheel.core.receipts import OutcomeGateError
+from ai_flywheel.core.retro_advisory import advise_retro_item
 from ai_flywheel.core.time_utils import shanghai_today_ymd
 from ai_flywheel.models import (
     CreateRuleRequest,
@@ -150,8 +151,43 @@ def build_governance_router(rt: FlywheelRuntime) -> APIRouter:
 
     @router.post("/api/site/observations/bulk-archive")
     def site_bulk_archive_observations(body: ObservationBulkArchiveBody) -> dict[str, Any]:
-        updated = rt.db.bulk_update_mistake_observation_status(body.obs_ids, "archived")
+        eligible_ids = [
+            obs_id
+            for obs_id in dict.fromkeys(body.obs_ids)
+            if (existing := rt.db.get_mistake_observation(obs_id))
+            and existing.get("status") == "observing"
+        ]
+        updated = rt.db.bulk_update_mistake_observation_status(eligible_ids, "archived")
         if updated > 0:
+            rt.db.append_audit_event(
+                entity_type="mistake_observation",
+                entity_id="bulk",
+                event_type="observation_bulk_archived",
+                actor="portal",
+                summary=f"批量归档 {updated} 条观察错题",
+                payload={"obs_ids": eligible_ids},
+            )
+            rt.refresh_core_card()
+        return {"updated": updated}
+
+    @router.post("/api/site/observations/bulk-restore")
+    def site_bulk_restore_observations(body: ObservationBulkArchiveBody) -> dict[str, Any]:
+        eligible_ids = [
+            obs_id
+            for obs_id in dict.fromkeys(body.obs_ids)
+            if (existing := rt.db.get_mistake_observation(obs_id))
+            and existing.get("status") == "archived"
+        ]
+        updated = rt.db.bulk_update_mistake_observation_status(eligible_ids, "observing")
+        if updated > 0:
+            rt.db.append_audit_event(
+                entity_type="mistake_observation",
+                entity_id="bulk",
+                event_type="observation_bulk_restored",
+                actor="portal",
+                summary=f"批量恢复 {updated} 条已归档错题至观察池",
+                payload={"obs_ids": eligible_ids},
+            )
             rt.refresh_core_card()
         return {"updated": updated}
 
@@ -166,9 +202,43 @@ def build_governance_router(rt: FlywheelRuntime) -> APIRouter:
 
     @router.post("/api/site/observations/{obs_id}/archive")
     def site_archive_observation(obs_id: str) -> dict[str, Any]:
-        updated = rt.db.update_mistake_observation_status(obs_id, "archived")
-        if not updated:
+        existing = rt.db.get_mistake_observation(obs_id)
+        if not existing:
             raise HTTPException(status_code=404, detail="Observation not found")
+        if existing.get("status") != "observing":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot archive observation in status '{existing.get('status')}'",
+            )
+        updated = rt.db.update_mistake_observation_status(obs_id, "archived")
+        rt.db.append_audit_event(
+            entity_type="mistake_observation",
+            entity_id=obs_id,
+            event_type="observation_archived",
+            actor="portal",
+            summary="归档观察错题",
+        )
+        rt.refresh_core_card()
+        return {"observation": updated}
+
+    @router.post("/api/site/observations/{obs_id}/restore")
+    def site_restore_observation(obs_id: str) -> dict[str, Any]:
+        existing = rt.db.get_mistake_observation(obs_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Observation not found")
+        if existing.get("status") != "archived":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Only archived observations can be restored (current: '{existing.get('status')}')",
+            )
+        updated = rt.db.update_mistake_observation_status(obs_id, "observing")
+        rt.db.append_audit_event(
+            entity_type="mistake_observation",
+            entity_id=obs_id,
+            event_type="observation_restored",
+            actor="portal",
+            summary="撤销归档，恢复错题至观察池",
+        )
         rt.refresh_core_card()
         return {"observation": updated}
 
@@ -247,8 +317,15 @@ def build_governance_router(rt: FlywheelRuntime) -> APIRouter:
     def site_list_retro(status: str | None = None, limit: int = 300) -> dict[str, Any]:
         safe_limit = max(1, min(int(limit), 500))
         items = rt.db.list_retro_items(status=status, limit=safe_limit)
+        user_prefs = rt.policies.get_policy("user_preferences") or {}
+        hard_gates = rt.policies.get_hard_gates()
+        enriched = []
+        for x in items:
+            dumped = x.model_dump(mode="json")
+            dumped["advisory"] = advise_retro_item(x, user_prefs=user_prefs, hard_gates=hard_gates)
+            enriched.append(dumped)
         return {
-            "items": [x.model_dump(mode="json") for x in items],
+            "items": enriched,
             "total": rt.db.count_retro_items(status=status),
         }
 

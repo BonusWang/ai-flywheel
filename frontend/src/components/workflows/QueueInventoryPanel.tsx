@@ -1,11 +1,11 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import { createPortal } from 'react-dom'
 import {
   Ban,
   Check,
   ChevronDown,
-  ChevronUp,
+  Loader2,
   RotateCcw,
-  Undo2,
   UserCheck,
   UserX,
   Wand2,
@@ -30,18 +30,9 @@ import type {
   QueueReTriageResult,
 } from '../../types'
 import { ListToolbar, PaginationBar, usePagination } from '../ListControls'
+import { Collapse } from '../ui/Collapse'
+import { useToast } from '../ui/Toast'
 
-/** The six inventory statuses, in the order the toolbar lists them. */
-const STATUS_ORDER = [
-  'queued',
-  'processing',
-  'processed',
-  'excluded',
-  'withdrawn',
-  'dead_letter',
-] as const
-
-/** Colour hints the builtin dictionary seeds carry for each status. */
 const STATUS_COLOR_FALLBACK: Record<string, string> = {
   queued: 'blue',
   processing: 'amber',
@@ -51,7 +42,6 @@ const STATUS_COLOR_FALLBACK: Record<string, string> = {
   dead_letter: 'red',
 }
 
-/** Dictionary colour name -> the design system's badge classes. */
 const STATUS_TONE: Record<string, string> = {
   blue: 'border-accent/35 bg-accent-soft text-accent-ink',
   amber: 'border-amber/40 bg-amber-soft text-amber-ink',
@@ -62,16 +52,14 @@ const STATUS_TONE: Record<string, string> = {
 
 const NEUTRAL_BADGE = 'border-line bg-bg-sunk text-ink-3'
 
-/** The Chinese verb shown in the confirmation line after an intervention. */
 const ACTION_LABELS: Record<QueueAction, string> = {
-  requeue: '捞回入队',
-  exclude: '排除',
+  requeue: '重新加入',
+  exclude: '移出队列',
   withdraw: '撤回',
-  opt_out: '标为不沉淀',
-  clear_opt_out: '解除不沉淀',
+  opt_out: '不再整理',
+  clear_opt_out: '恢复整理',
 }
 
-/** A small fixed-height badge; the tone classes override the neutral default. */
 const Badge: React.FC<{
   children: React.ReactNode
   className?: string
@@ -80,7 +68,7 @@ const Badge: React.FC<{
 }> = ({ children, className = '', mono = false, title }) => (
   <span
     title={title}
-    className={`inline-flex h-[19px] max-w-[280px] items-center truncate rounded-[var(--radius-mark)] border px-1.5 text-[11px] font-medium ${
+    className={`inline-flex h-[19px] max-w-[260px] items-center truncate rounded-[var(--radius-mark)] border px-1.5 text-[11px] font-medium ${
       mono ? 'mono' : ''
     } ${className || NEUTRAL_BADGE}`}
   >
@@ -94,7 +82,7 @@ function priorityTone(priority: string): string {
   return NEUTRAL_BADGE
 }
 
-/** One compact, scannable queue row with its contextual interventions. */
+/** One compact, scannable queue row with contextual actions and smooth collapsible trail. */
 const QueueRow: React.FC<{
   item: DistillQueueItem
   statusLabel: string
@@ -139,6 +127,9 @@ const QueueRow: React.FC<{
   onJumpToRun,
 }) => {
   const isOptOut = item.exclude_reason_code === 'USER_OPT_OUT'
+  const isProcessed = item.status === 'processed'
+  const isProcessing = item.status === 'processing'
+  const canSelect = !isProcessed && !isProcessing
   const canTrigger = item.status === 'queued'
   const canRequeue =
     item.status === 'excluded' ||
@@ -147,77 +138,78 @@ const QueueRow: React.FC<{
   const title = item.title || item.session_key
 
   const quickBtn =
-    'inline-flex items-center gap-1 h-6 px-1.5 rounded-[var(--radius-mark)] text-[11.5px] text-ink-3 hover:text-ink hover:bg-bg-sunk disabled:opacity-40'
+    'pressable inline-flex items-center gap-1 h-7 px-2 rounded-[var(--radius-mark)] text-[11.5px] text-ink-3 hover:text-ink hover:bg-bg-sunk disabled:opacity-40'
 
   let reasonLine = ''
   if (item.status === 'excluded') {
-    reasonLine = `排除原因：${excludeReasonLabel}${
+    reasonLine = `移出原因：${excludeReasonLabel}${
       item.exclude_reason_detail ? ` · ${item.exclude_reason_detail}` : ''
     }`
   } else if (item.status === 'dead_letter') {
-    reasonLine = `死信原因：${item.last_error || '重试耗尽，等待人工排查'}`
+    reasonLine = `失败原因：${item.last_error || '重试已达上限，可重新加入再次尝试'}`
   }
 
   return (
     <div
-      className={`px-4 py-3 transition-colors ${
+      className={`group px-4 py-3 transition-colors duration-[150ms] ${
         checked ? 'bg-accent-softer' : 'hover:bg-bg-sunk/40'
       }`}
     >
       <div className="flex flex-wrap items-start gap-3">
-        <input
-          type="checkbox"
-          aria-label={`选择 ${title}`}
-          checked={checked}
-          onChange={onToggleChecked}
-          className="mt-1 size-3.5 shrink-0 accent-accent"
-        />
+        {canSelect ? (
+          <input
+            type="checkbox"
+            aria-label={`选择 ${title}`}
+            checked={checked}
+            onChange={onToggleChecked}
+            className="mt-1 size-3.5 shrink-0 accent-accent cursor-pointer"
+          />
+        ) : (
+          <span aria-hidden="true" className="mt-1 size-3.5 shrink-0" />
+        )}
 
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span
-              className={`inline-flex h-[20px] items-center rounded-full border px-2 text-[11px] font-semibold ${statusTone}`}
+              className={`inline-flex h-[20px] items-center gap-1 rounded-full border px-2 text-[11px] font-semibold ${statusTone}`}
             >
+              {isProcessing && <span className="status-dot-live bg-amber" />}
               {statusLabel}
             </span>
             <span
               className="min-w-0 truncate text-[13px] font-medium text-ink"
-              title={title}
+              title={`${title} (${item.session_key})`}
             >
               {title}
             </span>
-            <span
-              className="mono max-w-[240px] truncate text-[11px] text-ink-4"
-              title={item.session_key}
-            >
-              {item.session_key}
-            </span>
           </div>
 
-          <div className="mt-1 flex flex-wrap items-center gap-1.5">
-            <Badge title="接入工具">{clientLabel}</Badge>
-            <Badge title="入队通道">{channelLabel}</Badge>
-            <Badge className={priorityTone(item.priority)} title="优先级">
-              {priorityLabel}
-            </Badge>
-            {item.revision > 1 && <Badge mono>rev {item.revision}</Badge>}
+          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+            <Badge title="来源工具">{clientLabel}</Badge>
+            <Badge title="入队方式">{channelLabel}</Badge>
+            {priorityLabel && (
+              <Badge className={priorityTone(item.priority)} title="优先级">
+                {priorityLabel}
+              </Badge>
+            )}
+            {item.revision > 1 && <Badge mono>更新 v{item.revision}</Badge>}
             {item.chunk_total > 1 && (
               <Badge mono>
                 分片 {item.chunk_index}/{item.chunk_total}
               </Badge>
             )}
-            {item.is_oversized && item.chunk_total <= 1 && <Badge>超大瘦身</Badge>}
+            {item.is_oversized && item.chunk_total <= 1 && <Badge>长对话已精简</Badge>}
             {item.retry_count > 0 && (
               <Badge className="border-hot/35 bg-hot-soft text-hot" mono>
                 重试 {item.retry_count}/{item.max_retries}
               </Badge>
             )}
-            {item.run_id && (item.status === 'processed' || item.status === 'processing') && (
+            {item.run_id && (isProcessed || isProcessing) && (
               <button
                 type="button"
                 onClick={() => onJumpToRun(item.run_id as string)}
-                title={`跳转到批次 ${item.run_id}`}
-                className="mono inline-flex h-[19px] items-center rounded-[var(--radius-mark)] border border-accent/35 bg-accent-soft px-1.5 text-[11px] font-medium text-accent-ink hover:border-accent"
+                title={`定位到批次 ${item.run_id}`}
+                className="pressable mono inline-flex h-[19px] items-center rounded-[var(--radius-mark)] border border-accent/35 bg-accent-soft px-1.5 text-[11px] font-medium text-accent-ink hover:border-accent"
               >
                 批次 {item.run_id.slice(-8)}
               </button>
@@ -235,17 +227,17 @@ const QueueRow: React.FC<{
           )}
         </div>
 
-        <div className="ml-auto flex max-w-full shrink-0 flex-wrap items-center justify-end gap-1 sm:max-w-[380px]">
+        <div className="ml-auto flex max-w-full shrink-0 flex-wrap items-center justify-end gap-1">
           {canTrigger && (
             <button
               type="button"
               onClick={onTrigger}
               disabled={triggerBusy}
-              className={quickBtn}
-              title="把这一条插队交给下一轮流水线立即沉淀"
+              className="pressable inline-flex items-center gap-1 h-7 px-2.5 rounded-[var(--radius-mark)] bg-accent-soft text-accent-ink text-[11.5px] font-medium hover:bg-accent/18 disabled:opacity-40"
+              title="将这段对话立即插队送入下一轮整理"
             >
               <Zap className="w-3.5 h-3.5" />
-              插队沉淀
+              插队整理
             </button>
           )}
           {canTrigger && (
@@ -253,21 +245,11 @@ const QueueRow: React.FC<{
               type="button"
               onClick={() => onAction('exclude')}
               disabled={acting}
+              title="本次不整理这段对话（5秒内可撤销，也可随时重新加入）"
               className={quickBtn}
             >
               <Ban className="w-3.5 h-3.5" />
-              排除
-            </button>
-          )}
-          {canTrigger && (
-            <button
-              type="button"
-              onClick={() => onAction('withdraw')}
-              disabled={acting}
-              className={quickBtn}
-            >
-              <Undo2 className="w-3.5 h-3.5" />
-              撤回
+              移出队列
             </button>
           )}
           {canRequeue &&
@@ -276,31 +258,32 @@ const QueueRow: React.FC<{
                 type="button"
                 onClick={() => onAction('clear_opt_out')}
                 disabled={acting}
-                className={quickBtn}
+                className="pressable inline-flex items-center gap-1 h-7 px-2.5 rounded-[var(--radius-mark)] bg-accent-soft text-accent-ink text-[11.5px] font-medium hover:bg-accent/18 disabled:opacity-40"
               >
                 <UserCheck className="w-3.5 h-3.5" />
-                解除不沉淀并入队
+                恢复整理
               </button>
             ) : (
               <button
                 type="button"
                 onClick={() => onAction('requeue')}
                 disabled={acting}
-                className={quickBtn}
+                className="pressable inline-flex items-center gap-1 h-7 px-2.5 rounded-[var(--radius-mark)] bg-accent-soft text-accent-ink text-[11.5px] font-medium hover:bg-accent/18 disabled:opacity-40"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
-                捞回入队
+                重新加入
               </button>
             ))}
-          {!isOptOut && (
+          {canSelect && !isOptOut && (
             <button
               type="button"
               onClick={() => onAction('opt_out')}
               disabled={acting}
-              className={quickBtn}
+              title="标记后，后续同步归档也会永久跳过此会话"
+              className={`${quickBtn} lg:opacity-70 lg:group-hover:opacity-100 focus-visible:opacity-100`}
             >
               <UserX className="w-3.5 h-3.5" />
-              标为不沉淀
+              不再整理
             </button>
           )}
           <button
@@ -309,22 +292,26 @@ const QueueRow: React.FC<{
             aria-expanded={expanded}
             className={`${quickBtn} border border-line bg-surface`}
           >
-            {expanded ? (
-              <ChevronUp className="w-3.5 h-3.5" />
-            ) : (
-              <ChevronDown className="w-3.5 h-3.5" />
-            )}
+            <ChevronDown
+              className={`w-3.5 h-3.5 transition-transform duration-200 ease-[var(--ease-out-quint)] ${
+                expanded ? 'rotate-180 text-accent' : ''
+              }`}
+            />
             轨迹
           </button>
         </div>
       </div>
 
-      {expanded && (
-        <div className="ml-6 mt-2.5 border-l-2 border-line pl-3">
+      {/* Smooth interruptible trail disclosure */}
+      <Collapse open={expanded} lazy>
+        <div className="ml-6 mt-2.5 border-l-2 border-line pl-3 pt-0.5">
           {trailLoading ? (
-            <div className="text-[11.5px] text-ink-4">正在读取状态轨迹…</div>
+            <div className="space-y-1.5 py-1" aria-busy="true">
+              <div className="skeleton-block h-3.5 w-64" />
+              <div className="skeleton-block h-3.5 w-48" />
+            </div>
           ) : events.length === 0 ? (
-            <div className="text-[11.5px] text-ink-4">暂无状态轨迹记录。</div>
+            <div className="text-[11.5px] text-ink-4 py-1">暂无状态变化记录。</div>
           ) : (
             <ol className="space-y-1">
               {[...events].reverse().map((event) => (
@@ -353,26 +340,17 @@ const QueueRow: React.FC<{
                       {labelOf(excludeReasonLabels, event.reason_code, event.reason_code)}
                     </span>
                   )}
-                  <span className="text-ink-4">· {event.actor}</span>
                   {event.summary && <span>· {event.summary}</span>}
                 </li>
               ))}
             </ol>
           )}
         </div>
-      )}
+      </Collapse>
     </div>
   )
 }
 
-/**
- * The distill-queue inventory panel: filters, bulk interventions, rule
- * re-triage preview and the per-row state-transition trail.
- *
- * Every label comes from the unified dictionary (`/api/site/dicts`) with the
- * local `labels.ts` tables as the offline fallback, so a badge never falls
- * back to a raw enum code the user cannot read.
- */
 export const QueueInventoryPanel: React.FC<{
   items: DistillQueueItem[]
   dicts: Record<string, DictItem[]>
@@ -392,6 +370,7 @@ export const QueueInventoryPanel: React.FC<{
   onTriggerQueueIds,
   onJumpToRun,
 }) => {
+  const toast = useToast()
   const [query, setQuery] = useState('')
   const [clientFilter, setClientFilter] = useState('all')
   const [channelFilter, setChannelFilter] = useState('all')
@@ -403,8 +382,6 @@ export const QueueInventoryPanel: React.FC<{
   const [bulkBusy, setBulkBusy] = useState(false)
   const [reTriage, setReTriage] = useState<QueueReTriageResult | null>(null)
   const [reTriageBusy, setReTriageBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [notice, setNotice] = useState<string | null>(null)
 
   const statusLabels = useMemo(
     () => dictLabels(dicts, 'queue_status', QUEUE_STATUS_LABELS),
@@ -467,6 +444,11 @@ export const QueueInventoryPanel: React.FC<{
   )
 
   const pager = usePagination(filtered, 10)
+  const hasFilters =
+    Boolean(query.trim()) ||
+    Boolean(statusFilter) ||
+    clientFilter !== 'all' ||
+    channelFilter !== 'all'
 
   useEffect(() => {
     pager.resetPage()
@@ -476,26 +458,21 @@ export const QueueInventoryPanel: React.FC<{
   useEffect(() => {
     setSelected((prev) => {
       if (prev.size === 0) return prev
-      const alive = new Set(items.map((item) => item.queue_id))
+      const alive = new Set(
+        items
+          .filter((i) => i.status !== 'processed' && i.status !== 'processing')
+          .map((item) => item.queue_id)
+      )
       const next = new Set(Array.from(prev).filter((id) => alive.has(id)))
       return next.size === prev.size ? prev : next
     })
   }, [items])
 
-  useEffect(() => {
-    if (!notice) return
-    const timer = window.setTimeout(() => setNotice(null), 6000)
-    return () => window.clearTimeout(timer)
-  }, [notice])
-
   const toggleChecked = (queueId: string) => {
     setSelected((prev) => {
       const next = new Set(prev)
-      if (next.has(queueId)) {
-        next.delete(queueId)
-      } else {
-        next.add(queueId)
-      }
+      if (next.has(queueId)) next.delete(queueId)
+      else next.add(queueId)
       return next
     })
   }
@@ -512,7 +489,7 @@ export const QueueInventoryPanel: React.FC<{
       const res = await api.getQueueEvents(item.queue_id)
       setEventsByItem((prev) => ({ ...prev, [item.queue_id]: res.events }))
     } catch (e: any) {
-      setError(e.message || '状态轨迹读取失败')
+      toast.push({ tone: 'error', message: e?.message || '读取轨迹失败' })
       setEventsByItem((prev) => ({ ...prev, [item.queue_id]: [] }))
     } finally {
       setLoadingTrailId(null)
@@ -521,20 +498,33 @@ export const QueueInventoryPanel: React.FC<{
 
   const runItemAction = async (item: DistillQueueItem, action: QueueAction) => {
     setActingId(item.queue_id)
-    setError(null)
     try {
       if (action === 'clear_opt_out') {
-        // Clearing the session flag alone leaves the row excluded: the button
-        // promises "解除不沉淀并入队", so the item is requeued right after.
         await api.queueItemAction(item.queue_id, 'clear_opt_out')
         await api.queueItemAction(item.queue_id, 'requeue')
-        setNotice('已解除不沉淀并捞回入队 1 条。')
+        toast.push('已恢复整理并重新加入队列')
       } else {
         await api.queueItemAction(item.queue_id, action)
-        setNotice(`已对 1 条队列项执行「${ACTION_LABELS[action]}」。`)
+        const undoAction =
+          action === 'exclude' || action === 'withdraw'
+            ? async () => {
+                await api.queueItemAction(item.queue_id, 'requeue')
+                await onRefresh()
+                toast.push('已撤销，重新放回待整理队列')
+              }
+            : action === 'opt_out'
+              ? async () => {
+                  await api.queueItemAction(item.queue_id, 'clear_opt_out')
+                  await api.queueItemAction(item.queue_id, 'requeue')
+                  await onRefresh()
+                  toast.push('已撤销「不再整理」')
+                }
+              : undefined
+        toast.push({
+          message: `已${ACTION_LABELS[action]}：「${item.title || item.session_key}」`,
+          onUndo: undoAction,
+        })
       }
-      // The intervention just appended an audit event: drop the cached trail
-      // so reopening it shows the new transition instead of a stale one.
       setEventsByItem((prev) => {
         const next = { ...prev }
         delete next[item.queue_id]
@@ -546,24 +536,34 @@ export const QueueInventoryPanel: React.FC<{
         setEventsByItem((prev) => ({ ...prev, [item.queue_id]: res.events }))
       }
     } catch (e: any) {
-      setError(e.message || '队列操作失败')
+      toast.push({ tone: 'error', message: e?.message || '操作失败' })
     } finally {
       setActingId(null)
     }
   }
 
-  const runBulkAction = async (action: QueueAction) => {
-    const ids = Array.from(selected)
+  const runBulkAction = async (action: QueueAction, targetIds?: string[]) => {
+    const ids = targetIds ?? Array.from(selected)
     if (ids.length === 0) return
     setBulkBusy(true)
-    setError(null)
     try {
       const res = await api.queueBulkAction(ids, action)
       setSelected(new Set())
-      setNotice(`批量「${ACTION_LABELS[action]}」已完成，更新 ${res.updated} 条。`)
+      const undo =
+        action === 'exclude'
+          ? async () => {
+              await api.queueBulkAction(ids, 'requeue')
+              await onRefresh()
+              toast.push(`已撤销，重新加入 ${ids.length} 段对话`)
+            }
+          : undefined
+      toast.push({
+        message: `已批量${ACTION_LABELS[action]} ${res.updated} 段对话`,
+        onUndo: undo,
+      })
       await onRefresh()
     } catch (e: any) {
-      setError(e.message || '批量操作失败')
+      toast.push({ tone: 'error', message: e?.message || '批量操作失败' })
     } finally {
       setBulkBusy(false)
     }
@@ -571,12 +571,19 @@ export const QueueInventoryPanel: React.FC<{
 
   const previewReTriage = async () => {
     setReTriageBusy(true)
-    setError(null)
     try {
       const res = await api.reTriageQueue(true)
-      setReTriage(res)
+      if (res.changed_count === 0) {
+        setReTriage(null)
+        toast.push({
+          tone: 'info',
+          message: `已评估 ${res.checked} 段对话，全部符合最新筛选规则，无需调整`,
+        })
+      } else {
+        setReTriage(res)
+      }
     } catch (e: any) {
-      setError(e.message || '规则重筛预览失败')
+      toast.push({ tone: 'error', message: e?.message || '规则重筛失败' })
     } finally {
       setReTriageBusy(false)
     }
@@ -584,14 +591,13 @@ export const QueueInventoryPanel: React.FC<{
 
   const applyReTriage = async () => {
     setReTriageBusy(true)
-    setError(null)
     try {
       const res = await api.reTriageQueue(false)
       setReTriage(null)
-      setNotice(`规则重筛已应用：更新 ${res.changed_count} 条队列项。`)
+      toast.push(`已按最新规则更新 ${res.changed_count} 段对话`)
       await onRefresh()
     } catch (e: any) {
-      setError(e.message || '规则重筛应用失败')
+      toast.push({ tone: 'error', message: e?.message || '应用规则重筛失败' })
     } finally {
       setReTriageBusy(false)
     }
@@ -604,192 +610,188 @@ export const QueueInventoryPanel: React.FC<{
     setSelected(new Set())
   }
 
+  const resetAllFilters = () => {
+    setQuery('')
+    onStatusFilterChange('')
+    setClientFilter('all')
+    setChannelFilter('all')
+  }
+
   const changeTitle = (change: QueueReTriageChange) =>
     itemById.get(change.queue_id)?.title || change.session_key || change.queue_id
 
+  const selectedItems = Array.from(selected)
+    .map((id) => itemById.get(id))
+    .filter((x): x is DistillQueueItem => Boolean(x))
+  const queuedSelectedIds = selectedItems
+    .filter((i) => i.status === 'queued')
+    .map((i) => i.queue_id)
+  const requeueableSelectedIds = selectedItems
+    .filter(
+      (i) =>
+        (i.status === 'excluded' || i.status === 'withdrawn' || i.status === 'dead_letter') &&
+        i.exclude_reason_code !== 'USER_OPT_OUT'
+    )
+    .map((i) => i.queue_id)
+  const optOutSelectedIds = selectedItems
+    .filter((i) => i.exclude_reason_code === 'USER_OPT_OUT')
+    .map((i) => i.queue_id)
+
+  const runBulkRestoreOptOut = async (ids: string[]) => {
+    if (ids.length === 0) return
+    setBulkBusy(true)
+    try {
+      await api.queueBulkAction(ids, 'clear_opt_out')
+      const res = await api.queueBulkAction(ids, 'requeue')
+      setSelected(new Set())
+      toast.push(`已恢复整理并重新加入 ${res.updated} 段对话`)
+      await onRefresh()
+    } catch (e: any) {
+      toast.push({ tone: 'error', message: e?.message || '恢复整理失败' })
+    } finally {
+      setBulkBusy(false)
+    }
+  }
+
   return (
     <div className="space-y-3">
-      <ListToolbar
-        query={query}
-        onQueryChange={setQuery}
-        placeholder="按标题、会话 key、项目或批次 ID 搜索…"
-        sortHint="按入队时间倒序"
-        actions={
-          <button
-            type="button"
-            onClick={previewReTriage}
-            disabled={reTriageBusy || busy}
-            className="inline-flex h-8 items-center gap-1.5 rounded-[var(--radius-control)] border border-line bg-surface px-3 text-[12px] font-medium text-ink-2 hover:border-line-strong hover:text-ink disabled:opacity-50"
-          >
-            <Wand2 className="w-3.5 h-3.5" />
-            {reTriageBusy ? '重筛中…' : '预览规则重筛'}
-          </button>
-        }
-      >
-        <select
-          aria-label="库存状态筛选"
-          value={statusFilter}
-          onChange={(e) => onStatusFilterChange(e.target.value)}
-          className="h-8 rounded-[var(--radius-control)] border border-line bg-surface px-2.5 text-[12px] text-ink"
+      {items.length > 0 && (
+        <ListToolbar
+          query={query}
+          onQueryChange={setQuery}
+          placeholder="搜索对话标题、项目或批次号…"
+          enableSlashShortcut
+          hasActiveFilters={hasFilters}
+          onResetFilters={resetAllFilters}
+          actions={
+            <button
+              type="button"
+              onClick={previewReTriage}
+              disabled={reTriageBusy || busy}
+              className="pressable inline-flex h-8 items-center gap-1.5 rounded-[var(--radius-control)] border border-line bg-surface px-3 text-[12px] font-medium text-ink-2 hover:border-line-strong hover:text-ink disabled:opacity-50"
+            >
+              {reTriageBusy ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Wand2 className="w-3.5 h-3.5" />
+              )}
+              <span>{reTriageBusy ? '评估中…' : '按最新规则重筛'}</span>
+            </button>
+          }
         >
-          <option value="">全部状态</option>
-          {STATUS_ORDER.map((status) => (
-            <option key={status} value={status}>
-              {labelOf(statusLabels, status, status)}
-            </option>
-          ))}
-        </select>
-        <select
-          aria-label="接入工具筛选"
-          value={clientFilter}
-          onChange={(e) => setClientFilter(e.target.value)}
-          className="h-8 rounded-[var(--radius-control)] border border-line bg-surface px-2.5 text-[12px] text-ink"
-        >
-          <option value="all">全部接入工具</option>
-          {clientOptions.map((client) => (
-            <option key={client} value={client}>
-              {labelOf(clientLabels, client, client)}
-            </option>
-          ))}
-        </select>
-        <select
-          aria-label="入队通道筛选"
-          value={channelFilter}
-          onChange={(e) => setChannelFilter(e.target.value)}
-          className="h-8 rounded-[var(--radius-control)] border border-line bg-surface px-2.5 text-[12px] text-ink"
-        >
-          <option value="all">全部通道</option>
-          {channelOptions.map((channel) => (
-            <option key={channel} value={channel}>
-              {labelOf(channelLabels, channel, channel)}
-            </option>
-          ))}
-        </select>
-      </ListToolbar>
-
-      {error && (
-        <div className="rounded-[var(--radius-card)] border border-hot/30 bg-hot-soft px-3.5 py-2.5 text-[12.5px] text-hot">
-          {error}
-        </div>
-      )}
-      {notice && (
-        <div className="rounded-[var(--radius-card)] border border-ok/30 bg-ok-soft px-3.5 py-2.5 text-[12.5px] text-ok-ink">
-          {notice}
-        </div>
+          {clientOptions.length > 1 && (
+            <select
+              aria-label="来源工具筛选"
+              value={clientFilter}
+              onChange={(e) => setClientFilter(e.target.value)}
+              className="field-input h-8 px-2.5 text-[12px]"
+            >
+              <option value="all">全部工具</option>
+              {clientOptions.map((client) => (
+                <option key={client} value={client}>
+                  {labelOf(clientLabels, client, client)}
+                </option>
+              ))}
+            </select>
+          )}
+          {channelOptions.length > 1 && (
+            <select
+              aria-label="入队方式筛选"
+              value={channelFilter}
+              onChange={(e) => setChannelFilter(e.target.value)}
+              className="field-input h-8 px-2.5 text-[12px]"
+            >
+              <option value="all">全部方式</option>
+              {channelOptions.map((channel) => (
+                <option key={channel} value={channel}>
+                  {labelOf(channelLabels, channel, channel)}
+                </option>
+              ))}
+            </select>
+          )}
+        </ListToolbar>
       )}
 
-      {reTriage && (
-        <div className="space-y-2 rounded-[var(--radius-card)] border border-amber/35 bg-amber-soft px-3.5 py-3 text-[12.5px] text-ink-2">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <span className="font-medium text-ink">
-              规则重筛预览：评估 <span className="num">{reTriage.checked}</span> 条，预计变化{' '}
-              <span className="num">{reTriage.changed_count}</span> 条
-              <span className="ml-2 font-normal text-ink-3">
-                （将排除 <span className="num">{reTriage.would_exclude.length}</span> 条 /
-                将捞回 <span className="num">{reTriage.would_admit.length}</span> 条）
+      {/* Smooth collapsible re-triage diff confirmation */}
+      <Collapse open={Boolean(reTriage)}>
+        {reTriage && (
+          <div className="space-y-2 rounded-[var(--radius-card)] border border-amber/35 bg-amber-soft px-3.5 py-3 text-[12.5px] text-ink-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="font-medium text-ink">
+                重筛预览：评估 <span className="num">{reTriage.checked}</span> 段，预计调整{' '}
+                <span className="num">{reTriage.changed_count}</span> 段
+                <span className="ml-2 font-normal text-ink-3">
+                  （移出 <span className="num">{reTriage.would_exclude.length}</span> / 重新加入{' '}
+                  <span className="num">{reTriage.would_admit.length}</span>）
+                </span>
               </span>
-            </span>
-            <div className="flex items-center gap-1.5">
-              <button
-                type="button"
-                onClick={applyReTriage}
-                disabled={reTriageBusy || reTriage.changed_count === 0}
-                className="inline-flex h-7 items-center gap-1 rounded-[var(--radius-mark)] bg-accent px-2.5 text-[12px] font-medium text-accent-contrast hover:bg-accent-ink disabled:opacity-50"
-              >
-                <Check className="w-3.5 h-3.5" />
-                应用重筛
-              </button>
-              <button
-                type="button"
-                onClick={() => setReTriage(null)}
-                className="inline-flex h-7 items-center gap-1 rounded-[var(--radius-mark)] border border-line bg-surface px-2.5 text-[12px] text-ink-2 hover:border-line-strong"
-              >
-                <X className="w-3.5 h-3.5" />
-                关闭
-              </button>
-            </div>
-          </div>
-          {[
-            { key: 'exclude', label: '将排除', rows: reTriage.would_exclude },
-            { key: 'admit', label: '将捞回', rows: reTriage.would_admit },
-          ]
-            .filter((group) => group.rows.length > 0)
-            .map((group) => (
-              <div key={group.key} className="flex flex-wrap items-center gap-1.5">
-                <span className="text-[11.5px] text-ink-4">{group.label}：</span>
-                {group.rows.slice(0, 6).map((change) => (
-                  <span
-                    key={change.queue_id}
-                    className="chip max-w-[280px]"
-                    title={change.session_key}
-                  >
-                    <span className="truncate">{changeTitle(change)}</span>
-                    {change.reason_code && (
-                      <span className="text-ink-4">
-                        ·{' '}
-                        {labelOf(excludeReasonLabels, change.reason_code, change.reason_code)}
-                      </span>
-                    )}
-                  </span>
-                ))}
-                {group.rows.length > 6 && (
-                  <span className="text-[11.5px] text-ink-4">等 {group.rows.length} 条</span>
-                )}
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={applyReTriage}
+                  disabled={reTriageBusy || reTriage.changed_count === 0}
+                  className="pressable inline-flex h-7 items-center gap-1 rounded-[var(--radius-mark)] bg-accent px-2.5 text-[12px] font-medium text-accent-contrast hover:bg-accent-ink disabled:opacity-50"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  确认应用
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setReTriage(null)}
+                  className="pressable inline-flex h-7 items-center gap-1 rounded-[var(--radius-mark)] border border-line bg-surface px-2.5 text-[12px] text-ink-2 hover:border-line-strong"
+                >
+                  <X className="w-3.5 h-3.5" />
+                  关闭
+                </button>
               </div>
-            ))}
-        </div>
-      )}
-
-      {selected.size > 0 && (
-        <div className="flex flex-wrap items-center justify-between gap-2 rounded-[var(--radius-card)] border border-accent/30 bg-accent-soft px-3.5 py-2.5">
-          <span className="text-[12.5px] text-accent-ink">
-            已选 <span className="num font-semibold">{selected.size}</span> 条队列项
-          </span>
-          <div className="flex flex-wrap items-center gap-1.5">
-            <button
-              type="button"
-              onClick={triggerSelected}
-              disabled={busy || bulkBusy}
-              className="inline-flex h-7 items-center gap-1 rounded-[var(--radius-mark)] bg-accent px-2.5 text-[12px] font-medium text-accent-contrast hover:bg-accent-ink disabled:opacity-50"
-            >
-              <Zap className="w-3.5 h-3.5" />
-              插队立即沉淀 ({selected.size})
-            </button>
-            <button
-              type="button"
-              onClick={() => runBulkAction('requeue')}
-              disabled={bulkBusy}
-              className="inline-flex h-7 items-center gap-1 rounded-[var(--radius-mark)] border border-line bg-surface px-2.5 text-[12px] text-ink-2 hover:border-line-strong disabled:opacity-50"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              批量捞回入队
-            </button>
-            <button
-              type="button"
-              onClick={() => runBulkAction('exclude')}
-              disabled={bulkBusy}
-              className="inline-flex h-7 items-center gap-1 rounded-[var(--radius-mark)] border border-line bg-surface px-2.5 text-[12px] text-ink-2 hover:border-line-strong disabled:opacity-50"
-            >
-              <Ban className="w-3.5 h-3.5" />
-              批量排除
-            </button>
-            <button
-              type="button"
-              onClick={() => setSelected(new Set())}
-              className="inline-flex h-7 items-center gap-1 rounded-[var(--radius-mark)] border border-transparent px-2 text-[12px] text-ink-3 hover:text-ink"
-            >
-              <X className="w-3.5 h-3.5" />
-              清空选择
-            </button>
+            </div>
+            {[
+              { key: 'exclude', label: '将移出', rows: reTriage.would_exclude },
+              { key: 'admit', label: '将重新加入', rows: reTriage.would_admit },
+            ]
+              .filter((group) => group.rows.length > 0)
+              .map((group) => (
+                <div key={group.key} className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[11.5px] text-ink-4">{group.label}：</span>
+                  {group.rows.slice(0, 6).map((change) => (
+                    <span
+                      key={change.queue_id}
+                      className="chip max-w-[260px]"
+                      title={change.session_key}
+                    >
+                      <span className="truncate">{changeTitle(change)}</span>
+                      {change.reason_code && (
+                        <span className="text-ink-4">
+                          · {labelOf(excludeReasonLabels, change.reason_code, change.reason_code)}
+                        </span>
+                      )}
+                    </span>
+                  ))}
+                  {group.rows.length > 6 && (
+                    <span className="text-[11.5px] text-ink-4">等 {group.rows.length} 段</span>
+                  )}
+                </div>
+              ))}
           </div>
-        </div>
-      )}
+        )}
+      </Collapse>
 
       {filtered.length === 0 ? (
-        <div className="card p-10 text-center text-[13px] text-ink-4">
-          {items.length === 0
-            ? '库存为空：归档同步或手工补录后，对话会先进入沉淀队列。'
-            : '没有符合当前筛选条件的队列项。'}
+        <div className="card p-10 text-center space-y-3">
+          <p className="text-[13px] text-ink-4">
+            {items.length === 0
+              ? '目前还没有待整理对话，归档同步或手工补录后会出现在这里。'
+              : '没有符合当前筛选条件的对话记录。'}
+          </p>
+          {hasFilters && (
+            <button
+              type="button"
+              onClick={resetAllFilters}
+              className="pressable inline-flex items-center h-8 px-3 rounded-[var(--radius-control)] border border-line bg-surface text-[12.5px] text-ink-2 hover:border-line-strong hover:text-ink"
+            >
+              清空筛选条件
+            </button>
+          )}
         </div>
       ) : (
         <div className="card overflow-hidden">
@@ -802,11 +804,11 @@ export const QueueInventoryPanel: React.FC<{
                 statusTone={statusToneClass(item.status)}
                 clientLabel={labelOf(clientLabels, item.client, item.client)}
                 channelLabel={labelOf(channelLabels, item.ingress_channel, item.ingress_channel)}
-                priorityLabel={labelOf(priorityLabels, item.priority, item.priority)}
+                priorityLabel={labelOf(priorityLabels, item.priority, '')}
                 excludeReasonLabel={labelOf(
                   excludeReasonLabels,
                   item.exclude_reason_code,
-                  item.exclude_reason_code || '未标注'
+                  item.exclude_reason_code || '规则筛选'
                 )}
                 statusLabels={statusLabels}
                 excludeReasonLabels={excludeReasonLabels}
@@ -836,6 +838,79 @@ export const QueueInventoryPanel: React.FC<{
           </div>
         </div>
       )}
+
+      {/* Apple-style Floating Bulk Action Island (portaled to body, zero table layout shift!) */}
+      {typeof document !== 'undefined' &&
+        createPortal(
+          <div
+            aria-live="polite"
+            className={`fixed left-1/2 bottom-[72px] lg:bottom-6 z-40 -translate-x-1/2 transition-[opacity,transform] duration-[220ms] ease-[var(--ease-out-quint)] ${
+              selected.size > 0
+                ? 'opacity-100 translate-y-0 pointer-events-auto'
+                : 'opacity-0 translate-y-4 pointer-events-none'
+            }`}
+          >
+            <div className="flex flex-wrap items-center gap-2 rounded-full border border-line-strong bg-surface/95 backdrop-blur-md px-3.5 py-2 shadow-[var(--shadow-sheet)]">
+              <span className="text-[12.5px] font-medium text-ink px-1">
+                已选 <span className="num font-semibold text-accent">{selected.size}</span> 段
+              </span>
+              <span className="h-4 w-px bg-line" />
+              {queuedSelectedIds.length > 0 && (
+                <button
+                  type="button"
+                  onClick={triggerSelected}
+                  disabled={busy || bulkBusy}
+                  className="pressable inline-flex h-7 items-center gap-1 rounded-full bg-accent px-3 text-[12px] font-medium text-accent-contrast hover:bg-accent-ink disabled:opacity-50"
+                >
+                  <Zap className="w-3.5 h-3.5" />
+                  插队整理
+                </button>
+              )}
+              {requeueableSelectedIds.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => runBulkAction('requeue', requeueableSelectedIds)}
+                  disabled={bulkBusy}
+                  className="pressable inline-flex h-7 items-center gap-1 rounded-full border border-line bg-bg-sunk px-2.5 text-[12px] text-ink-2 hover:border-line-strong hover:text-ink disabled:opacity-50"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  重新加入
+                </button>
+              )}
+              {optOutSelectedIds.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => runBulkRestoreOptOut(optOutSelectedIds)}
+                  disabled={bulkBusy}
+                  className="pressable inline-flex h-7 items-center gap-1 rounded-full border border-line bg-bg-sunk px-2.5 text-[12px] text-ink-2 hover:border-line-strong hover:text-ink disabled:opacity-50"
+                >
+                  <UserCheck className="w-3.5 h-3.5" />
+                  恢复整理
+                </button>
+              )}
+              {queuedSelectedIds.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => runBulkAction('exclude', queuedSelectedIds)}
+                  disabled={bulkBusy}
+                  className="pressable inline-flex h-7 items-center gap-1 rounded-full border border-line bg-bg-sunk px-2.5 text-[12px] text-ink-2 hover:border-line-strong hover:text-ink disabled:opacity-50"
+                >
+                  <Ban className="w-3.5 h-3.5" />
+                  移出队列
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setSelected(new Set())}
+                aria-label="取消选择"
+                className="pressable-sm inline-flex size-7 items-center justify-center rounded-full text-ink-4 hover:bg-bg-sunk hover:text-ink"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>,
+          document.body
+        )}
     </div>
   )
 }

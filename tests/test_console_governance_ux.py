@@ -154,6 +154,30 @@ def test_dissents_enriched_and_bulk_governance_endpoints(tmp_path: Path) -> None
     assert res.json()["updated"] == 2
     assert len(client.get("/api/site/observations?status=observing").json()["observations"]) == 0
 
+    # Bulk restore observations (Undo flow)
+    res = client.post(
+        "/api/site/observations/bulk-restore",
+        json={"obs_ids": [obs1["obs_id"], obs2["obs_id"]]},
+    )
+    assert res.status_code == 200
+    assert res.json()["updated"] == 2
+    assert len(client.get("/api/site/observations?status=observing").json()["observations"]) == 2
+
+    # Single archive then restore observation
+    res = client.post(f"/api/site/observations/{obs1['obs_id']}/archive")
+    assert res.status_code == 200
+    assert res.json()["observation"]["status"] == "archived"
+    # Archiving an already-archived observation returns 409
+    assert client.post(f"/api/site/observations/{obs1['obs_id']}/archive").status_code == 409
+    res = client.post(f"/api/site/observations/{obs1['obs_id']}/restore")
+    assert res.status_code == 200
+    assert res.json()["observation"]["status"] == "observing"
+    # Restoring a non-archived (observing or promoted) observation returns 409
+    assert client.post(f"/api/site/observations/{obs1['obs_id']}/restore").status_code == 409
+    assert client.post(f"/api/site/observations/{obs1['obs_id']}/promote").status_code == 200
+    assert client.post(f"/api/site/observations/{obs1['obs_id']}/restore").status_code == 409
+    assert client.post("/api/site/observations/missing-obs-id/restore").status_code == 404
+
     # Bulk update retro items
     res = client.post(
         "/api/site/retro/bulk-status",

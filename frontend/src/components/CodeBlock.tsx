@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { Check, Copy } from 'lucide-react'
 
 export const CopyButton: React.FC<{ text: string; label?: string; className?: string }> = ({
@@ -7,6 +7,14 @@ export const CopyButton: React.FC<{ text: string; label?: string; className?: st
   className = '',
 }) => {
   const [copied, setCopied] = useState(false)
+  const timerRef = useRef<number | null>(null)
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) window.clearTimeout(timerRef.current)
+    }
+  }, [])
+
   return (
     <button
       type="button"
@@ -22,14 +30,23 @@ export const CopyButton: React.FC<{ text: string; label?: string; className?: st
           ta.remove()
         }
         setCopied(true)
-        setTimeout(() => setCopied(false), 1500)
+        if (timerRef.current) window.clearTimeout(timerRef.current)
+        timerRef.current = window.setTimeout(() => setCopied(false), 1600)
       }}
-      className={`inline-flex h-7 items-center gap-1 rounded-[var(--radius-mark)] border border-line bg-surface px-2 text-[12px] transition-colors ${
-        copied ? 'text-ok' : 'text-ink-3 hover:border-line-strong hover:text-ink'
+      className={`pressable inline-flex h-7 items-center gap-1 rounded-[var(--radius-mark)] border px-2 text-[12px] ${
+        copied
+          ? 'border-ok/35 bg-ok-soft text-ok-ink'
+          : 'border-line bg-surface text-ink-3 hover:border-line-strong hover:text-ink'
       } ${className}`}
     >
-      {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-      {copied ? '已复制' : label}
+      <span className="relative flex size-3.5 items-center justify-center">
+        {copied ? (
+          <Check key="check" className="w-3.5 h-3.5 animate-check-pop" />
+        ) : (
+          <Copy key="copy" className="w-3.5 h-3.5" />
+        )}
+      </span>
+      <span>{copied ? '已复制' : label}</span>
     </button>
   )
 }

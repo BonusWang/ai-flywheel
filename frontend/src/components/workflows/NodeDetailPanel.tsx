@@ -3,18 +3,13 @@ import { StatusBadge } from '../StatusBadge'
 import { STAGE_PLAIN_NAMES } from '../../lib/labels'
 import type { NodeExecution } from '../../types'
 
-/**
- * The "各环节进度" tab: a compact 8-node picker on the left and the selected
- * node's summary, error, artifacts, internal checks, model call telemetry and —
- * on P05 — the weekly distillation summary on the right.
- */
 export const NodeDetailPanel: React.FC<{
   nodes: NodeExecution[]
   activeNode: NodeExecution | null
   onSelectNode: (nodeId: string) => void
 }> = ({ nodes, activeNode, onSelectNode }) => (
   <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-    {/* Compact stage list */}
+    {/* Compact 8-stage picker */}
     <div className="lg:col-span-5 grid grid-cols-2 gap-2">
       {nodes.map((node) => {
         const isSel = activeNode?.node_id === node.node_id
@@ -24,9 +19,9 @@ export const NodeDetailPanel: React.FC<{
             key={node.node_id}
             type="button"
             onClick={() => onSelectNode(node.node_id)}
-            className={`text-left px-3 py-2 rounded-[var(--radius-control)] border transition-colors ${
+            className={`pressable text-left px-3 py-2 rounded-[var(--radius-control)] border ${
               isSel
-                ? 'bg-surface border-accent ring-1 ring-accent/35'
+                ? 'bg-surface border-accent ring-1 ring-accent/35 shadow-[var(--shadow-card)]'
                 : 'bg-surface/70 border-line-soft hover:border-line-strong'
             }`}
           >
@@ -45,7 +40,7 @@ export const NodeDetailPanel: React.FC<{
     {/* Selected stage detail */}
     <div className="lg:col-span-7 card p-4 space-y-2.5 text-[12.5px]">
       {activeNode ? (
-        <>
+        <div key={activeNode.node_id} className="animate-tab-enter space-y-2.5">
           <div className="flex items-center justify-between gap-2 pb-2 border-b border-line-soft">
             <span className="font-semibold text-ink">
               {activeNode.node_id.split('_')[0]} ·{' '}
@@ -92,7 +87,7 @@ export const NodeDetailPanel: React.FC<{
             typeof activeNode.payload === 'object' &&
             (activeNode.payload as any).call_telemetry && (
               <div className="mt-1 p-2.5 rounded-[var(--radius-control)] bg-bg-sunk/70 border border-line-soft space-y-1">
-                <div className="text-[11.5px] font-semibold text-ink">模型调用遥测</div>
+                <div className="text-[11.5px] font-semibold text-ink">模型耗时与用量</div>
                 {(() => {
                   const t = (activeNode.payload as any).call_telemetry as Record<string, any>
                   return (
@@ -108,8 +103,8 @@ export const NodeDetailPanel: React.FC<{
                       {t.attempts != null && <span>尝试：{t.attempts} 次</span>}
                       {(t.prompt_tokens != null || t.completion_tokens != null) && (
                         <span>
-                          Token：in {t.prompt_tokens ?? 0} / out {t.completion_tokens ?? 0}
-                          {t.reasoning_tokens ? ` (reasoning ${t.reasoning_tokens})` : ''}
+                          Token：输入 {t.prompt_tokens ?? 0} / 输出 {t.completion_tokens ?? 0}
+                          {t.reasoning_tokens ? `（思考 ${t.reasoning_tokens}）` : ''}
                         </span>
                       )}
                       {t.cache_hit === true && (
@@ -126,21 +121,21 @@ export const NodeDetailPanel: React.FC<{
             (activeNode.payload as any).dream && (
               <div className="mt-2 p-3 rounded-[var(--radius-control)] bg-bg-sunk/70 border border-line-soft space-y-1.5">
                 <div className="text-[12px] font-semibold text-ink">
-                  周五蒸馏与减法摘要（{(activeNode.payload as any).dream.period_key}）
+                  周五精简体检摘要（{(activeNode.payload as any).dream.period_key}）
                 </div>
                 <div className="flex flex-wrap gap-2 text-[11.5px] text-ink-3 num">
                   <span>
-                    自动休眠规则：
+                    休眠零命中规则：
                     {((activeNode.payload as any).dream.auto_dormant_rules || []).length} 条
                   </span>
                   <span>·</span>
                   <span>
-                    过期需复核经验卡：
+                    待复核笔记：
                     {((activeNode.payload as any).dream.expired_cards || []).length} 篇
                   </span>
                   <span>·</span>
                   <span>
-                    待收敛分歧：{(activeNode.payload as any).dream.open_dissents_count ?? 0} 条
+                    待处理分歧：{(activeNode.payload as any).dream.open_dissents_count ?? 0} 条
                   </span>
                 </div>
                 {((activeNode.payload as any).dream.proposals || []).length > 0 && (
@@ -154,7 +149,7 @@ export const NodeDetailPanel: React.FC<{
                 )}
               </div>
             )}
-        </>
+        </div>
       ) : null}
     </div>
   </div>

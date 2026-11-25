@@ -2,6 +2,7 @@ import React from 'react'
 import { MarkdownView } from '../MarkdownView'
 import { PillTabs } from '../PageLayout'
 import { StatusBadge } from '../StatusBadge'
+import { Collapse } from '../ui/Collapse'
 import {
   APPROVAL_MODE_LABELS,
   CLIENT_LABELS,
@@ -16,12 +17,9 @@ import { NoiseFunnelStrip } from './NoiseFunnelStrip'
 
 export type WorkflowDetailTab = 'stages' | 'digest' | 'sessions' | 'events'
 
-/**
- * The expanded part of one batch row: the approval drawer (when the batch waits for
- * it), the noise funnel, the four detail tabs and their content.
- */
 export const RunDetailPanel: React.FC<{
   run: WorkflowRunRecord
+  isExpanded?: boolean
   sessions: SessionRecord[]
   events: AuditEventRecord[]
   detailTab: WorkflowDetailTab
@@ -32,10 +30,12 @@ export const RunDetailPanel: React.FC<{
   onTabChange: (tab: WorkflowDetailTab) => void
   onSelectNode: (nodeId: string) => void
   onToggleIndex: (idx: number) => void
+  onSelectAll: (selectAll: boolean) => void
   onApprove: () => void
   onReject: () => void
 }> = ({
   run,
+  isExpanded = true,
   sessions,
   events,
   detailTab,
@@ -46,6 +46,7 @@ export const RunDetailPanel: React.FC<{
   onTabChange,
   onSelectNode,
   onToggleIndex,
+  onSelectAll,
   onApprove,
   onReject,
 }) => {
@@ -56,20 +57,20 @@ export const RunDetailPanel: React.FC<{
 
   return (
     <div className="border-t border-line-soft bg-bg-sunk/45 px-5 py-4 space-y-4">
-      {/* Inline Approval Section (attached directly to this date's batch!) */}
-      {isAwaiting && (
+      <Collapse open={isAwaiting} unmountOnExit>
         <ApprovalDrawer
           run={run}
+          active={isExpanded && isAwaiting}
           approvedIndices={approvedIndices}
           busy={busy}
           feishuLabel={feishuLabel}
           onToggleIndex={onToggleIndex}
+          onSelectAll={onSelectAll}
           onApprove={onApprove}
           onReject={onReject}
         />
-      )}
+      </Collapse>
 
-      {/* Noise filter funnel & model telemetry strip */}
       <NoiseFunnelStrip run={run} />
 
       {/* Detail sub-tabs */}
@@ -98,80 +99,82 @@ export const RunDetailPanel: React.FC<{
         </span>
       </div>
 
-      {detailTab === 'stages' && (
-        <NodeDetailPanel
-          nodes={run.nodes}
-          activeNode={activeNode}
-          onSelectNode={onSelectNode}
-        />
-      )}
+      <div key={detailTab} className="animate-tab-enter">
+        {detailTab === 'stages' && (
+          <NodeDetailPanel
+            nodes={run.nodes}
+            activeNode={activeNode}
+            onSelectNode={onSelectNode}
+          />
+        )}
 
-      {detailTab === 'digest' && (
-        <div className="card p-4">
-          {run.digest_markdown ? (
-            <MarkdownView content={run.digest_markdown} />
-          ) : (
-            <p className="text-[13px] text-ink-4">
-              本批尚未完成全部步骤，审批通过后会自动生成总结日报。
-            </p>
-          )}
-        </div>
-      )}
+        {detailTab === 'digest' && (
+          <div className="card p-4">
+            {run.digest_markdown ? (
+              <MarkdownView content={run.digest_markdown} />
+            ) : (
+              <p className="text-[13px] text-ink-4">
+                本批尚未完成全部步骤，审批通过后会自动生成总结日报。
+              </p>
+            )}
+          </div>
+        )}
 
-      {detailTab === 'sessions' && (
-        <div className="card p-4">
-          {batchSessions.length === 0 ? (
-            <p className="text-[13px] text-ink-4">
-              本批共纳入 {run.admitted_sessions.length} 段对话记录。
-            </p>
-          ) : (
-            <div className="divide-y divide-line-soft">
-              {batchSessions.map((s) => (
-                <div
-                  key={s.session_key}
-                  className="py-2.5 flex items-center justify-between gap-3"
-                >
-                  <div className="min-w-0">
-                    <div className="text-[13px] font-medium text-ink truncate">
-                      {s.title || s.session_key}
+        {detailTab === 'sessions' && (
+          <div className="card p-4">
+            {batchSessions.length === 0 ? (
+              <p className="text-[13px] text-ink-4">
+                本批共纳入 {run.admitted_sessions.length} 段对话记录。
+              </p>
+            ) : (
+              <div className="divide-y divide-line-soft">
+                {batchSessions.map((s) => (
+                  <div
+                    key={s.session_key}
+                    className="py-2.5 flex items-center justify-between gap-3"
+                  >
+                    <div className="min-w-0">
+                      <div className="text-[13px] font-medium text-ink truncate">
+                        {s.title || s.session_key}
+                      </div>
+                      <div className="text-[11.5px] text-ink-4">
+                        {labelOf(CLIENT_LABELS, s.client)}
+                        {s.summary ? ` · ${s.summary}` : ''}
+                      </div>
                     </div>
-                    <div className="text-[11.5px] text-ink-4">
-                      {labelOf(CLIENT_LABELS, s.client)}
-                      {s.summary ? ` · ${s.summary}` : ''}
-                    </div>
+                    <StatusBadge status={s.status} />
                   </div>
-                  <StatusBadge status={s.status} />
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
-      {detailTab === 'events' && (
-        <div className="card p-4">
-          {events.length === 0 ? (
-            <p className="text-[13px] text-ink-4">暂无审计记录。</p>
-          ) : (
-            <div className="divide-y divide-line-soft">
-              {events.map((ev) => (
-                <div
-                  key={ev.seq}
-                  className="py-2 flex flex-wrap items-center justify-between gap-2 text-[12.5px]"
-                >
-                  <div className="flex items-center gap-2 min-w-0">
-                    <span className="chip mono">{ev.event_type}</span>
-                    <span className="text-ink-2">{ev.summary}</span>
+        {detailTab === 'events' && (
+          <div className="card p-4">
+            {events.length === 0 ? (
+              <p className="text-[13px] text-ink-4">暂无操作记录。</p>
+            ) : (
+              <div className="divide-y divide-line-soft">
+                {events.map((ev) => (
+                  <div
+                    key={ev.seq}
+                    className="py-2 flex flex-wrap items-center justify-between gap-2 text-[12.5px]"
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="chip mono">{ev.event_type}</span>
+                      <span className="text-ink-2">{ev.summary}</span>
+                    </div>
+                    <span className="num text-[11.5px] text-ink-4">
+                      {formatRelativeTime(ev.created_at)}
+                    </span>
                   </div>
-                  <span className="num text-[11.5px] text-ink-4">
-                    {formatRelativeTime(ev.created_at)}
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   )
 }

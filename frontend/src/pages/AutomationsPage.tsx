@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   ArrowRight,
-  ArrowUp,
   Bell,
   Calendar,
   Check,
@@ -13,29 +12,39 @@ import {
   Sparkles,
 } from 'lucide-react'
 import { api } from '../api'
-import type { PageKey } from '../App'
+import type { NavigateFn } from '../App'
 import { ListToolbar, PaginationBar, usePagination } from '../components/ListControls'
 import { PillTabs } from '../components/PageLayout'
 import { StatusBadge } from '../components/StatusBadge'
+import { AnimatedNumber } from '../components/ui/AnimatedNumber'
+import { Collapse } from '../components/ui/Collapse'
+import { ConfirmButton } from '../components/ui/ConfirmButton'
+import { Switch } from '../components/ui/Switch'
+import { useToast } from '../components/ui/Toast'
 import {
   APPROVAL_MODE_LABELS,
   FEISHU_LISTENER_STATE_LABELS,
   formatDuration,
   formatRunnerMode,
+  formatShanghaiTimestamp,
   labelOf,
   PHASE_LABELS,
+  preferredScrollBehavior,
   TRIGGER_LABELS,
 } from '../lib/labels'
 import type { AutomationsSnapshot, DreamResult, DreamStatusPayload } from '../types'
 
 interface Props {
   refreshToken: number
-  onNavigate: (page: PageKey) => void
+  onNavigate: NavigateFn
   onGlobalRefresh: () => void
 }
 
 type CronPreset = 'daily' | 'weekdays' | 'friday' | 'custom'
 type SectionKey = 'scheduler' | 'daily' | 'daemons' | 'history'
+
+const HOURS = Array.from({ length: 24 }, (_, i) => String(i).padStart(2, '0'))
+const MINUTES = ['00', '05', '10', '15', '20', '25', '30', '35', '40', '45', '50', '55']
 
 function parseCronToVisual(expr: string): {
   preset: CronPreset
@@ -46,7 +55,7 @@ function parseCronToVisual(expr: string): {
   if (parts.length === 5 && /^\d{1,2}$/.test(parts[0]) && /^\d{1,2}$/.test(parts[1])) {
     const minute = String(Number(parts[0])).padStart(2, '0')
     const hour = String(Number(parts[1])).padStart(2, '0')
-    if (parts[2] === '*' && parts[3] === '*') {
+    if (MINUTES.includes(minute) && HOURS.includes(hour) && parts[2] === '*' && parts[3] === '*') {
       const dow = parts[4].toLowerCase()
       if (dow === '*') return { preset: 'daily', hour, minute }
       if (dow === '1-5' || dow === 'mon-fri') return { preset: 'weekdays', hour, minute }
@@ -56,7 +65,12 @@ function parseCronToVisual(expr: string): {
   return { preset: 'custom', hour: '20', minute: '00' }
 }
 
-function buildCronFromVisual(preset: CronPreset, hour: string, minute: string, fallback: string): string {
+function buildCronFromVisual(
+  preset: CronPreset,
+  hour: string,
+  minute: string,
+  fallback: string
+): string {
   const m = String(Number(minute) || 0)
   const h = String(Number(hour) || 0)
   if (preset === 'daily') return `${m} ${h} * * *`
@@ -65,35 +79,46 @@ function buildCronFromVisual(preset: CronPreset, hour: string, minute: string, f
   return fallback
 }
 
-function formatShanghaiTimestamp(iso: string | null | undefined): string {
-  if (!iso) return '暂无'
-  const dt = new Date(iso)
-  if (Number.isNaN(dt.getTime())) return iso
-  const fmt = new Intl.DateTimeFormat('zh-CN', {
-    timeZone: 'Asia/Shanghai',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  })
-  return fmt.format(dt).replace(/\//g, '-')
+function humanPreview(preset: CronPreset, hour: string, minute: string): string {
+  if (preset === 'daily') return `每天 ${hour}:${minute} · 上海时间`
+  if (preset === 'weekdays') return `工作日 ${hour}:${minute} · 上海时间`
+  if (preset === 'friday') return `每周五 ${hour}:${minute} · 上海时间`
+  return '自定义排程 · 上海时间'
 }
 
-const HOURS = Array.from({ length: 24 }, (_, i) => String(i).padStart(2, '0'))
-const MINUTES = ['00', '05', '10', '15', '20', '25', '30', '35', '40', '45', '50', '55']
+function AutomationsSkeleton() {
+  return (
+    <div className="mx-auto max-w-[var(--page-max-wide)] space-y-5" aria-busy="true">
+      <div className="pb-4 border-b border-line space-y-2">
+        <div className="skeleton-block h-7 w-36" />
+        <div className="skeleton-block h-4 w-80 max-w-full" />
+      </div>
+      <div className="skeleton-block h-9 w-96 max-w-full rounded-full" />
+      <div className="card p-6 space-y-3">
+        <div className="skeleton-block h-5 w-32" />
+        <div className="skeleton-block h-12 w-full" />
+      </div>
+      <div className="card p-6 space-y-4">
+        <div className="skeleton-block h-5 w-44" />
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="skeleton-block h-28 w-full" />
+          <div className="skeleton-block h-28 w-full" />
+        </div>
+      </div>
+    </div>
+  )
+}
 
 export const AutomationsPage: React.FC<Props> = ({
   refreshToken,
   onNavigate,
   onGlobalRefresh,
 }) => {
+  const toast = useToast()
   const [data, setData] = useState<AutomationsSnapshot | null>(null)
   const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [notice, setNotice] = useState<string | null>(null)
   const [activeSection, setActiveSection] = useState<SectionKey>('scheduler')
   const [historyFilter, setHistoryFilter] = useState<'all' | 'scheduled'>('all')
 
@@ -120,24 +145,22 @@ export const AutomationsPage: React.FC<Props> = ({
   }, [])
 
   const load = useCallback(
-    async (syncEditor = false) => {
+    async (syncEditor = false, showSpinner = false) => {
+      if (showSpinner) setRefreshing(true)
       try {
         const [snap, dream] = await Promise.all([
           api.automations(),
           api.getDream().catch(() => null),
         ])
         setData(snap)
-        if (dream) {
-          setDreamStatus(dream)
-        }
-        if (syncEditor) {
-          syncDraftFromSnapshot(snap)
-        }
+        if (dream) setDreamStatus(dream)
+        if (syncEditor) syncDraftFromSnapshot(snap)
         setError(null)
       } catch (e: any) {
         setError(e?.message || '加载自动化调度状态失败')
       } finally {
         setLoading(false)
+        setRefreshing(false)
       }
     },
     [syncDraftFromSnapshot]
@@ -148,17 +171,13 @@ export const AutomationsPage: React.FC<Props> = ({
   }, [load])
 
   useEffect(() => {
-    if (refreshToken > 0) {
-      load(false)
-    }
+    if (refreshToken > 0) load(false)
   }, [refreshToken, load])
 
   const scrollToSection = (key: SectionKey) => {
     setActiveSection(key)
     const el = document.getElementById(`automation-sec-${key}`)
-    if (el) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'start' })
-    }
+    if (el) el.scrollIntoView({ behavior: preferredScrollBehavior(), block: 'start' })
   }
 
   const handlePresetChange = (nextPreset: CronPreset) => {
@@ -185,30 +204,27 @@ export const AutomationsPage: React.FC<Props> = ({
   const handleCronInput = (val: string) => {
     setCronDraft(val)
     const parsed = parseCronToVisual(val)
-    setPreset(parsed.preset)
     if (parsed.preset !== 'custom') {
       setHour(parsed.hour)
       setMinute(parsed.minute)
     }
   }
 
-  const handleToggleAuto = async () => {
+  const handleToggleAuto = async (nextEnabled: boolean) => {
     if (!data || togglingScheduler) return
     setTogglingScheduler(true)
     setError(null)
-    setNotice(null)
     try {
-      const nextEnabled = !data.scheduler.enabled
       const res = await api.updateAutomationSchedule({ schedule_enabled: nextEnabled })
       setData(res.automations)
-      setNotice(
+      toast.push(
         nextEnabled
-          ? `后台定时调度器已开启（${res.automations.scheduler.human_schedule}），立即生效无需重启。`
-          : '后台定时调度器已关闭；自动触发暂停，手动按钮仍可正常执行。'
+          ? `自动调度已开启（${res.automations.scheduler.human_schedule}），立即生效`
+          : '自动调度已暂停，手动整理仍随时可用'
       )
       onGlobalRefresh()
     } catch (e: any) {
-      setError(e?.message || '切换自动调度失败')
+      toast.push({ tone: 'error', message: e?.message || '切换自动调度失败' })
     } finally {
       setTogglingScheduler(false)
     }
@@ -218,57 +234,57 @@ export const AutomationsPage: React.FC<Props> = ({
     if (!data || savingSchedule) return
     setSavingSchedule(true)
     setError(null)
-    setNotice(null)
     try {
       const res = await api.updateAutomationSchedule({ daily_cron: cronDraft.trim() })
       setData(res.automations)
       syncDraftFromSnapshot(res.automations)
-      setNotice(
-        `定时规则已热更新为「${res.automations.scheduler.human_schedule}」（${res.automations.scheduler.cron}），无需重启服务。`
-      )
+      toast.push(`定时规则已更新为「${res.automations.scheduler.human_schedule}」，立即生效`)
       onGlobalRefresh()
     } catch (e: any) {
-      setError(e?.message || '保存 Cron 表达式失败')
+      toast.push({ tone: 'error', message: e?.message || '保存定时规则失败' })
     } finally {
       setSavingSchedule(false)
     }
   }
 
-  const handleToggleFridayWeekly = async () => {
+  const handleToggleFridayWeekly = async (nextVal: boolean) => {
     if (!data || savingSchedule) return
     setSavingSchedule(true)
     setError(null)
-    setNotice(null)
     try {
-      const nextVal = !data.scheduler.friday_weekly_enabled
       const res = await api.updateAutomationSchedule({ friday_weekly_enabled: nextVal })
       setData(res.automations)
-      setNotice(
+      toast.push(
         nextVal
-          ? '已开启周五自动并入周度 Dream 复盘。'
-          : '已关闭周五自动并入周度复盘（仍可手动执行周度复盘）。'
+          ? '已开启周五自动附带规则与笔记体检'
+          : '已关闭周五自动附带体检（仍可随时手动预览或执行）'
       )
       onGlobalRefresh()
     } catch (e: any) {
-      setError(e?.message || '切换周度复盘设置失败')
+      toast.push({ tone: 'error', message: e?.message || '切换设置失败' })
     } finally {
       setSavingSchedule(false)
     }
   }
 
-  const handleManualRun = async (phase: 'auto' | 'daily' | 'weekly') => {
+  const handleManualRun = async (phase: 'auto' | 'weekly') => {
     if (runningPhase) return
     setRunningPhase(phase)
     setError(null)
-    setNotice(null)
     try {
       const res = await api.startRun({ phase }, { background: true })
       const rid = res.run_id || res.run?.run_id || ''
-      setNotice(`已触发「${labelOf(PHASE_LABELS, phase)}」沉淀任务${rid ? `（${rid}）` : ''}，后台执行中。`)
+      toast.push({
+        tone: 'info',
+        message: `已启动「${labelOf(PHASE_LABELS, phase)}」任务，后台整理中`,
+      })
       onGlobalRefresh()
       await load(false)
+      if (rid) {
+        onNavigate('runs', { runsTab: 'pipeline', runId: rid })
+      }
     } catch (e: any) {
-      setError(e?.message || '触发沉淀任务失败')
+      toast.push({ tone: 'error', message: e?.message || '启动整理任务失败' })
     } finally {
       setRunningPhase(null)
     }
@@ -278,18 +294,17 @@ export const AutomationsPage: React.FC<Props> = ({
     if (recovering) return
     setRecovering(true)
     setError(null)
-    setNotice(null)
     try {
       const res = await api.triggerAutomationRecovery()
       setData(res.automations)
-      setNotice(
+      toast.push(
         res.reaped_count > 0
-          ? `巡检完成：已自动收割 ${res.reaped_count} 个陈旧中断批次并释放独占锁。`
-          : '巡检完成：当前无心跳超时的中断批次，独占锁与审批卡状态正常。'
+          ? `巡检完成：已自动恢复 ${res.reaped_count} 个卡住的批次并释放锁`
+          : '巡检完成：没有卡住的批次，运行状态正常'
       )
       onGlobalRefresh()
     } catch (e: any) {
-      setError(e?.message || '执行守护巡检失败')
+      toast.push({ tone: 'error', message: e?.message || '执行巡检失败' })
     } finally {
       setRecovering(false)
     }
@@ -299,21 +314,18 @@ export const AutomationsPage: React.FC<Props> = ({
     if (dreamBusy) return
     setDreamBusy(true)
     setError(null)
-    setNotice(null)
     try {
       const res = await api.runDream(dryRun)
       setDreamResult(res.result)
-      setNotice(
+      toast.push(
         dryRun
-          ? `只读蒸馏预览完成（${res.result.period_key}）：候选休眠 ${res.result.auto_dormant_rules.length} 条规则，超期经验卡 ${res.result.expired_cards.length} 篇，精简建议 ${res.result.proposals.length} 项（未修改数据）。`
-          : `分层蒸馏执行完成（${res.result.period_key}）：已休眠 ${res.result.auto_dormant_rules.length} 条零命中规则，标记 ${res.result.expired_cards.length} 篇过期经验卡并刷新核心索引卡。`
+          ? `预览完成：待休眠 ${res.result.auto_dormant_rules.length} 条零命中规则，待复核 ${res.result.expired_cards.length} 篇笔记（未改动数据）`
+          : `精简完成：已休眠 ${res.result.auto_dormant_rules.length} 条零命中规则，标记 ${res.result.expired_cards.length} 篇待复核笔记`
       )
       await load(false)
-      if (!dryRun) {
-        onGlobalRefresh()
-      }
+      if (!dryRun) onGlobalRefresh()
     } catch (e: any) {
-      setError(e?.message || '执行分层蒸馏失败')
+      toast.push({ tone: 'error', message: e?.message || '执行周五精简失败' })
     } finally {
       setDreamBusy(false)
     }
@@ -336,7 +348,7 @@ export const AutomationsPage: React.FC<Props> = ({
       .filter((r) =>
         !q
           ? true
-          : `${r.batch_date || ''} ${r.run_id} ${r.phase} ${r.trigger} ${r.error || ''}`
+          : `${r.batch_date || ''} ${r.run_id} ${r.phase} ${labelOf(PHASE_LABELS, r.phase)} ${r.trigger} ${labelOf(TRIGGER_LABELS, r.trigger)} ${r.error || ''}`
               .toLowerCase()
               .includes(q)
       )
@@ -348,14 +360,10 @@ export const AutomationsPage: React.FC<Props> = ({
   }, [data, historyFilter, historyQuery, historyStatus])
 
   const historyPager = usePagination(filteredRuns, 10)
+  const hasHistoryFilters = Boolean(historyQuery.trim()) || historyStatus !== 'all'
 
   if (loading && !data) {
-    return (
-      <div className="mx-auto max-w-[var(--page-max-wide)] py-12 flex items-center justify-center gap-2 text-ink-3 text-[13.5px]">
-        <Loader2 className="w-4 h-4 animate-spin text-accent" />
-        <span>正在加载自动化任务状态…</span>
-      </div>
-    )
+    return <AutomationsSkeleton />
   }
 
   const sched = data?.scheduler
@@ -368,16 +376,13 @@ export const AutomationsPage: React.FC<Props> = ({
 
   const todayHeadline = (() => {
     if (!metrics) return '—'
-    if (metrics.today_awaiting_count > 0) {
-      return `待审批 (${metrics.today_awaiting_count} 批)`
-    }
-    if (metrics.today_passed_count > 0) {
-      return `今日已沉淀 (${metrics.today_passed_count}/${metrics.today_runs_count})`
-    }
-    if (metrics.today_failed_count > 0) {
-      return `今日异常 (${metrics.today_failed_count} 批)`
-    }
-    return sched?.enabled ? `今日待触发 · ${sched.human_schedule.replace('（上海时间）', '')}` : '今日未执行（自动已暂停）'
+    if (metrics.today_awaiting_count > 0) return `待审批 (${metrics.today_awaiting_count} 批)`
+    if (metrics.today_passed_count > 0)
+      return `今日已整理 (${metrics.today_passed_count}/${metrics.today_runs_count})`
+    if (metrics.today_failed_count > 0) return `今日异常 (${metrics.today_failed_count} 批)`
+    return sched?.enabled
+      ? `今日待触发 · ${sched.human_schedule.replace('（上海时间）', '')}`
+      : '今日未执行（自动已暂停）'
   })()
 
   const todayColorClass = (() => {
@@ -390,15 +395,15 @@ export const AutomationsPage: React.FC<Props> = ({
 
   return (
     <div className="mx-auto max-w-[var(--page-max-wide)] space-y-5 pb-12">
-      {/* Page Header */}
-      <header className="flex flex-wrap items-start justify-between gap-4">
+      {/* Unified Page Header */}
+      <header className="flex flex-wrap items-end justify-between gap-3 pb-4 border-b border-line">
         <div>
-          <h1 className="text-[22px] font-bold tracking-tight text-ink">自动化调度</h1>
-          <p className="mt-1 text-[13px] text-ink-3">
-            后台调度器、每日定时沉淀批、周五分层蒸馏与守护巡检（统一上海时区 Asia/Shanghai）。
+          <h1 className="text-[24px] font-semibold leading-[1.3] text-ink">自动化调度</h1>
+          <p className="mt-1 text-[13.5px] text-ink-3">
+            设置每日定时整理、周五规则精简体检与后台异常恢复（统一按上海时间运行）。
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <span
             className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-[12px] font-medium ${
               isRunning
@@ -407,106 +412,90 @@ export const AutomationsPage: React.FC<Props> = ({
             }`}
           >
             <span
-              className={`size-2 rounded-full ${isRunning ? 'bg-ok' : 'bg-ink-4'}`}
+              className={`size-2 rounded-full ${isRunning ? 'status-dot-live bg-ok' : 'bg-ink-4'}`}
             />
-            <span>{isRunning ? `调度运行中 · ${sched?.human_schedule}` : '自动调度已暂停'}</span>
+            <span>{isRunning ? `定时运行中 · ${sched?.human_schedule}` : '自动调度已暂停'}</span>
           </span>
           <button
             type="button"
-            onClick={() => load(false)}
-            className="inline-flex items-center gap-1.5 rounded-[var(--radius-control)] border border-line bg-surface px-3 py-1.5 text-[12.5px] font-medium text-ink-2 hover:bg-bg-sunk transition-colors"
+            disabled={refreshing}
+            onClick={() => load(false, true)}
+            className="pressable inline-flex items-center gap-1.5 h-8 rounded-[var(--radius-control)] border border-line bg-surface px-3 text-[12.5px] font-medium text-ink-2 hover:border-line-strong hover:text-ink disabled:opacity-60"
           >
-            <RefreshCw className="w-3.5 h-3.5" />
+            <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
             <span>刷新</span>
           </button>
         </div>
       </header>
 
-      {/* Section Anchor Tabs + Back to Top (aligned with reference layout) */}
+      {/* Section Anchor Tabs */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <PillTabs
           items={[
-            { key: 'scheduler', label: '后台调度器' },
-            { key: 'daily', label: '每日与周期任务' },
-            { key: 'daemons', label: '后台守护巡检' },
+            { key: 'scheduler', label: '定时总开关' },
+            { key: 'daily', label: '每日与周五精简' },
+            { key: 'daemons', label: '后台守护' },
             { key: 'history', label: '执行记录', count: data?.recent_runs.length ?? 0 },
           ]}
           active={activeSection}
           onChange={(k) => scrollToSection(k as SectionKey)}
         />
-        <button
-          type="button"
-          onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
-          className="inline-flex items-center gap-1 rounded-full border border-line bg-surface px-3 py-1 text-[12px] text-ink-3 hover:text-ink transition-colors"
-        >
-          <ArrowUp className="w-3.5 h-3.5" />
-          <span>回到顶部</span>
-        </button>
       </div>
 
-      {/* Feedback banners */}
       {error && (
-        <div className="rounded-[var(--radius-card)] border border-hot/30 bg-hot-soft px-4 py-2.5 text-[13px] text-hot">
+        <div className="animate-shake rounded-[var(--radius-card)] border border-hot/30 bg-hot-soft px-4 py-2.5 text-[13px] text-hot">
           {error}
         </div>
       )}
-      {notice && (
-        <div className="rounded-[var(--radius-card)] border border-ok/30 bg-ok-soft px-4 py-2.5 text-[13px] text-ok-ink flex items-center gap-2">
-          <Check className="w-4 h-4 shrink-0" />
-          <span>{notice}</span>
-        </div>
-      )}
+
       {policy && !policy.workflow_enabled && (
-        <div className="rounded-[var(--radius-card)] border border-amber/30 bg-amber-soft px-4 py-2.5 text-[13px] text-amber-ink">
-          安全阀 <code className="font-mono">safety_valves.workflow_enabled</code> 当前为关闭状态：定时与手动沉淀任务均会被阻止，请先在「接入与设置」中开启。
+        <div className="rounded-[var(--radius-card)] border border-amber/35 bg-amber-soft px-4 py-2.5 text-[13px] text-amber-ink flex flex-wrap items-center justify-between gap-2">
+          <span>
+            后台自动整理总开关当前已关闭，定时与手动任务均会暂停。
+          </span>
+          <button
+            type="button"
+            onClick={() => onNavigate('settings', { settingsTab: 'storage' })}
+            className="pressable inline-flex items-center gap-1 h-7 px-2.5 rounded-[var(--radius-mark)] bg-amber text-amber-contrast text-[12px] font-semibold hover:opacity-90"
+          >
+            <span>立即前往开启</span>
+            <ArrowRight className="w-3.5 h-3.5" />
+          </button>
         </div>
       )}
 
       {/* Card 1: Background Scheduler Master Control */}
       <section
         id="automation-sec-scheduler"
-        className="card p-5 sm:p-6 space-y-4 scroll-mt-6"
+        className="card p-5 sm:p-6 space-y-4 scroll-mt-20 lg:scroll-mt-6"
       >
-        <div>
-          <h2 className="text-[16px] font-semibold text-ink">后台调度器</h2>
-          <p className="mt-1 text-[12.5px] text-ink-3">
-            定时沉淀、周五周度复盘与守护巡检；关闭后不再自动执行，手动按钮仍可用（修改即时热生效，无需重启服务）。
-          </p>
-        </div>
-
-        {/* Toggle Switch Row */}
-        <div className="flex items-center gap-3">
-          <span className="text-[13px] font-medium text-ink-2">自动执行</span>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={Boolean(sched?.enabled)}
-            disabled={togglingScheduler}
-            onClick={handleToggleAuto}
-            className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full border transition-colors ${
-              sched?.enabled
-                ? 'border-accent bg-accent'
-                : 'border-line-strong bg-bg-muted'
-            } disabled:opacity-60`}
-          >
-            <span
-              className={`inline-block size-4.5 rounded-full bg-white shadow transition-transform ${
-                sched?.enabled ? 'translate-x-5.5' : 'translate-x-0.5'
-              }`}
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="text-[16px] font-semibold text-ink">后台定时调度</h2>
+            <p className="mt-1 text-[12.5px] text-ink-3">
+              到点自动整理对话并按你的审批偏好落盘；关闭后暂停自动触发，修改立即生效无需重启。
+            </p>
+          </div>
+          <div className="flex items-center gap-2.5">
+            <span className="text-[12.5px] font-medium text-ink-2">
+              {togglingScheduler
+                ? '切换中…'
+                : sched?.enabled
+                  ? '已开启'
+                  : '已暂停'}
+            </span>
+            <Switch
+              checked={Boolean(sched?.enabled)}
+              disabled={togglingScheduler}
+              onChange={handleToggleAuto}
+              ariaLabel="自动执行总开关"
             />
-          </button>
-          <span className="text-[12px] text-ink-4">
-            {togglingScheduler
-              ? '正在切换…'
-              : sched?.enabled
-              ? '已启用（到点自动运行 P00–P07）'
-              : '已暂停（仅保留手动触发）'}
-          </span>
+          </div>
         </div>
 
         {/* Live Status Strip */}
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius-tile)] border border-line-soft bg-bg-sunk/70 px-4 py-3">
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[12.5px]">
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius-tile)] border border-line-soft bg-bg-sunk/70 px-4 py-3 text-[12.5px]">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
             <span className="inline-flex items-center gap-2 font-semibold text-ink">
               <span
                 className={`size-2 rounded-full ${
@@ -514,332 +503,296 @@ export const AutomationsPage: React.FC<Props> = ({
                 }`}
               />
               <span>
-                后台定时调度器：
                 {isRunning
                   ? '运行中'
                   : sched?.enabled && !sched.role_active
-                  ? '非 serve 模式（仅配置）'
-                  : '已暂停'}
+                    ? '后台服务未常驻（仅保存排程设置）'
+                    : '已暂停'}
               </span>
             </span>
             <span className="text-ink-3">
               · {sched?.human_schedule}
-              {sched?.friday_weekly_enabled ? '（含周五周度复盘）' : ''} + {Math.round(recovery?.interval_seconds ?? 30)}s 中断收割
-              {feishu?.enabled ? ' + 飞书通道' : ''}
-            </span>
-            <span className="num text-ink-4">
-              上次：{formatShanghaiTimestamp(sched?.last_scheduled_run_at || sched?.last_run_at)} · 下次：
-              {sched?.next_run_at
-                ? formatShanghaiTimestamp(sched.next_run_at)
-                : sched?.preview_next_run_at
-                ? `暂停中（开启后 ${formatShanghaiTimestamp(sched.preview_next_run_at)}）`
-                : '未排程'}
+              {sched?.friday_weekly_enabled ? '（含周五精简体检）' : ''}
+              {feishu?.enabled ? ' · 已接飞书通知' : ''}
             </span>
           </div>
-          <button
-            type="button"
-            disabled={recovering}
-            onClick={handleRecoveryNow}
-            className="inline-flex items-center gap-1.5 rounded-[var(--radius-control)] border border-line bg-surface px-3 py-1.5 text-[12.5px] font-medium text-ink-2 hover:bg-bg-muted transition-colors disabled:opacity-60"
-          >
-            {recovering ? (
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            ) : (
-              <ShieldCheck className="w-3.5 h-3.5 text-accent" />
-            )}
-            <span>立即巡检收割</span>
-          </button>
+          <span className="num text-[12px] text-ink-4">
+            上次：{formatShanghaiTimestamp(sched?.last_scheduled_run_at || sched?.last_run_at)} ·
+            下次：
+            {sched?.next_run_at
+              ? formatShanghaiTimestamp(sched.next_run_at)
+              : sched?.preview_next_run_at
+                ? `暂停中（开启后 ${formatShanghaiTimestamp(sched.preview_next_run_at)}）`
+                : '未排程'}
+          </span>
         </div>
       </section>
 
       {/* Card 2: Daily & Periodic Tasks */}
       <section
         id="automation-sec-daily"
-        className="card p-5 sm:p-6 space-y-5 scroll-mt-6"
+        className="card p-5 sm:p-6 space-y-5 scroll-mt-20 lg:scroll-mt-6"
       >
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line-soft pb-4">
           <div>
-            <h2 className="text-[16px] font-semibold text-ink">每日与周期任务</h2>
+            <h2 className="text-[16px] font-semibold text-ink">每日整理与周五精简</h2>
             <p className="mt-1 text-[12.5px] text-ink-3">
-              每日自动沉淀与周五周度 Dream 复盘；按上海时间排程，支持可视化调整 Cron 并即时热生效，也可一键手动触发。
+              按「{labelOf(APPROVAL_MODE_LABELS, policy?.effective_approval_mode || 'smart')}」策略整理对话，系统会自动按日期决定是否附带周五精简体检。
             </p>
           </div>
           <button
             type="button"
             disabled={Boolean(runningPhase) || isLocked}
             onClick={() => handleManualRun('auto')}
-            className="inline-flex items-center gap-1.5 rounded-[var(--radius-control)] bg-accent px-4 py-2 text-[13px] font-semibold text-accent-contrast hover:opacity-95 transition-opacity disabled:opacity-50"
+            className="pressable inline-flex items-center gap-1.5 h-9 rounded-[var(--radius-control)] bg-accent px-4 text-[13px] font-semibold text-accent-contrast hover:bg-accent-ink disabled:opacity-50"
           >
             {runningPhase === 'auto' ? (
               <Loader2 className="w-4 h-4 animate-spin" />
             ) : (
               <Play className="w-3.5 h-3.5" />
             )}
-            <span>{isLocked ? '已有批次执行中' : '一键执行自动沉淀'}</span>
+            <span>{isLocked ? '已有批次整理中' : '立即整理一轮'}</span>
           </button>
         </div>
 
-        {/* Sub-block: Daily Automatic Sedimentation */}
-        <div className="space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-3">
+        {/* Visual Schedule Editor */}
+        <div className="rounded-[var(--radius-tile)] border border-line-soft bg-bg-sunk/55 p-4 space-y-3.5">
+          <div className="flex flex-wrap items-end gap-3">
             <div>
-              <h3 className="text-[14.5px] font-semibold text-ink flex items-center gap-2">
-                <Clock className="w-4 h-4 text-accent" />
-                <span>每日自动沉淀批（P00–P07）</span>
-              </h3>
-              <p className="mt-0.5 text-[12.5px] text-ink-3">
-                自动扫描会话、过滤噪音、调用模型审查与路由规划，按「{labelOf(APPROVAL_MODE_LABELS, policy?.effective_approval_mode || 'smart')}」策略受控落盘。
-              </p>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <button
-                type="button"
-                disabled={Boolean(runningPhase) || isLocked}
-                onClick={() => handleManualRun('daily')}
-                className="inline-flex items-center gap-1.5 rounded-[var(--radius-control)] bg-accent/12 border border-accent/25 px-3.5 py-1.5 text-[12.5px] font-semibold text-accent-ink hover:bg-accent/18 transition-colors disabled:opacity-50"
+              <label className="block text-[11.5px] font-medium text-ink-3 mb-1">触发频率</label>
+              <select
+                value={preset}
+                onChange={(e) => handlePresetChange(e.target.value as CronPreset)}
+                className="field-input h-9 px-2.5 text-[13px]"
               >
-                {runningPhase === 'daily' ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <Play className="w-3.5 h-3.5" />
-                )}
-                <span>立即执行每日批</span>
-              </button>
-              <button
-                type="button"
-                disabled={Boolean(runningPhase) || isLocked}
-                onClick={() => handleManualRun('weekly')}
-                className="inline-flex items-center gap-1.5 rounded-[var(--radius-control)] border border-line bg-surface px-3.5 py-1.5 text-[12.5px] font-medium text-ink-2 hover:bg-bg-sunk transition-colors disabled:opacity-50"
-              >
-                {runningPhase === 'weekly' ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <Sparkles className="w-3.5 h-3.5 text-amber" />
-                )}
-                <span>立即执行周度复盘</span>
-              </button>
+                <option value="daily">每天</option>
+                <option value="weekdays">工作日（周一至周五）</option>
+                <option value="friday">每周五</option>
+                <option value="custom">自定义 Cron</option>
+              </select>
             </div>
-          </div>
 
-          {/* Visual Cron Editor + Friday Weekly Option Box */}
-          <div className="rounded-[var(--radius-tile)] border border-line-soft bg-bg-sunk/55 p-4 space-y-3.5">
-            <div className="flex flex-wrap items-end gap-3">
-              <div>
-                <label className="block text-[11.5px] font-medium text-ink-3 mb-1">
-                  触发频率
-                </label>
-                <select
-                  value={preset}
-                  onChange={(e) => handlePresetChange(e.target.value as CronPreset)}
-                  className="h-9 rounded-[var(--radius-control)] border border-line bg-surface px-2.5 text-[13px] text-ink focus:outline-none focus:border-accent"
+            {preset !== 'custom' && (
+              <>
+                <div>
+                  <label className="block text-[11.5px] font-medium text-ink-3 mb-1">
+                    小时（上海时间）
+                  </label>
+                  <select
+                    value={hour}
+                    onChange={(e) => handleHourChange(e.target.value)}
+                    className="field-input h-9 num px-2.5 text-[13px]"
+                  >
+                    {HOURS.map((h) => (
+                      <option key={h} value={h}>
+                        {h} 时
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[11.5px] font-medium text-ink-3 mb-1">分钟</label>
+                  <select
+                    value={MINUTES.includes(minute) ? minute : '00'}
+                    onChange={(e) => handleMinuteChange(e.target.value)}
+                    className="field-input h-9 num px-2.5 text-[13px]"
+                  >
+                    {MINUTES.map((m) => (
+                      <option key={m} value={m}>
+                        {m} 分
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="h-9 flex items-center">
+                  <span className="chip text-[12px] text-ink-2">
+                    <Clock className="w-3 h-3 text-accent" />
+                    {humanPreview(preset, hour, minute)}
+                  </span>
+                </div>
+              </>
+            )}
+
+            <div className="ml-auto flex items-center gap-2">
+              {cronDirty && (
+                <button
+                  type="button"
+                  onClick={() => data && syncDraftFromSnapshot(data)}
+                  className="pressable h-9 px-3 rounded-[var(--radius-control)] border border-line bg-surface text-[12.5px] text-ink-3 hover:text-ink"
                 >
-                  <option value="daily">每天</option>
-                  <option value="weekdays">工作日（周一至周五）</option>
-                  <option value="friday">每周五</option>
-                  <option value="custom">自定义 5 段 Cron</option>
-                </select>
-              </div>
-
-              {preset !== 'custom' && (
-                <>
-                  <div>
-                    <label className="block text-[11.5px] font-medium text-ink-3 mb-1">
-                      小时（上海时间）
-                    </label>
-                    <select
-                      value={hour}
-                      onChange={(e) => handleHourChange(e.target.value)}
-                      className="h-9 num rounded-[var(--radius-control)] border border-line bg-surface px-2.5 text-[13px] text-ink focus:outline-none focus:border-accent"
-                    >
-                      {HOURS.map((h) => (
-                        <option key={h} value={h}>
-                          {h} 时
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-[11.5px] font-medium text-ink-3 mb-1">
-                      分钟
-                    </label>
-                    <select
-                      value={MINUTES.includes(minute) ? minute : '00'}
-                      onChange={(e) => handleMinuteChange(e.target.value)}
-                      className="h-9 num rounded-[var(--radius-control)] border border-line bg-surface px-2.5 text-[13px] text-ink focus:outline-none focus:border-accent"
-                    >
-                      {MINUTES.map((m) => (
-                        <option key={m} value={m}>
-                          {m} 分
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                </>
+                  还原
+                </button>
               )}
-
-              <div className="flex-1 min-w-[180px]">
-                <label className="block text-[11.5px] font-medium text-ink-3 mb-1">
-                  Cron 表达式（分 时 日 月 周）
-                </label>
-                <input
-                  type="text"
-                  value={cronDraft}
-                  onChange={(e) => handleCronInput(e.target.value)}
-                  placeholder="0 20 * * *"
-                  className="h-9 w-full font-mono rounded-[var(--radius-control)] border border-line bg-surface px-3 text-[13px] text-ink focus:outline-none focus:border-accent"
-                />
-              </div>
-
               <button
                 type="button"
                 disabled={!cronDirty || savingSchedule}
                 onClick={handleSaveCron}
-                className="h-9 inline-flex items-center gap-1.5 rounded-[var(--radius-control)] bg-accent px-4 text-[12.5px] font-semibold text-accent-contrast hover:opacity-95 transition-opacity disabled:opacity-45"
+                className="pressable h-9 inline-flex items-center gap-1.5 rounded-[var(--radius-control)] bg-accent px-4 text-[12.5px] font-semibold text-accent-contrast hover:bg-accent-ink disabled:opacity-45"
               >
-                {savingSchedule ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
-                <span>保存并热生效</span>
+                {savingSchedule ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Check className="w-3.5 h-3.5" />
+                )}
+                <span>{cronDirty ? '保存排程' : '已生效'}</span>
               </button>
             </div>
+          </div>
 
-            <div className="border-t border-line-soft pt-3 flex flex-wrap items-center justify-between gap-2">
-              <label className="inline-flex items-start gap-2.5 cursor-pointer select-none">
-                <input
-                  type="checkbox"
-                  checked={Boolean(sched?.friday_weekly_enabled)}
-                  disabled={savingSchedule}
-                  onChange={handleToggleFridayWeekly}
-                  className="mt-0.5 size-4 rounded border-line accent-[var(--accent)]"
-                />
-                <span className="text-[12.5px]">
-                  <span className="font-semibold text-ink">
-                    周五自动并入周度 Dream 复盘
-                  </span>{' '}
-                  <span className="text-ok-ink">
-                    （{sched?.friday_weekly_enabled ? '已启用 · 周五自动触发跨周聚类与规则蒸馏' : '已关闭 · 仅跑每日沉淀'}）
-                  </span>
-                  <span className="block text-[12px] text-ink-4 mt-0.5">
-                    开启后，每周五的定时沉淀批（phase=auto）在完成 P05 结算时自动执行周度错题聚类与过时规则巡检；手动周度按钮不受此开关影响。
-                  </span>
-                </span>
+          {/* Raw Cron input only appears when user chooses Custom */}
+          <Collapse open={preset === 'custom'}>
+            <div className="pt-1">
+              <label className="block text-[11.5px] font-medium text-ink-3 mb-1">
+                自定义 5 段 Cron 表达式（分 时 日 月 周）
               </label>
+              <input
+                type="text"
+                value={cronDraft}
+                onChange={(e) => handleCronInput(e.target.value)}
+                placeholder="0 20 * * *"
+                className="field-input h-9 w-full max-w-md font-mono px-3 text-[13px]"
+              />
             </div>
+          </Collapse>
+
+          <div className="border-t border-line-soft pt-3 flex items-center justify-between gap-3">
+            <div className="text-[12.5px]">
+              <div className="font-semibold text-ink">周五顺带做一次规则与笔记体检</div>
+              <p className="text-[12px] text-ink-4 mt-0.5">
+                开启后，每周五定时整理结束时自动休眠 14 天零命中的试运行规则并标记过保鲜期的笔记。
+              </p>
+            </div>
+            <Switch
+              size="sm"
+              checked={Boolean(sched?.friday_weekly_enabled)}
+              disabled={savingSchedule}
+              onChange={handleToggleFridayWeekly}
+              ariaLabel="周五自动附带精简体检"
+            />
           </div>
-
-          {/* 2-Column Big KPI Tiles (directly matching reference screenshot bottom cards) */}
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="rounded-[var(--radius-tile)] border border-line bg-surface p-4 sm:p-5">
-              <div className="text-[12px] font-medium text-ink-3">
-                今日沉淀批状态（{metrics?.today_date || '—'}）
-              </div>
-              <div className={`mt-2 text-[22px] font-bold tracking-tight num ${todayColorClass}`}>
-                {todayHeadline}
-              </div>
-              <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px] text-ink-4">
-                <span>待审会话 {metrics?.pending_sessions ?? 0} 条</span>
-                <span>·</span>
-                <span>
-                  审批策略：{labelOf(APPROVAL_MODE_LABELS, policy?.effective_approval_mode || 'smart')}
-                </span>
-              </div>
-            </div>
-
-            <div className="rounded-[var(--radius-tile)] border border-line bg-surface p-4 sm:p-5">
-              <div className="text-[12px] font-medium text-ink-3">累计定时沉淀统计</div>
-              <div className="mt-2 text-[22px] font-bold tracking-tight num text-amber-ink">
-                {metrics?.total_scheduled_passed ?? 0} 次通过 / 共 {metrics?.total_scheduled_runs ?? 0} 次定时
-              </div>
-              <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px] text-ink-4">
-                <span>全部历史批次 {metrics?.total_runs ?? 0} 次</span>
-                <span>·</span>
-                <span>执行器：{formatRunnerMode(policy?.runner_mode || 'dry_run')}</span>
-              </div>
-            </div>
-          </div>
-          {/* Friday Dream Consolidation Control Card */}
-          {(() => {
-            const activeDream = dreamResult || dreamStatus?.preview
-            const latestEv = dreamStatus?.latest_event
-            return (
-              <div className="rounded-[var(--radius-tile)] border border-line bg-bg-sunk/40 p-4 sm:p-5 space-y-3">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <Sparkles className="w-4 h-4 text-accent" />
-                      <h3 className="text-[14px] font-semibold text-ink">
-                        周五分层蒸馏与减法（Dream Consolidation）
-                      </h3>
-                      {activeDream?.dry_run && (
-                        <span className="chip text-[11px]">只读预览态</span>
-                      )}
-                    </div>
-                    <p className="mt-1 text-[12px] text-ink-3">
-                      自动休眠 14 天零命中的试运行规则、扫描超期经验卡、识别触发词重合规则与 21 天零调用 Skill。
-                    </p>
-                  </div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <button
-                      type="button"
-                      disabled={dreamBusy}
-                      onClick={() => handleDreamAction(true)}
-                      className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[var(--radius-control)] border border-line bg-surface text-[12px] font-medium text-ink-2 hover:text-ink disabled:opacity-50"
-                    >
-                      {dreamBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
-                      <span>预览蒸馏建议（只读）</span>
-                    </button>
-                    <button
-                      type="button"
-                      disabled={dreamBusy}
-                      onClick={() => handleDreamAction(false)}
-                      className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[var(--radius-control)] bg-accent text-accent-contrast text-[12px] font-semibold hover:opacity-95 disabled:opacity-50"
-                    >
-                      <Sparkles className="w-3.5 h-3.5" />
-                      <span>立即执行蒸馏</span>
-                    </button>
-                  </div>
-                </div>
-
-                {activeDream && (
-                  <div className="flex flex-wrap gap-3 text-[12px] text-ink-2 num">
-                    <span>周期：{activeDream.period_key}</span>
-                    <span>·</span>
-                    <span>待休眠规则：{activeDream.auto_dormant_rules.length} 条</span>
-                    <span>·</span>
-                    <span>超期经验卡：{activeDream.expired_cards.length} 篇</span>
-                    <span>·</span>
-                    <span>规则合并候选：{activeDream.merge_candidates.length} 对</span>
-                    <span>·</span>
-                    <span>Skill 告警：{activeDream.skill_alerts.length} 个</span>
-                    <span>·</span>
-                    <span>未决分歧：{activeDream.open_dissents_count} 条</span>
-                  </div>
-                )}
-
-                {activeDream && activeDream.proposals.length > 0 && (
-                  <ul className="list-disc pl-5 space-y-1 text-[12.5px] text-ink-2">
-                    {activeDream.proposals.map((item, idx) => (
-                      <li key={idx}>{item}</li>
-                    ))}
-                  </ul>
-                )}
-
-                {latestEv && (
-                  <div className="pt-2 border-t border-line-soft text-[11.5px] text-ink-4 num">
-                    最近正式执行（{formatShanghaiTimestamp(latestEv.created_at)}）：{latestEv.summary}
-                  </div>
-                )}
-              </div>
-            )
-          })()}
         </div>
+
+        {/* 2-Column KPI Tiles */}
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="rounded-[var(--radius-tile)] border border-line bg-surface p-4 sm:p-5">
+            <div className="text-[12px] font-medium text-ink-3">
+              今日整理状态（{metrics?.today_date || '—'}）
+            </div>
+            <div className={`mt-2 text-[22px] font-bold tracking-tight num ${todayColorClass}`}>
+              {todayHeadline}
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px] text-ink-4">
+              <span>待整理对话 {metrics?.pending_sessions ?? 0} 段</span>
+              <span>·</span>
+              <span>
+                审批方式：{labelOf(APPROVAL_MODE_LABELS, policy?.effective_approval_mode || 'smart')}
+              </span>
+            </div>
+          </div>
+
+          <div className="rounded-[var(--radius-tile)] border border-line bg-surface p-4 sm:p-5">
+            <div className="text-[12px] font-medium text-ink-3">累计定时整理统计</div>
+            <div className="mt-2 text-[22px] font-bold tracking-tight num text-amber-ink">
+              <AnimatedNumber value={metrics?.total_scheduled_passed ?? 0} /> 次通过 / 共{' '}
+              <AnimatedNumber value={metrics?.total_scheduled_runs ?? 0} /> 次定时
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px] text-ink-4">
+              <span>全部历史批次 {metrics?.total_runs ?? 0} 次</span>
+              <span>·</span>
+              <span>整理模型：{formatRunnerMode(policy?.runner_mode || 'dry_run')}</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Friday Consolidation Card (Preview-first + guarded execution) */}
+        {(() => {
+          const activeDream = dreamResult || dreamStatus?.preview
+          const latestEv = dreamStatus?.latest_event
+          return (
+            <div className="rounded-[var(--radius-tile)] border border-line bg-bg-sunk/40 p-4 sm:p-5 space-y-3">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <Sparkles className="w-4 h-4 text-accent" />
+                    <h3 className="text-[14px] font-semibold text-ink">周五定期精简</h3>
+                    {activeDream?.dry_run && <span className="chip text-[11px]">预览结果</span>}
+                  </div>
+                  <p className="mt-1 text-[12px] text-ink-3">
+                    自动休眠 14 天零命中的试运行规则、扫描过保鲜期的笔记，并找出重复规则与长期未用的 Skill。
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={dreamBusy}
+                    onClick={() => handleDreamAction(true)}
+                    className="pressable inline-flex items-center gap-1.5 h-8 px-3 rounded-[var(--radius-control)] bg-accent-soft border border-accent/25 text-[12px] font-semibold text-accent-ink hover:bg-accent/18 disabled:opacity-50"
+                  >
+                    {dreamBusy && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                    <span>预览精简建议</span>
+                  </button>
+                  <ConfirmButton
+                    label="执行精简"
+                    confirmLabel="确认写入精简结果？"
+                    disabled={dreamBusy}
+                    onConfirm={() => handleDreamAction(false)}
+                    className="h-8 px-3 rounded-[var(--radius-control)] border border-line bg-surface text-[12px] font-medium text-ink-2 hover:border-line-strong hover:text-ink disabled:opacity-50"
+                    confirmClassName="h-8 px-3 rounded-[var(--radius-control)] border border-amber bg-amber text-amber-contrast text-[12px] font-semibold"
+                  />
+                  <button
+                    type="button"
+                    disabled={Boolean(runningPhase) || isLocked}
+                    onClick={() => handleManualRun('weekly')}
+                    className="pressable h-8 px-2.5 rounded-[var(--radius-control)] text-[12px] text-ink-3 hover:text-ink hover:bg-bg-sunk disabled:opacity-50"
+                  >
+                    单独跑周复盘
+                  </button>
+                </div>
+              </div>
+
+              {activeDream && (
+                <div className="flex flex-wrap gap-3 text-[12px] text-ink-2 num">
+                  <span>周期：{activeDream.period_key}</span>
+                  <span>·</span>
+                  <span>待休眠规则：{activeDream.auto_dormant_rules.length} 条</span>
+                  <span>·</span>
+                  <span>待复核笔记：{activeDream.expired_cards.length} 篇</span>
+                  <span>·</span>
+                  <span>重复规则候选：{activeDream.merge_candidates.length} 对</span>
+                  <span>·</span>
+                  <span>Skill 提醒：{activeDream.skill_alerts.length} 个</span>
+                  <span>·</span>
+                  <span>待处理分歧：{activeDream.open_dissents_count} 条</span>
+                </div>
+              )}
+
+              {activeDream && activeDream.proposals.length > 0 && (
+                <ul className="list-disc pl-5 space-y-1 text-[12.5px] text-ink-2">
+                  {activeDream.proposals.map((item, idx) => (
+                    <li key={idx}>{item}</li>
+                  ))}
+                </ul>
+              )}
+
+              {latestEv && (
+                <div className="pt-2 border-t border-line-soft text-[11.5px] text-ink-4 num">
+                  最近正式执行（{formatShanghaiTimestamp(latestEv.created_at)}）：{latestEv.summary}
+                </div>
+              )}
+            </div>
+          )
+        })()}
       </section>
+
+      {/* Card 3: Background Watchdogs */}
       <section
         id="automation-sec-daemons"
-        className="card p-5 sm:p-6 space-y-4 scroll-mt-6"
+        className="card p-5 sm:p-6 space-y-4 scroll-mt-20 lg:scroll-mt-6"
       >
         <div>
-          <h2 className="text-[16px] font-semibold text-ink">后台守护巡检</h2>
+          <h2 className="text-[16px] font-semibold text-ink">后台守护</h2>
           <p className="mt-1 text-[12.5px] text-ink-3">
-            仅在 <code className="font-mono text-[12px]">flywheel serve</code> 常驻进程中运行的守护任务：中断批次自动收割与飞书审批卡片长连接通道。
+            常驻服务期间自动看护中断批次与飞书审批通道，异常时自动清理恢复。
           </p>
         </div>
 
@@ -849,7 +802,7 @@ export const AutomationsPage: React.FC<Props> = ({
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2 font-semibold text-[13.5px] text-ink">
                 <ShieldCheck className="w-4 h-4 text-accent" />
-                <span>中断批次收割（Recovery Watchdog）</span>
+                <span>异常中断自动恢复</span>
               </div>
               <span
                 className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${
@@ -862,20 +815,22 @@ export const AutomationsPage: React.FC<Props> = ({
               </span>
             </div>
             <p className="text-[12px] text-ink-3">
-              每 <span className="num font-medium">{Math.round(recovery?.interval_seconds ?? 30)}</span> 秒巡检一次，自动收割超过{' '}
-              <span className="num font-medium">{recovery?.stale_after_seconds ?? 300}</span> 秒无心跳的 <code className="font-mono">RUNNING</code> 批次，释放独占锁并将未完成会话退回队列。
+              每 <span className="num font-medium">{Math.round(recovery?.interval_seconds ?? 30)}</span> 秒巡检一次，自动清理超过{' '}
+              <span className="num font-medium">{recovery?.stale_after_seconds ?? 300}</span> 秒无响应的卡住批次，释放锁并把未完成对话退回队列。
             </p>
             <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[12px] text-ink-4">
               <span className="num">
-                上次巡检：{formatShanghaiTimestamp(recovery?.last_pass_at)} · 累计收割 {recovery?.total_reaped_count ?? 0} 批
+                上次巡检：{formatShanghaiTimestamp(recovery?.last_pass_at)} · 累计恢复{' '}
+                {recovery?.total_reaped_count ?? 0} 批
               </span>
               <button
                 type="button"
                 disabled={recovering}
                 onClick={handleRecoveryNow}
-                className="text-accent-ink hover:underline font-medium"
+                className="pressable inline-flex items-center gap-1 text-accent-ink hover:underline font-medium disabled:opacity-50"
               >
-                立即巡检
+                {recovering && <Loader2 className="w-3 h-3 animate-spin" />}
+                <span>清理卡住的批次</span>
               </button>
             </div>
             {recovery?.last_error && (
@@ -888,39 +843,39 @@ export const AutomationsPage: React.FC<Props> = ({
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2 font-semibold text-[13.5px] text-ink">
                 <Bell className="w-4 h-4 text-accent" />
-                <span>飞书审批发件箱与点击监听</span>
+                <span>飞书消息与卡片审批</span>
               </div>
               <span
                 className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${
                   feishu?.availability === 'ok'
                     ? 'bg-ok-soft text-ok-ink'
                     : feishu?.enabled
-                    ? 'bg-amber-soft text-amber-ink'
-                    : 'bg-bg-muted text-ink-3'
+                      ? 'bg-amber-soft text-amber-ink'
+                      : 'bg-bg-muted text-ink-3'
                 }`}
               >
                 {!feishu?.enabled
                   ? '未启用'
                   : feishu.availability === 'ok'
-                  ? '交互就绪'
-                  : feishu.interactive
-                  ? labelOf(FEISHU_LISTENER_STATE_LABELS, feishu.listener_state)
-                  : '仅文本通知'}
+                    ? '交互就绪'
+                    : feishu.interactive
+                      ? labelOf(FEISHU_LISTENER_STATE_LABELS, feishu.listener_state)
+                      : '仅文本通知'}
               </span>
             </div>
             <p className="text-[12px] text-ink-3">
-              每 30 秒同步待审批卡片与退避重试；交互模式下通过单消费者长连接接收飞书卡片点击并原子认领执行。
+              支持在飞书卡片上直接点击「同意 / 放弃」，结果实时同步回本地，平时自动通过不打扰。
             </p>
             <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[12px] text-ink-4">
               <span>
-                自检：{feishu?.check_valid ? '已通过' : feishu?.interactive ? '待自检' : '未开启交互模式'}
+                链路自检：{feishu?.check_valid ? '已通过' : feishu?.interactive ? '待自检' : '未开启交互卡片'}
               </span>
               <button
                 type="button"
-                onClick={() => onNavigate('settings')}
-                className="inline-flex items-center gap-1 text-accent-ink hover:underline font-medium"
+                onClick={() => onNavigate('settings', { settingsTab: 'storage' })}
+                className="pressable inline-flex items-center gap-1 text-accent-ink hover:underline font-medium"
               >
-                <span>前往接入与设置</span>
+                <span>前往配置飞书</span>
                 <ArrowRight className="w-3 h-3" />
               </button>
             </div>
@@ -928,67 +883,76 @@ export const AutomationsPage: React.FC<Props> = ({
         </div>
       </section>
 
-      {/* Card 4: Recent Automation & Scheduled Execution History */}
+      {/* Card 4: Recent Execution History */}
       <section
         id="automation-sec-history"
-        className="card p-5 sm:p-6 space-y-4 scroll-mt-6"
+        className="card p-5 sm:p-6 space-y-4 scroll-mt-20 lg:scroll-mt-6"
       >
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="text-[16px] font-semibold text-ink flex items-center gap-2">
               <Calendar className="w-4 h-4 text-accent" />
-              <span>自动化执行记录</span>
+              <span>执行记录</span>
             </h2>
             <p className="mt-0.5 text-[12.5px] text-ink-3">
-              展示近期定时触发与手动触发的沉淀批次，点击可跳转至「沉淀与审批」查看八节点详情与审批。
+              点任意批次的「查看批次」直接定位到该批明细与审批抽屉。
             </p>
           </div>
-          <div className="flex items-center gap-2">
-            <PillTabs
-              items={[
-                { key: 'all', label: '全部批次', count: data?.recent_runs.length ?? 0 },
-                {
-                  key: 'scheduled',
-                  label: '仅定时触发',
-                  count: (data?.recent_runs || []).filter((r) => r.trigger === 'scheduled').length,
-                },
-              ]}
-              active={historyFilter}
-              onChange={(k) => setHistoryFilter(k as 'all' | 'scheduled')}
-            />
-          </div>
-        </div>
-
-        <ListToolbar
-          query={historyQuery}
-          onQueryChange={(q) => {
-            setHistoryQuery(q)
-            historyPager.resetPage()
-          }}
-          placeholder="按日期、批次 ID、阶段或错误信息搜索…"
-        >
-          <select
-            aria-label="执行记录状态筛选"
-            value={historyStatus}
-            onChange={(e) => {
-              setHistoryStatus(e.target.value)
+          <PillTabs
+            items={[
+              { key: 'all', label: '全部批次', count: data?.recent_runs.length ?? 0 },
+              {
+                key: 'scheduled',
+                label: '仅定时触发',
+                count: (data?.recent_runs || []).filter((r) => r.trigger === 'scheduled').length,
+              },
+            ]}
+            active={historyFilter}
+            onChange={(k) => {
+              setHistoryFilter(k as 'all' | 'scheduled')
               historyPager.resetPage()
             }}
-            className="h-8 rounded-[var(--radius-control)] border border-line bg-surface px-2.5 text-[12px] text-ink"
+          />
+        </div>
+
+        {(data?.recent_runs.length ?? 0) > 0 && (
+          <ListToolbar
+            query={historyQuery}
+            onQueryChange={(q) => {
+              setHistoryQuery(q)
+              historyPager.resetPage()
+            }}
+            placeholder="按日期、批次号或错误信息搜索…"
+            hasActiveFilters={hasHistoryFilters}
+            onResetFilters={() => {
+              setHistoryQuery('')
+              setHistoryStatus('all')
+              historyPager.resetPage()
+            }}
           >
-            <option value="all">全部状态</option>
-            <option value="PASS">已通过</option>
-            <option value="AWAITING_APPROVAL">待审批</option>
-            <option value="FAILED">已失败</option>
-            <option value="PARTIAL">部分完成</option>
-            <option value="CANCELLED">已取消</option>
-          </select>
-        </ListToolbar>
+            <select
+              aria-label="执行记录状态筛选"
+              value={historyStatus}
+              onChange={(e) => {
+                setHistoryStatus(e.target.value)
+                historyPager.resetPage()
+              }}
+              className="field-input h-8 px-2.5 text-[12px]"
+            >
+              <option value="all">全部状态</option>
+              <option value="PASS">已通过</option>
+              <option value="AWAITING_APPROVAL">待审批</option>
+              <option value="FAILED">已失败</option>
+              <option value="PARTIAL">部分完成</option>
+              <option value="CANCELLED">已取消</option>
+            </select>
+          </ListToolbar>
+        )}
 
         {filteredRuns.length === 0 ? (
           <div className="rounded-[var(--radius-tile)] border border-dashed border-line py-8 text-center text-[13px] text-ink-4">
             {historyFilter === 'scheduled'
-              ? '暂无定时调度触发的历史批次；到达预定时间后将自动记录在此。'
+              ? '暂无定时调度触发的历史批次；到达预定时间后会自动记录在这里。'
               : '暂无符合条件的运行记录。'}
           </div>
         ) : (
@@ -997,7 +961,7 @@ export const AutomationsPage: React.FC<Props> = ({
               {historyPager.pageItems.map((run) => (
                 <div
                   key={run.run_id}
-                  className="flex flex-wrap items-center justify-between gap-3 bg-surface px-4 py-3 hover:bg-bg-sunk/60 transition-colors"
+                  className="flex flex-wrap items-center justify-between gap-3 bg-surface px-4 py-3 hover:bg-bg-sunk/60 transition-colors duration-[150ms]"
                 >
                   <div className="min-w-0 space-y-1">
                     <div className="flex flex-wrap items-center gap-2">
@@ -1015,14 +979,17 @@ export const AutomationsPage: React.FC<Props> = ({
                     <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[12px] text-ink-4 num">
                       <span>{formatShanghaiTimestamp(run.started_at || run.created_at)}</span>
                       <span>·</span>
-                      <span>准入 {run.admitted_count} 会话</span>
+                      <span>整理 {run.admitted_count} 段对话</span>
                       <span>·</span>
-                      <span>计划写入 {run.planned_writes_count} 项</span>
+                      <span>拟写入 {run.planned_writes_count} 项</span>
                       {run.duration_ms > 0 && (
                         <>
                           <span>·</span>
                           <span>
-                            耗时 {formatDuration(run.started_at, run.finished_at, [{ duration_ms: run.duration_ms }])}
+                            耗时{' '}
+                            {formatDuration(run.started_at, run.finished_at, [
+                              { duration_ms: run.duration_ms },
+                            ])}
                           </span>
                         </>
                       )}
@@ -1035,8 +1002,10 @@ export const AutomationsPage: React.FC<Props> = ({
                   </div>
                   <button
                     type="button"
-                    onClick={() => onNavigate('runs')}
-                    className="inline-flex items-center gap-1 rounded-[var(--radius-control)] border border-line bg-surface px-2.5 py-1 text-[12px] font-medium text-ink-2 hover:text-accent-ink hover:border-accent/40 transition-colors"
+                    onClick={() =>
+                      onNavigate('runs', { runsTab: 'pipeline', runId: run.run_id })
+                    }
+                    className="pressable inline-flex items-center gap-1 rounded-[var(--radius-control)] border border-line bg-surface px-2.5 py-1 text-[12px] font-medium text-ink-2 hover:text-accent-ink hover:border-accent/40"
                   >
                     <span>查看批次</span>
                     <ArrowRight className="w-3.5 h-3.5" />

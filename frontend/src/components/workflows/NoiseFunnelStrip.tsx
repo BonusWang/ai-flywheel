@@ -2,10 +2,8 @@ import React from 'react'
 import type { WorkflowRunRecord } from '../../types'
 
 /**
- * The P00 → P02 → P03 noise-funnel strip of one batch.
- *
- * It only appears once there is triage or review data; a run that has not reached
- * those stages yet shows nothing rather than a row of zeros.
+ * The triage & extraction funnel strip of one batch.
+ * Only renders when triage or review findings exist.
  */
 export const NoiseFunnelStrip: React.FC<{ run: WorkflowRunRecord }> = ({ run }) => {
   const p00 = run.nodes.find((n) => n.node_id === 'P00_PREPARE')
@@ -22,25 +20,24 @@ export const NoiseFunnelStrip: React.FC<{ run: WorkflowRunRecord }> = ({ run }) 
 
   return (
     <div className="flex flex-wrap items-center gap-2 rounded-[var(--radius-control)] border border-line-soft bg-surface px-3.5 py-2 text-[12px] text-ink-3 num">
-      <span className="font-semibold text-ink">噪音过滤漏斗</span>
+      <span className="font-semibold text-ink">筛选明细</span>
       {triage && (triage.checked || 0) > 0 && (
         <span>
-          一级硬筛 {triage.checked} → 跳过噪音{' '}
-          <strong className="text-ink">{triage.skipped || 0}</strong>
+          初筛 {triage.checked} 段对话，跳过{' '}
+          <strong className="text-ink">{triage.skipped || 0}</strong> 段闲聊
         </span>
       )}
       {findings.length > 0 && (
         <>
           <span>·</span>
           <span>
-            P02 语义闸门有效 <strong className="text-ok-ink">{worthyCount}</strong> /{' '}
-            {findings.length}
+            提炼出有效经验 <strong className="text-ok-ink">{worthyCount}</strong> / {findings.length}
           </span>
         </>
       )}
       <span>·</span>
       <span>
-        计划写入 <strong className="text-ink">{run.planned_writes.length}</strong> 项
+        拟写入 <strong className="text-ink">{run.planned_writes.length}</strong> 项
       </span>
     </div>
   )

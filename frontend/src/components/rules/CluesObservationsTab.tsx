@@ -1,10 +1,8 @@
-import React, { useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import {
-  AlertTriangle,
   Archive,
   ArrowUpRight,
   CheckCheck,
-  ChevronDown,
   ChevronRight,
   EyeOff,
   GitBranch,
@@ -15,8 +13,17 @@ import { api } from '../../api'
 import { ListToolbar, PaginationBar, usePagination } from '../ListControls'
 import { PillTabs } from '../PageLayout'
 import { StatusBadge } from '../StatusBadge'
-import { CLIENT_LABELS, formatDateYMD, labelOf, RETRO_KIND_LABELS } from '../../lib/labels'
-import type { DissentRecord, MistakeObservation, RetroItem } from '../../types'
+import { Collapse } from '../ui/Collapse'
+import { ConfirmButton } from '../ui/ConfirmButton'
+import { useToast } from '../ui/Toast'
+import {
+  CLIENT_LABELS,
+  DISSENT_STATUS_LABELS,
+  formatDateYMD,
+  labelOf,
+  RETRO_KIND_LABELS,
+} from '../../lib/labels'
+import type { DissentRecord, MistakeObservation, RetroAdvisory, RetroItem } from '../../types'
 
 type SubViewKey = 'action' | 'observations' | 'dissents' | 'retros'
 
@@ -30,20 +37,32 @@ interface RetroGroup {
   latest: RetroItem
   count: number
   openCount: number
+  maxAttempt: number
   clients: string[]
   sessions: string[]
+  advisory?: RetroAdvisory
 }
 
-const DISSENT_STATUS_LABELS: Record<string, string> = {
-  open: '待收敛',
-  merged: '已吸收',
-  dismissed: '已忽略',
+function canonicalRetroKey(item: RetroItem): string {
+  if (item.advisory?.group_key) return item.advisory.group_key
+  const tool = (item.tool_name || '').trim().toLowerCase()
+  const norm = item.summary.trim().replace(/已连续尝试\s*\d+\s*次/g, '已连续尝试 N 次')
+  if (item.kind === 'retry_loop' && tool) return `retry_loop::${tool}`
+  return `${item.kind}::${norm}`
+}
+
+function extractAttempt(item: RetroItem): number {
+  if (item.advisory?.attempt && item.advisory.attempt > 0) return item.advisory.attempt
+  const raw = item.detail?.attempt
+  if (typeof raw === 'number' && raw > 0) return raw
+  const m = item.summary.match(/已连续尝试\s*(\d+)\s*次/)
+  return m ? Number(m[1]) : 0
 }
 
 const DISSENT_TARGET_LABELS: Record<string, string> = {
   rule: '规则',
   skill: 'Skill',
-  knowledge_doc: '知识文档',
+  knowledge_doc: '知识笔记',
 }
 
 function byCreatedDesc(a?: string | null, b?: string | null): number {
@@ -54,10 +73,12 @@ export const CluesObservationsTab: React.FC<{
   observations: MistakeObservation[]
   dissents: DissentRecord[]
   retros: RetroItem[]
+  initialSubView?: SubViewKey
+  intentNonce?: number
   onChanged: () => Promise<void>
-  onToast: (msg: string) => void
-}> = ({ observations, dissents, retros, onChanged, onToast }) => {
-  const [subView, setSubView] = useState<SubViewKey>('action')
+}> = ({ observations, dissents, retros, initialSubView, intentNonce, onChanged }) => {
+  const toast = useToast()
+  const [subView, setSubView] = useState<SubViewKey>(initialSubView || 'action')
   const [expandedIds, setExpandedIds] = useState<Record<string, boolean>>({})
   const [busy, setBusy] = useState(false)
 
@@ -72,6 +93,11 @@ export const CluesObservationsTab: React.FC<{
   const [selectedObs, setSelectedObs] = useState<string[]>([])
   const [selectedDissents, setSelectedDissents] = useState<string[]>([])
   const [selectedRetroKeys, setSelectedRetroKeys] = useState<string[]>([])
+
+  useEffect(() => {
+    if (!intentNonce || !initialSubView) return
+    setSubView(initialSubView)
+  }, [intentNonce, initialSubView])
 
   const toggleExpand = (id: string) =>
     setExpandedIds((prev) => ({ ...prev, [id]: !prev[id] }))
@@ -190,7 +216,8 @@ export const CluesObservationsTab: React.FC<{
     for (const item of filtered) {
       const stateBucket =
         item.status === 'open' || item.status === 'in_review' ? 'open' : item.status
-      const key = `${stateBucket}::${item.kind}::${item.client}::${item.summary.trim()}`
+      const key = `${stateBucket}::${canonicalRetroKey(item)}`
+      const attempt = extractAttempt(item)
       const existing = map.get(key)
       if (!existing) {
         map.set(key, {
@@ -199,15 +226,24 @@ export const CluesObservationsTab: React.FC<{
           latest: item,
           count: 1,
           openCount: stateBucket === 'open' ? 1 : 0,
+          maxAttempt: attempt,
           clients: [item.client],
           sessions: item.session_key ? [item.session_key] : [],
+          advisory: item.advisory,
         })
       } else {
         existing.ids.push(item.retro_id)
         existing.count += 1
         if (stateBucket === 'open') existing.openCount += 1
+        if (attempt > existing.maxAttempt) existing.maxAttempt = attempt
+        if (item.client && !existing.clients.includes(item.client)) {
+          existing.clients.push(item.client)
+        }
         if (item.session_key && !existing.sessions.includes(item.session_key)) {
           existing.sessions.push(item.session_key)
+        }
+        if (!existing.advisory && item.advisory) {
+          existing.advisory = item.advisory
         }
       }
     }
@@ -220,23 +256,31 @@ export const CluesObservationsTab: React.FC<{
     const keys = new Set<string>()
     for (const r of retros) {
       if (r.status === 'open' || r.status === 'in_review') {
-        keys.add(`${r.kind}::${r.client}::${r.summary.trim()}`)
+        keys.add(canonicalRetroKey(r))
       }
     }
     return keys.size
   }, [retros])
 
-  // Paginators (all default 10 per page)
+  const suggestedNoiseIds = useMemo(
+    () =>
+      groupedRetros
+        .filter((g) => g.openCount > 0 && g.advisory?.verdict === 'ignore')
+        .flatMap((g) => g.ids),
+    [groupedRetros]
+  )
+
   const actionPager = usePagination(actionItems, 10)
   const obsPager = usePagination(filteredObs, 10)
   const dissentPager = usePagination(filteredDissents, 10)
   const retroPager = usePagination(groupedRetros, 10)
 
-  // ---- Actions ----
   const runAction = async (fn: () => Promise<void>) => {
     setBusy(true)
     try {
       await fn()
+    } catch (e: any) {
+      toast.push({ tone: 'error', message: e?.message || '操作失败，请稍后重试' })
     } finally {
       setBusy(false)
     }
@@ -246,14 +290,21 @@ export const CluesObservationsTab: React.FC<{
     runAction(async () => {
       await api.promoteObservation(obsId)
       await onChanged()
-      onToast('已将该错题升级为试运行避坑规则')
+      toast.push('已将该错题升级为试运行避坑规则')
     })
 
   const handleArchiveObservation = (obsId: string) =>
     runAction(async () => {
       await api.archiveObservation(obsId)
       await onChanged()
-      onToast('错题已归档')
+      toast.push({
+        message: '错题已归档',
+        onUndo: async () => {
+          await api.restoreObservation(obsId)
+          await onChanged()
+          toast.push('已撤销归档，放回错题观察池')
+        },
+      })
     })
 
   const handleBulkArchiveObs = (ids: string[]) =>
@@ -262,14 +313,28 @@ export const CluesObservationsTab: React.FC<{
       const res = await api.bulkArchiveObservations(ids)
       setSelectedObs([])
       await onChanged()
-      onToast(`已批量归档 ${res.updated} 条观察错题`)
+      toast.push({
+        message: `已批量归档 ${res.updated} 条观察错题`,
+        onUndo: async () => {
+          await api.bulkRestoreObservations(ids)
+          await onChanged()
+          toast.push(`已撤销，恢复 ${ids.length} 条错题`)
+        },
+      })
     })
 
   const handleDissentStatus = (dissentId: string, status: 'merged' | 'dismissed') =>
     runAction(async () => {
       await api.updateDissentStatus(dissentId, status)
       await onChanged()
-      onToast(status === 'merged' ? '分歧已标记为已吸收' : '分歧已忽略')
+      toast.push({
+        message: status === 'merged' ? '已标记为纳入规则' : '已忽略该规则分歧',
+        onUndo: async () => {
+          await api.updateDissentStatus(dissentId, 'open')
+          await onChanged()
+          toast.push('已撤销，恢复为待处理分歧')
+        },
+      })
     })
 
   const handleBulkDissents = (ids: string[], status: 'merged' | 'dismissed') =>
@@ -278,7 +343,14 @@ export const CluesObservationsTab: React.FC<{
       const res = await api.bulkUpdateDissents(ids, status)
       setSelectedDissents([])
       await onChanged()
-      onToast(`已批量${status === 'merged' ? '标记吸收' : '忽略'} ${res.updated} 条规则分歧`)
+      toast.push({
+        message: `已批量${status === 'merged' ? '纳入规则' : '忽略'} ${res.updated} 条分歧`,
+        onUndo: async () => {
+          await api.bulkUpdateDissents(ids, 'open')
+          await onChanged()
+          toast.push(`已撤销，恢复 ${ids.length} 条分歧`)
+        },
+      })
     })
 
   const handleRetroGroupStatus = (ids: string[], status: RetroItem['status']) =>
@@ -287,7 +359,14 @@ export const CluesObservationsTab: React.FC<{
       const res = await api.bulkUpdateRetro(ids, status)
       setSelectedRetroKeys([])
       await onChanged()
-      onToast(`已批量标记 ${res.updated} 条线索为${status === 'resolved' ? '已处理' : '已忽略'}`)
+      toast.push({
+        message: `已标记 ${res.updated} 条线索为${status === 'resolved' ? '已处理' : '已忽略'}`,
+        onUndo: async () => {
+          await api.bulkUpdateRetro(ids, 'open')
+          await onChanged()
+          toast.push(`已撤销，恢复 ${ids.length} 条线索`)
+        },
+      })
     })
 
   const totalActionCount = highPriorityObs.length + openDissents.length
@@ -306,7 +385,7 @@ export const CluesObservationsTab: React.FC<{
       <div className="flex flex-wrap items-center justify-between gap-3">
         <PillTabs
           items={[
-            { key: 'action', label: '待我处理', count: totalActionCount },
+            { key: 'action', label: '待我拍板', count: totalActionCount },
             { key: 'observations', label: '错题观察池', count: observingCount },
             { key: 'dissents', label: '规则分歧', count: openDissents.length },
             { key: 'retros', label: '实时异常线索', count: openRetroGroupCount },
@@ -316,33 +395,36 @@ export const CluesObservationsTab: React.FC<{
         />
       </div>
 
-      {/* ==================== 1. 待我处理 ==================== */}
+      {/* ==================== 1. 待我拍板 ==================== */}
       {subView === 'action' && (
-        <section className="card p-5 space-y-3.5">
+        <section key="sub-action" className="animate-tab-enter card p-5 space-y-3.5">
           <div className="rounded-[var(--radius-tile)] bg-accent-softer/70 border border-accent/20 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-[12.5px]">
             <div className="flex items-center gap-2 text-ink-2">
               <ShieldAlert className="w-4 h-4 text-accent shrink-0" />
               <span>
-                仅汇总真正需要你拍板的高优项：
-                <strong className="text-ink font-semibold"> 🔴 沉默错误 ({highPriorityObs.length})</strong>{' '}
-                与 <strong className="text-ink font-semibold">未收敛规则分歧 ({openDissents.length})</strong>
-                ；普通观察错题与运行线索已由系统自动流转，无需逐条确认。
+                只汇总真正需要你拍板的高优项：
+                <strong className="text-ink font-semibold"> 漏检失误 ({highPriorityObs.length})</strong>{' '}
+                与 <strong className="text-ink font-semibold">待处理分歧 ({openDissents.length})</strong>
+                ；普通观察错题与运行线索已由系统自动流转。
               </span>
             </div>
           </div>
 
-          <ListToolbar
-            query={query}
-            onQueryChange={(q) => {
-              setQuery(q)
-              actionPager.resetPage()
-            }}
-            placeholder="搜索高优错题或规则分歧…"
-          />
+          {actionItems.length > 0 && (
+            <ListToolbar
+              query={query}
+              onQueryChange={(q) => {
+                setQuery(q)
+                actionPager.resetPage()
+              }}
+              placeholder="搜索高优错题或规则分歧…"
+              enableSlashShortcut
+            />
+          )}
 
           {actionItems.length === 0 ? (
             <div className="py-10 text-center text-[13px] text-ink-4">
-              当前没有需要人工拍板的高优错题或分歧。系统仍在后台自动观察普通失误并按批次结算异常线索。
+              当前没有需要人工拍板的高优错题或分歧，系统正在后台自动观察与流转。
             </div>
           ) : (
             <div className="divide-y divide-line-soft">
@@ -351,18 +433,21 @@ export const CluesObservationsTab: React.FC<{
                 if (item.kind === 'mistake') {
                   const obs = item.obs
                   return (
-                    <div key={item.id} className="py-3 space-y-2">
+                    <div key={item.id} className="py-3">
                       <div className="flex flex-wrap items-center justify-between gap-3">
                         <button
                           type="button"
+                          aria-expanded={expanded}
                           onClick={() => toggleExpand(item.id)}
                           className="flex items-start gap-2 min-w-0 flex-1 text-left group"
                         >
-                          {expanded ? (
-                            <ChevronDown className="w-4 h-4 text-accent shrink-0 mt-0.5" />
-                          ) : (
-                            <ChevronRight className="w-4 h-4 text-ink-4 shrink-0 mt-0.5 group-hover:text-ink" />
-                          )}
+                          <ChevronRight
+                            className={`w-4 h-4 shrink-0 mt-0.5 transition-transform duration-200 ease-[var(--ease-out-quint)] ${
+                              expanded
+                                ? 'rotate-90 text-accent'
+                                : 'text-ink-4 group-hover:text-ink'
+                            }`}
+                          />
                           <div className="min-w-0 flex-1 space-y-1">
                             <div className="flex flex-wrap items-center gap-1.5">
                               <span className="px-1.5 py-0.5 rounded bg-hot-soft text-hot text-[11px] font-semibold">
@@ -385,7 +470,7 @@ export const CluesObservationsTab: React.FC<{
                             disabled={busy}
                             onClick={() => handlePromoteObservation(obs.obs_id)}
                             title="将其升级为试运行避坑规则，下次同类任务自动提醒"
-                            className="inline-flex items-center gap-1 h-7 px-2.5 rounded-[var(--radius-mark)] bg-accent-soft text-accent-ink text-[12px] font-medium hover:bg-accent/20 disabled:opacity-50"
+                            className="pressable inline-flex items-center gap-1 h-7 px-2.5 rounded-[var(--radius-mark)] bg-accent-soft text-accent-ink text-[12px] font-medium hover:bg-accent/20 disabled:opacity-50"
                           >
                             <ArrowUpRight className="w-3.5 h-3.5" />
                             升为规则
@@ -394,15 +479,15 @@ export const CluesObservationsTab: React.FC<{
                             type="button"
                             disabled={busy}
                             onClick={() => handleArchiveObservation(obs.obs_id)}
-                            title="归档为一次性噪音，不再提示"
-                            className="h-7 px-2.5 rounded-[var(--radius-mark)] border border-line text-ink-3 text-[12px] hover:text-ink disabled:opacity-50"
+                            title="归档为一次性噪音（5秒内可撤销）"
+                            className="pressable h-7 px-2.5 rounded-[var(--radius-mark)] border border-line text-ink-3 text-[12px] hover:border-line-strong hover:text-ink disabled:opacity-50"
                           >
                             归档
                           </button>
                         </div>
                       </div>
-                      {expanded && (
-                        <div className="ml-6 rounded-[var(--radius-tile)] bg-bg-sunk/60 border border-line-soft p-3 text-[12.5px] space-y-1.5">
+                      <Collapse open={expanded} lazy>
+                        <div className="ml-6 mt-2 rounded-[var(--radius-tile)] bg-bg-sunk/60 border border-line-soft p-3 text-[12.5px] space-y-1.5">
                           <div className="mono text-[11.5px] text-ink-4">
                             根因标识：{obs.root_cause_key}
                           </div>
@@ -419,32 +504,34 @@ export const CluesObservationsTab: React.FC<{
                             </p>
                           )}
                         </div>
-                      )}
+                      </Collapse>
                     </div>
                   )
                 }
 
                 const d = item.dissent
                 return (
-                  <div key={item.id} className="py-3 space-y-2">
+                  <div key={item.id} className="py-3">
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <button
                         type="button"
+                        aria-expanded={expanded}
                         onClick={() => toggleExpand(item.id)}
                         className="flex items-start gap-2 min-w-0 flex-1 text-left group"
                       >
-                        {expanded ? (
-                          <ChevronDown className="w-4 h-4 text-accent shrink-0 mt-0.5" />
-                        ) : (
-                          <ChevronRight className="w-4 h-4 text-ink-4 shrink-0 mt-0.5 group-hover:text-ink" />
-                        )}
+                        <ChevronRight
+                          className={`w-4 h-4 shrink-0 mt-0.5 transition-transform duration-200 ease-[var(--ease-out-quint)] ${
+                            expanded ? 'rotate-90 text-accent' : 'text-ink-4 group-hover:text-ink'
+                          }`}
+                        />
                         <div className="min-w-0 flex-1 space-y-1">
                           <div className="flex flex-wrap items-center gap-1.5">
                             <span className="px-1.5 py-0.5 rounded bg-amber-soft text-amber-ink text-[11px] font-semibold">
-                              分歧 · 待收敛
+                              分歧 · 待处理
                             </span>
                             <span className="chip truncate max-w-[280px]">
-                              {DISSENT_TARGET_LABELS[d.target_type] || d.target_type}：{d.target_title || d.target_id}
+                              {DISSENT_TARGET_LABELS[d.target_type] || d.target_type}：
+                              {d.target_title || d.target_id}
                             </span>
                             <span className="num text-[11.5px] text-ink-4">
                               {formatDateYMD(d.created_at)}
@@ -460,24 +547,22 @@ export const CluesObservationsTab: React.FC<{
                           type="button"
                           disabled={busy}
                           onClick={() => handleDissentStatus(d.dissent_id, 'merged')}
-                          title="确认该反例已吸收进规则条件，关闭待处理"
-                          className="h-7 px-2.5 rounded-[var(--radius-mark)] bg-ok-soft text-ok-ink text-[12px] font-medium disabled:opacity-50"
+                          className="pressable h-7 px-2.5 rounded-[var(--radius-mark)] bg-ok-soft text-ok-ink text-[12px] font-medium disabled:opacity-50"
                         >
-                          已吸收
+                          已纳入规则
                         </button>
                         <button
                           type="button"
                           disabled={busy}
                           onClick={() => handleDissentStatus(d.dissent_id, 'dismissed')}
-                          title="判定为无效反例，忽略关闭"
-                          className="h-7 px-2.5 rounded-[var(--radius-mark)] border border-line text-ink-3 text-[12px] hover:text-ink disabled:opacity-50"
+                          className="pressable h-7 px-2.5 rounded-[var(--radius-mark)] border border-line text-ink-3 text-[12px] hover:border-line-strong hover:text-ink disabled:opacity-50"
                         >
                           忽略
                         </button>
                       </div>
                     </div>
-                    {expanded && (
-                      <div className="ml-6 rounded-[var(--radius-tile)] bg-bg-sunk/60 border border-line-soft p-3 text-[12.5px] space-y-1.5">
+                    <Collapse open={expanded} lazy>
+                      <div className="ml-6 mt-2 rounded-[var(--radius-tile)] bg-bg-sunk/60 border border-line-soft p-3 text-[12.5px] space-y-1.5">
                         <p className="text-ink-2">
                           <span className="text-ink-4">反例说明：</span>
                           {d.counter_claim}
@@ -493,7 +578,7 @@ export const CluesObservationsTab: React.FC<{
                           {d.evidence_pointer && <span>来源：{d.evidence_pointer}</span>}
                         </div>
                       </div>
-                    )}
+                    </Collapse>
                   </div>
                 )
               })}
@@ -513,11 +598,10 @@ export const CluesObservationsTab: React.FC<{
 
       {/* ==================== 2. 错题观察池 ==================== */}
       {subView === 'observations' && (
-        <section className="card p-5 space-y-3.5">
-          <div className="rounded-[var(--radius-tile)] bg-bg-sunk/65 border border-line-soft px-4 py-2.5 text-[12px] text-ink-3 flex flex-wrap items-center justify-between gap-2">
-            <span>
-              <strong className="text-ink">系统自动流转（事不过三）</strong>：普通失误（🟡/🟢）自动按根因计数，满 3 次自动晋升规则，超 30 天未复发单次低危错题由周五蒸馏自动归档；平时无需逐条操作。
-            </span>
+        <section key="sub-obs" className="animate-tab-enter card p-5 space-y-3.5">
+          <div className="rounded-[var(--radius-tile)] bg-bg-sunk/65 border border-line-soft px-4 py-2.5 text-[12px] text-ink-3">
+            <strong className="text-ink">系统自动流转（事不过三）</strong>
+            ：普通失误自动按根因计数，满 3 次自动晋升规则，超 30 天未复发的低危错题由周五精简自动归档。
           </div>
 
           <ListToolbar
@@ -527,13 +611,21 @@ export const CluesObservationsTab: React.FC<{
               obsPager.resetPage()
             }}
             placeholder="搜索错题标题、根因或做法…"
+            enableSlashShortcut
+            hasActiveFilters={Boolean(query.trim()) || obsStatus !== 'observing' || obsSeverity !== 'all'}
+            onResetFilters={() => {
+              setQuery('')
+              setObsStatus('observing')
+              setObsSeverity('all')
+              obsPager.resetPage()
+            }}
             actions={
               selectedObs.length > 0 ? (
                 <button
                   type="button"
                   disabled={busy}
                   onClick={() => handleBulkArchiveObs(selectedObs)}
-                  className="inline-flex items-center gap-1 h-8 px-2.5 rounded-[var(--radius-control)] border border-line bg-surface text-[12px] font-medium text-ink hover:border-accent"
+                  className="pressable inline-flex items-center gap-1 h-8 px-2.5 rounded-[var(--radius-control)] border border-line bg-surface text-[12px] font-medium text-ink hover:border-accent"
                 >
                   <Archive className="w-3.5 h-3.5" />
                   批量归档 ({selectedObs.length})
@@ -549,11 +641,11 @@ export const CluesObservationsTab: React.FC<{
                 setSelectedObs([])
                 obsPager.resetPage()
               }}
-              className="h-8 rounded-[var(--radius-control)] border border-line bg-surface px-2.5 text-[12px] text-ink"
+              className="field-input h-8 px-2.5 text-[12px]"
             >
               <option value="observing">仅看观察中</option>
               <option value="all">全部状态</option>
-              <option value="promoted">已升级规则</option>
+              <option value="promoted">已升规则</option>
               <option value="archived">已归档</option>
             </select>
             <select
@@ -564,12 +656,12 @@ export const CluesObservationsTab: React.FC<{
                 setSelectedObs([])
                 obsPager.resetPage()
               }}
-              className="h-8 rounded-[var(--radius-control)] border border-line bg-surface px-2.5 text-[12px] text-ink"
+              className="field-input h-8 px-2.5 text-[12px]"
             >
               <option value="all">全部级别</option>
-              <option value="red_silent">🔴 沉默错误</option>
-              <option value="yellow_caught">🟡 自查拦截</option>
-              <option value="green_minor">🟢 轻微</option>
+              <option value="red_silent">漏检失误</option>
+              <option value="yellow_caught">自查拦截</option>
+              <option value="green_minor">轻微</option>
             </select>
           </ListToolbar>
 
@@ -582,7 +674,7 @@ export const CluesObservationsTab: React.FC<{
                 const expanded = Boolean(expandedIds[key])
                 const checked = selectedObs.includes(obs.obs_id)
                 return (
-                  <div key={obs.obs_id} className="py-3 space-y-2">
+                  <div key={obs.obs_id} className="py-3">
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div className="flex items-start gap-2 min-w-0 flex-1">
                         {obs.status === 'observing' && (
@@ -590,19 +682,22 @@ export const CluesObservationsTab: React.FC<{
                             type="checkbox"
                             checked={checked}
                             onChange={() => toggleSelect(obs.obs_id, selectedObs, setSelectedObs)}
-                            className="mt-1 size-3.5 accent-[var(--accent)]"
+                            className="mt-1 size-3.5 accent-[var(--accent)] cursor-pointer"
                           />
                         )}
                         <button
                           type="button"
+                          aria-expanded={expanded}
                           onClick={() => toggleExpand(key)}
                           className="flex items-start gap-1.5 min-w-0 flex-1 text-left group"
                         >
-                          {expanded ? (
-                            <ChevronDown className="w-4 h-4 text-accent shrink-0 mt-0.5" />
-                          ) : (
-                            <ChevronRight className="w-4 h-4 text-ink-4 shrink-0 mt-0.5 group-hover:text-ink" />
-                          )}
+                          <ChevronRight
+                            className={`w-4 h-4 shrink-0 mt-0.5 transition-transform duration-200 ease-[var(--ease-out-quint)] ${
+                              expanded
+                                ? 'rotate-90 text-accent'
+                                : 'text-ink-4 group-hover:text-ink'
+                            }`}
+                          />
                           <div className="min-w-0 flex-1 space-y-1">
                             <div className="flex flex-wrap items-center gap-1.5">
                               <StatusBadge status={obs.severity_grade} />
@@ -625,7 +720,7 @@ export const CluesObservationsTab: React.FC<{
                               type="button"
                               disabled={busy}
                               onClick={() => handlePromoteObservation(obs.obs_id)}
-                              className="inline-flex items-center gap-1 h-7 px-2.5 rounded-[var(--radius-mark)] bg-accent-soft text-accent-ink text-[12px] font-medium"
+                              className="pressable inline-flex items-center gap-1 h-7 px-2.5 rounded-[var(--radius-mark)] bg-accent-soft text-accent-ink text-[12px] font-medium hover:bg-accent/18 disabled:opacity-50"
                             >
                               <ArrowUpRight className="w-3.5 h-3.5" />
                               升为规则
@@ -635,7 +730,7 @@ export const CluesObservationsTab: React.FC<{
                               type="button"
                               disabled={busy}
                               onClick={() => handlePromoteObservation(obs.obs_id)}
-                              className="h-7 px-2 rounded-[var(--radius-mark)] border border-line text-ink-3 text-[11.5px] hover:text-ink"
+                              className="pressable h-7 px-2 rounded-[var(--radius-mark)] border border-line text-ink-3 text-[11.5px] hover:border-line-strong hover:text-ink disabled:opacity-50"
                             >
                               提前升规则
                             </button>
@@ -644,15 +739,15 @@ export const CluesObservationsTab: React.FC<{
                             type="button"
                             disabled={busy}
                             onClick={() => handleArchiveObservation(obs.obs_id)}
-                            className="h-7 px-2 rounded-[var(--radius-mark)] border border-line text-ink-4 text-[11.5px] hover:text-ink"
+                            className="pressable h-7 px-2 rounded-[var(--radius-mark)] border border-line text-ink-4 text-[11.5px] hover:border-line-strong hover:text-ink disabled:opacity-50"
                           >
                             归档
                           </button>
                         </div>
                       )}
                     </div>
-                    {expanded && (
-                      <div className="ml-8 rounded-[var(--radius-tile)] bg-bg-sunk/60 border border-line-soft p-3 text-[12.5px] space-y-1.5">
+                    <Collapse open={expanded} lazy>
+                      <div className="ml-8 mt-2 rounded-[var(--radius-tile)] bg-bg-sunk/60 border border-line-soft p-3 text-[12.5px] space-y-1.5">
                         <div className="mono text-[11.5px] text-ink-4">
                           根因标识：{obs.root_cause_key}
                         </div>
@@ -669,7 +764,7 @@ export const CluesObservationsTab: React.FC<{
                           </p>
                         )}
                       </div>
-                    )}
+                    </Collapse>
                   </div>
                 )
               })}
@@ -689,11 +784,12 @@ export const CluesObservationsTab: React.FC<{
 
       {/* ==================== 3. 规则分歧 ==================== */}
       {subView === 'dissents' && (
-        <section className="card p-5 space-y-3.5">
+        <section key="sub-dissents" className="animate-tab-enter card p-5 space-y-3.5">
           <div className="rounded-[var(--radius-tile)] bg-amber-soft/50 border border-amber/25 px-4 py-2.5 text-[12px] text-ink-2 flex items-center gap-2">
             <GitBranch className="w-4 h-4 text-amber-ink shrink-0" />
             <span>
-              <strong className="text-ink">规则分歧与反例</strong>：当既有规则在特定场景不适用时保留反例不覆盖原规则。确认已吸收进规则条件请点「已吸收」，判定无效反例请点「忽略」。
+              <strong className="text-ink">规则分歧与反例</strong>
+              ：既有规则在特定场景不适用时保留反例不直接覆盖。已补充进规则请点「已纳入规则」，无效反例请点「忽略」。
             </span>
           </div>
 
@@ -704,6 +800,13 @@ export const CluesObservationsTab: React.FC<{
               dissentPager.resetPage()
             }}
             placeholder="搜索反例内容、适用边界或关联规则…"
+            enableSlashShortcut
+            hasActiveFilters={Boolean(query.trim()) || dissentStatus !== 'open'}
+            onResetFilters={() => {
+              setQuery('')
+              setDissentStatus('open')
+              dissentPager.resetPage()
+            }}
             actions={
               selectedDissents.length > 0 ? (
                 <div className="flex items-center gap-1.5">
@@ -711,15 +814,15 @@ export const CluesObservationsTab: React.FC<{
                     type="button"
                     disabled={busy}
                     onClick={() => handleBulkDissents(selectedDissents, 'merged')}
-                    className="h-8 px-2.5 rounded-[var(--radius-control)] bg-ok-soft text-ok-ink text-[12px] font-medium"
+                    className="pressable h-8 px-2.5 rounded-[var(--radius-control)] bg-ok-soft text-ok-ink text-[12px] font-medium"
                   >
-                    批量已吸收 ({selectedDissents.length})
+                    批量纳入规则 ({selectedDissents.length})
                   </button>
                   <button
                     type="button"
                     disabled={busy}
                     onClick={() => handleBulkDissents(selectedDissents, 'dismissed')}
-                    className="h-8 px-2.5 rounded-[var(--radius-control)] border border-line bg-surface text-ink-3 text-[12px]"
+                    className="pressable h-8 px-2.5 rounded-[var(--radius-control)] border border-line bg-surface text-ink-3 text-[12px] hover:text-ink"
                   >
                     批量忽略
                   </button>
@@ -735,11 +838,11 @@ export const CluesObservationsTab: React.FC<{
                 setSelectedDissents([])
                 dissentPager.resetPage()
               }}
-              className="h-8 rounded-[var(--radius-control)] border border-line bg-surface px-2.5 text-[12px] text-ink"
+              className="field-input h-8 px-2.5 text-[12px]"
             >
-              <option value="open">仅看待收敛</option>
+              <option value="open">仅看待处理</option>
               <option value="all">全部状态</option>
-              <option value="merged">已吸收</option>
+              <option value="merged">已纳入规则</option>
               <option value="dismissed">已忽略</option>
             </select>
           </ListToolbar>
@@ -753,7 +856,7 @@ export const CluesObservationsTab: React.FC<{
                 const expanded = Boolean(expandedIds[key])
                 const checked = selectedDissents.includes(d.dissent_id)
                 return (
-                  <div key={d.dissent_id} className="py-3 space-y-2">
+                  <div key={d.dissent_id} className="py-3">
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div className="flex items-start gap-2 min-w-0 flex-1">
                         {d.status === 'open' && (
@@ -763,19 +866,22 @@ export const CluesObservationsTab: React.FC<{
                             onChange={() =>
                               toggleSelect(d.dissent_id, selectedDissents, setSelectedDissents)
                             }
-                            className="mt-1 size-3.5 accent-[var(--accent)]"
+                            className="mt-1 size-3.5 accent-[var(--accent)] cursor-pointer"
                           />
                         )}
                         <button
                           type="button"
+                          aria-expanded={expanded}
                           onClick={() => toggleExpand(key)}
                           className="flex items-start gap-1.5 min-w-0 flex-1 text-left group"
                         >
-                          {expanded ? (
-                            <ChevronDown className="w-4 h-4 text-accent shrink-0 mt-0.5" />
-                          ) : (
-                            <ChevronRight className="w-4 h-4 text-ink-4 shrink-0 mt-0.5 group-hover:text-ink" />
-                          )}
+                          <ChevronRight
+                            className={`w-4 h-4 shrink-0 mt-0.5 transition-transform duration-200 ease-[var(--ease-out-quint)] ${
+                              expanded
+                                ? 'rotate-90 text-accent'
+                                : 'text-ink-4 group-hover:text-ink'
+                            }`}
+                          />
                           <div className="min-w-0 flex-1 space-y-1">
                             <div className="flex flex-wrap items-center gap-1.5">
                               <span
@@ -790,7 +896,8 @@ export const CluesObservationsTab: React.FC<{
                                 {DISSENT_STATUS_LABELS[d.status] || d.status}
                               </span>
                               <span className="chip truncate max-w-[300px]">
-                                {DISSENT_TARGET_LABELS[d.target_type] || d.target_type}：{d.target_title || d.target_id}
+                                {DISSENT_TARGET_LABELS[d.target_type] || d.target_type}：
+                                {d.target_title || d.target_id}
                               </span>
                               <span className="num text-[11.5px] text-ink-4">
                                 {formatDateYMD(d.created_at)}
@@ -808,23 +915,23 @@ export const CluesObservationsTab: React.FC<{
                             type="button"
                             disabled={busy}
                             onClick={() => handleDissentStatus(d.dissent_id, 'merged')}
-                            className="h-7 px-2.5 rounded-[var(--radius-mark)] bg-ok-soft text-ok-ink text-[12px] font-medium"
+                            className="pressable h-7 px-2.5 rounded-[var(--radius-mark)] bg-ok-soft text-ok-ink text-[12px] font-medium disabled:opacity-50"
                           >
-                            已吸收
+                            已纳入规则
                           </button>
                           <button
                             type="button"
                             disabled={busy}
                             onClick={() => handleDissentStatus(d.dissent_id, 'dismissed')}
-                            className="h-7 px-2.5 rounded-[var(--radius-mark)] border border-line text-ink-3 text-[12px]"
+                            className="pressable h-7 px-2.5 rounded-[var(--radius-mark)] border border-line text-ink-3 text-[12px] hover:border-line-strong hover:text-ink disabled:opacity-50"
                           >
                             忽略
                           </button>
                         </div>
                       )}
                     </div>
-                    {expanded && (
-                      <div className="ml-8 rounded-[var(--radius-tile)] bg-bg-sunk/60 border border-line-soft p-3 text-[12.5px] space-y-1.5">
+                    <Collapse open={expanded} lazy>
+                      <div className="ml-8 mt-2 rounded-[var(--radius-tile)] bg-bg-sunk/60 border border-line-soft p-3 text-[12.5px] space-y-1.5">
                         <p className="text-ink-2">
                           <span className="text-ink-4">完整反例：</span>
                           {d.counter_claim}
@@ -841,7 +948,7 @@ export const CluesObservationsTab: React.FC<{
                           {d.session_key && <span>会话：{d.session_key}</span>}
                         </div>
                       </div>
-                    )}
+                    </Collapse>
                   </div>
                 )
               })}
@@ -861,11 +968,12 @@ export const CluesObservationsTab: React.FC<{
 
       {/* ==================== 4. 实时异常线索 ==================== */}
       {subView === 'retros' && (
-        <section className="card p-5 space-y-3.5">
+        <section key="sub-retros" className="animate-tab-enter card p-5 space-y-3.5">
           <div className="rounded-[var(--radius-tile)] bg-bg-sunk/65 border border-line-soft px-4 py-2.5 text-[12px] text-ink-3 flex items-center gap-2">
             <Radar className="w-4 h-4 text-accent shrink-0" />
             <span>
-              <strong className="text-ink">系统自动复盘原料</strong>：由 Hook / MCP 实时捕获，每日 20:00 批次结算时自动标记已处理；同类重复信号已自动聚合显示，无需逐条手工点完，也可按组批量忽略清理噪音。
+              <strong className="text-ink">系统自动聚合的运行线索</strong>
+              ：由工具在执行期实时上报，每日定时整理时会自动结算；同类重复信号已合并展示，也可一键清理建议噪音。
             </span>
           </div>
 
@@ -876,8 +984,15 @@ export const CluesObservationsTab: React.FC<{
               retroPager.resetPage()
             }}
             placeholder="搜索异常摘要、工具名或客户端…"
+            enableSlashShortcut
+            hasActiveFilters={Boolean(query.trim()) || retroStatus !== 'open'}
+            onResetFilters={() => {
+              setQuery('')
+              setRetroStatus('open')
+              retroPager.resetPage()
+            }}
             actions={
-              <div className="flex items-center gap-1.5">
+              <div className="flex flex-wrap items-center gap-1.5">
                 {selectedRetroKeys.length > 0 && (
                   <>
                     <button
@@ -889,7 +1004,7 @@ export const CluesObservationsTab: React.FC<{
                           .flatMap((g) => g.ids)
                         handleRetroGroupStatus(ids, 'resolved')
                       }}
-                      className="inline-flex items-center gap-1 h-8 px-2.5 rounded-[var(--radius-control)] bg-ok-soft text-ok-ink text-[12px] font-medium"
+                      className="pressable inline-flex items-center gap-1 h-8 px-2.5 rounded-[var(--radius-control)] bg-ok-soft text-ok-ink text-[12px] font-medium"
                     >
                       <CheckCheck className="w-3.5 h-3.5" />
                       批量已处理
@@ -903,27 +1018,37 @@ export const CluesObservationsTab: React.FC<{
                           .flatMap((g) => g.ids)
                         handleRetroGroupStatus(ids, 'dismissed')
                       }}
-                      className="inline-flex items-center gap-1 h-8 px-2.5 rounded-[var(--radius-control)] border border-line bg-surface text-ink-3 text-[12px]"
+                      className="pressable inline-flex items-center gap-1 h-8 px-2.5 rounded-[var(--radius-control)] border border-line bg-surface text-ink-3 text-[12px] hover:text-ink"
                     >
                       <EyeOff className="w-3.5 h-3.5" />
                       批量忽略
                     </button>
                   </>
                 )}
-                {retroStatus === 'open' && groupedRetros.length > 0 && (
+                {retroStatus === 'open' && suggestedNoiseIds.length > 0 && (
                   <button
                     type="button"
                     disabled={busy}
-                    onClick={() =>
+                    onClick={() => handleRetroGroupStatus(suggestedNoiseIds, 'dismissed')}
+                    className="pressable h-8 px-2.5 rounded-[var(--radius-control)] border border-line bg-bg-sunk text-ink-2 text-[12px] font-medium hover:border-line-strong hover:text-ink"
+                  >
+                    一键忽略建议噪音 ({suggestedNoiseIds.length})
+                  </button>
+                )}
+                {retroStatus === 'open' && groupedRetros.length > 0 && (
+                  <ConfirmButton
+                    label="忽略本页全部"
+                    confirmLabel={`确认忽略本页 ${retroPager.pageItems.length} 组？`}
+                    disabled={busy}
+                    onConfirm={() =>
                       handleRetroGroupStatus(
                         retroPager.pageItems.flatMap((g) => g.ids),
                         'dismissed'
                       )
                     }
-                    className="h-8 px-2.5 rounded-[var(--radius-control)] border border-line bg-surface text-ink-3 text-[12px] hover:text-ink"
-                  >
-                    忽略本页全部
-                  </button>
+                    className="h-8 px-2.5 rounded-[var(--radius-control)] border border-line bg-surface text-ink-3 text-[12px] hover:border-hot/50 hover:text-hot disabled:opacity-50"
+                    confirmClassName="h-8 px-2.5 rounded-[var(--radius-control)] border border-hot bg-hot text-white text-[12px] font-semibold"
+                  />
                 )}
               </div>
             }
@@ -936,10 +1061,10 @@ export const CluesObservationsTab: React.FC<{
                 setSelectedRetroKeys([])
                 retroPager.resetPage()
               }}
-              className="h-8 rounded-[var(--radius-control)] border border-line bg-surface px-2.5 text-[12px] text-ink"
+              className="field-input h-8 px-2.5 text-[12px]"
             >
-              <option value="open">仅看待查看</option>
-              <option value="all">全部（含历史已处理）</option>
+              <option value="open">仅看待处理</option>
+              <option value="all">全部（含历史）</option>
               <option value="resolved">已处理</option>
               <option value="dismissed">已忽略</option>
             </select>
@@ -955,7 +1080,7 @@ export const CluesObservationsTab: React.FC<{
                 const isOpen = item.status === 'open' || item.status === 'in_review'
                 const checked = selectedRetroKeys.includes(group.key)
                 return (
-                  <div key={group.key} className="py-3 space-y-2">
+                  <div key={group.key} className="py-3">
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div className="flex items-start gap-2 min-w-0 flex-1">
                         {isOpen && (
@@ -965,70 +1090,129 @@ export const CluesObservationsTab: React.FC<{
                             onChange={() =>
                               toggleSelect(group.key, selectedRetroKeys, setSelectedRetroKeys)
                             }
-                            className="mt-1 size-3.5 accent-[var(--accent)]"
+                            className="mt-1 size-3.5 accent-[var(--accent)] cursor-pointer"
                           />
                         )}
                         <button
                           type="button"
+                          aria-expanded={expanded}
                           onClick={() => toggleExpand(group.key)}
                           className="flex items-start gap-1.5 min-w-0 flex-1 text-left group"
                         >
-                          {expanded ? (
-                            <ChevronDown className="w-4 h-4 text-accent shrink-0 mt-0.5" />
-                          ) : (
-                            <ChevronRight className="w-4 h-4 text-ink-4 shrink-0 mt-0.5 group-hover:text-ink" />
-                          )}
+                          <ChevronRight
+                            className={`w-4 h-4 shrink-0 mt-0.5 transition-transform duration-200 ease-[var(--ease-out-quint)] ${
+                              expanded
+                                ? 'rotate-90 text-accent'
+                                : 'text-ink-4 group-hover:text-ink'
+                            }`}
+                          />
                           <div className="min-w-0 flex-1 space-y-1">
                             <div className="flex flex-wrap items-center gap-1.5">
                               <StatusBadge status={item.status} />
                               <span className="chip">{labelOf(RETRO_KIND_LABELS, item.kind)}</span>
-                              <span className="chip">{labelOf(CLIENT_LABELS, item.client)}</span>
+                              {group.clients.map((c) => (
+                                <span key={c} className="chip">
+                                  {labelOf(CLIENT_LABELS, c)}
+                                </span>
+                              ))}
                               {group.count > 1 && (
                                 <span className="px-1.5 py-0.5 rounded bg-amber-soft text-amber-ink text-[11px] font-semibold num">
                                   同类 ×{group.count}
+                                </span>
+                              )}
+                              {group.maxAttempt > 0 && (
+                                <span className="px-1.5 py-0.5 rounded bg-bg-sunk border border-line-soft text-ink-3 text-[11px] num">
+                                  最高连试 {group.maxAttempt} 次
                                 </span>
                               )}
                               <span className="num text-[11.5px] text-ink-4">
                                 最近 {formatDateYMD(item.created_at)}
                               </span>
                             </div>
-                            <p className="text-[13px] text-ink line-clamp-1">{item.summary}</p>
+                            <p className="text-[13px] text-ink line-clamp-1">
+                              {group.advisory?.normalized_summary || item.summary}
+                            </p>
+                            {group.advisory && (
+                              <div className="flex flex-wrap items-center gap-1.5 text-[11.5px]">
+                                <span
+                                  className={
+                                    group.advisory.verdict === 'keep'
+                                      ? 'px-1.5 py-0.5 rounded bg-accent-soft text-accent font-medium'
+                                      : group.advisory.verdict === 'ignore'
+                                        ? 'px-1.5 py-0.5 rounded bg-bg-sunk border border-line-soft text-ink-3 font-medium'
+                                        : 'px-1.5 py-0.5 rounded bg-amber-soft text-amber-ink font-medium'
+                                  }
+                                >
+                                  {group.advisory.verdict_label}
+                                </span>
+                                <span className="text-ink-3">{group.advisory.reason}</span>
+                              </div>
+                            )}
                           </div>
                         </button>
                       </div>
                       {isOpen && (
                         <div className="flex items-center gap-1.5 shrink-0">
-                          <button
-                            type="button"
-                            disabled={busy}
-                            onClick={() => handleRetroGroupStatus(group.ids, 'resolved')}
-                            className="h-7 px-2.5 rounded-[var(--radius-mark)] bg-ok-soft text-ok-ink text-[12px] font-medium"
-                          >
-                            {group.count > 1 ? `整组已处理 (${group.count})` : '已处理'}
-                          </button>
-                          <button
-                            type="button"
-                            disabled={busy}
-                            onClick={() => handleRetroGroupStatus(group.ids, 'dismissed')}
-                            className="h-7 px-2.5 rounded-[var(--radius-mark)] border border-line text-ink-3 text-[12px]"
-                          >
-                            忽略
-                          </button>
+                          {group.advisory?.verdict === 'ignore' ? (
+                            <>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => handleRetroGroupStatus(group.ids, 'dismissed')}
+                                className="pressable h-7 px-2.5 rounded-[var(--radius-mark)] bg-bg-sunk border border-line-strong text-ink text-[12px] font-medium hover:bg-surface disabled:opacity-50"
+                              >
+                                {group.count > 1 ? `整组忽略 (${group.count})` : '忽略'}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => handleRetroGroupStatus(group.ids, 'resolved')}
+                                className="pressable h-7 px-2.5 rounded-[var(--radius-mark)] border border-line text-ink-3 text-[12px] hover:text-ink disabled:opacity-50"
+                              >
+                                已处理
+                              </button>
+                            </>
+                          ) : (
+                            <>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => handleRetroGroupStatus(group.ids, 'resolved')}
+                                className="pressable h-7 px-2.5 rounded-[var(--radius-mark)] bg-ok-soft text-ok-ink text-[12px] font-medium disabled:opacity-50"
+                              >
+                                {group.count > 1 ? `整组已处理 (${group.count})` : '已处理'}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => handleRetroGroupStatus(group.ids, 'dismissed')}
+                                className="pressable h-7 px-2.5 rounded-[var(--radius-mark)] border border-line text-ink-3 text-[12px] hover:text-ink disabled:opacity-50"
+                              >
+                                忽略
+                              </button>
+                            </>
+                          )}
                         </div>
                       )}
                     </div>
-                    {expanded && (
-                      <div className="ml-8 rounded-[var(--radius-tile)] bg-bg-sunk/60 border border-line-soft p-3 text-[12px] text-ink-3 space-y-1">
+                    <Collapse open={expanded} lazy>
+                      <div className="ml-8 mt-2 rounded-[var(--radius-tile)] bg-bg-sunk/60 border border-line-soft p-3 text-[12px] text-ink-3 space-y-1.5">
                         <p className="text-ink-2">{item.summary}</p>
+                        {group.advisory?.matched_preference && (
+                          <p className="text-[11.5px] text-accent">
+                            关联个人红线：{group.advisory.matched_preference}
+                          </p>
+                        )}
                         <div className="flex flex-wrap gap-3 text-[11.5px] text-ink-4 mono">
                           {item.tool_name && <span>工具：{item.tool_name}</span>}
                           <span>合并条数：{group.count}</span>
+                          {group.maxAttempt > 0 && <span>最高连续尝试：{group.maxAttempt} 次</span>}
                           {group.sessions.length > 0 && (
                             <span>涉及会话：{group.sessions.slice(0, 3).join(', ')}</span>
                           )}
                         </div>
                       </div>
-                    )}
+                    </Collapse>
                   </div>
                 )
               })}

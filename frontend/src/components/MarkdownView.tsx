@@ -40,7 +40,9 @@ export const MarkdownView: React.FC<{ content: string; className?: string }> = (
   content,
   className = '',
 }) => {
-  const lines = content.replace(/\r\n/g, '\n').split('\n')
+  // Strip leading YAML frontmatter (`---\n...\n---`) so notes read cleanly without raw metadata walls
+  const cleaned = content.replace(/\r\n/g, '\n').replace(/^---\n[\s\S]*?\n---\n*/, '')
+  const lines = cleaned.split('\n')
   const blocks: React.ReactNode[] = []
   let i = 0
   let key = 0

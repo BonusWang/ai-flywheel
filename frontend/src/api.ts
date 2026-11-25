@@ -218,8 +218,17 @@ export const api = {
     req<{ observation: MistakeObservation }>(`/api/site/observations/${obsId}/archive`, {
       method: 'POST',
     }),
+  restoreObservation: (obsId: string) =>
+    req<{ observation: MistakeObservation }>(`/api/site/observations/${obsId}/restore`, {
+      method: 'POST',
+    }),
   bulkArchiveObservations: (obsIds: string[]) =>
     req<{ updated: number }>('/api/site/observations/bulk-archive', {
+      method: 'POST',
+      body: JSON.stringify({ obs_ids: obsIds }),
+    }),
+  bulkRestoreObservations: (obsIds: string[]) =>
+    req<{ updated: number }>('/api/site/observations/bulk-restore', {
       method: 'POST',
       body: JSON.stringify({ obs_ids: obsIds }),
     }),

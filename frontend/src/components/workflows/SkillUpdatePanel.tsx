@@ -1,10 +1,10 @@
 import React, { useEffect, useState } from 'react'
-import { ChevronDown, ChevronUp } from 'lucide-react'
+import { ChevronDown } from 'lucide-react'
 import { api } from '../../api'
 import { MarkdownView } from '../MarkdownView'
+import { Collapse } from '../ui/Collapse'
 import type { PlannedWrite, SkillPreview } from '../../types'
 
-/** The Skill a planned write targets, read off its relative path ("<slug>/SKILL.md"). */
 export function skillSlugOf(pw: PlannedWrite): string {
   const raw = (pw.relative_path || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
   const parts = raw.split('/').filter(Boolean)
@@ -14,10 +14,6 @@ export function skillSlugOf(pw: PlannedWrite): string {
   return parts[0] || ''
 }
 
-/**
- * The existing Skill an update would append to: its size, its section outline and — on
- * demand — its full text, so the approver can compare the old file with the new section.
- */
 export const SkillUpdatePanel: React.FC<{ pw: PlannedWrite }> = ({ pw }) => {
   const slug = skillSlugOf(pw)
   const [preview, setPreview] = useState<SkillPreview | null>(null)
@@ -67,19 +63,29 @@ export const SkillUpdatePanel: React.FC<{ pw: PlannedWrite }> = ({ pw }) => {
         </ul>
       )}
       {preview && (
-        <button
-          type="button"
-          onClick={() => setExpanded((v) => !v)}
-          className="inline-flex items-center gap-1 text-[11.5px] text-accent-ink hover:underline"
-        >
-          {expanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-          {expanded ? '收起现有全文' : '对照现有全文'}
-        </button>
-      )}
-      {expanded && preview && (
-        <div className="max-h-48 overflow-y-auto rounded-[var(--radius-control)] bg-surface border border-line-soft p-2">
-          <MarkdownView content={preview.content} />
-        </div>
+        <>
+          <button
+            type="button"
+            aria-expanded={expanded}
+            onClick={(e) => {
+              e.preventDefault()
+              setExpanded((v) => !v)
+            }}
+            className="pressable inline-flex items-center gap-1 text-[11.5px] text-accent-ink hover:underline"
+          >
+            <ChevronDown
+              className={`w-3 h-3 transition-transform duration-200 ease-[var(--ease-out-quint)] ${
+                expanded ? 'rotate-180' : ''
+              }`}
+            />
+            {expanded ? '收起现有全文' : '对照现有全文'}
+          </button>
+          <Collapse open={expanded} lazy>
+            <div className="mt-1.5 max-h-48 overflow-y-auto rounded-[var(--radius-control)] bg-surface border border-line-soft p-2">
+              <MarkdownView content={preview.content} />
+            </div>
+          </Collapse>
+        </>
       )}
       {error && <div className="text-[11.5px] text-hot">读取现有文件失败：{error}</div>}
     </div>

@@ -71,8 +71,10 @@ EXPECTED_ROUTES: tuple[tuple[str, str], ...] = (
     ("POST", "/api/site/rules/{rule_id}/transition"),
     ("GET", "/api/site/observations"),
     ("POST", "/api/site/observations/bulk-archive"),
+    ("POST", "/api/site/observations/bulk-restore"),
     ("POST", "/api/site/observations/{obs_id}/promote"),
     ("POST", "/api/site/observations/{obs_id}/archive"),
+    ("POST", "/api/site/observations/{obs_id}/restore"),
     ("GET", "/api/site/dissents"),
     ("POST", "/api/site/dissents"),
     ("POST", "/api/site/dissents/bulk-status"),
@@ -215,7 +217,7 @@ def test_every_application_route_survives_the_split(tmp_path: Path):
     app = create_app(runtime=_runtime(tmp_path), process_role="cli")
     registered = _registered_routes(app)
     assert registered == set(EXPECTED_ROUTES)
-    assert len(EXPECTED_ROUTES) == 63
+    assert len(EXPECTED_ROUTES) == 65
 
 
 def test_mcp_stays_mounted_and_the_spa_catch_all_stays_last(tmp_path: Path):

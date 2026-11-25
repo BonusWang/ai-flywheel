@@ -12,17 +12,20 @@ import {
   PauseCircle,
   Shield,
   ShieldAlert,
-  X,
 } from 'lucide-react'
-import type { PageKey } from '../App'
+import type { NavigateFn } from '../App'
 import { api } from '../api'
 import { MarkdownView } from '../components/MarkdownView'
 import { AsideCard, ReadingLayout } from '../components/PageLayout'
 import { CoreCardModal } from '../components/rules/CoreCardModal'
 import { StatusBadge } from '../components/StatusBadge'
+import { AnimatedNumber } from '../components/ui/AnimatedNumber'
+import { DocumentReaderModal } from '../components/ui/DocumentReaderModal'
 import {
   APPROVAL_MODE_LABELS,
+  FRESHNESS_TIER_SHORT,
   formatDateYMD,
+  formatShanghaiToday,
   labelOf,
   RULE_STATUS_LABELS,
   SINK_TYPE_LABELS,
@@ -37,20 +40,49 @@ import type {
 
 interface Props {
   overview: OverviewResponse | null
-  onNavigate: (page: PageKey) => void
+  onNavigate: NavigateFn
   onRefresh: () => void
 }
 
-function todayFormatted() {
-  const now = new Date()
-  const week = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][now.getDay()]
-  return `${now.getMonth() + 1}月${now.getDate()}日 · ${week}`
-}
-
-const FRESHNESS_TIER_SHORT: Record<string, string> = {
-  volatile: '30天',
-  evolving: '90天',
-  evergreen: '180天',
+function HomeSkeleton() {
+  const aside = (
+    <>
+      <div className="card p-5 space-y-3">
+        <div className="skeleton-block h-4 w-28" />
+        <div className="skeleton-block h-10 w-full" />
+        <div className="skeleton-block h-10 w-full" />
+      </div>
+      <div className="card p-5 space-y-2.5">
+        <div className="skeleton-block h-4 w-24" />
+        <div className="skeleton-block h-12 w-full" />
+      </div>
+    </>
+  )
+  return (
+    <ReadingLayout aside={aside}>
+      <div className="space-y-5" aria-busy="true">
+        <div className="pb-4 border-b border-line space-y-2.5">
+          <div className="skeleton-block h-7 w-40" />
+          <div className="skeleton-block h-4 w-80 max-w-full" />
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+          {[0, 1, 2, 3].map((i) => (
+            <div key={i} className="card p-4 space-y-2.5">
+              <div className="skeleton-block h-3.5 w-20" />
+              <div className="skeleton-block h-7 w-24" />
+              <div className="skeleton-block h-3 w-32" />
+            </div>
+          ))}
+        </div>
+        <div className="card p-5 space-y-3">
+          <div className="skeleton-block h-5 w-44" />
+          <div className="skeleton-block h-4 w-full" />
+          <div className="skeleton-block h-4 w-5/6" />
+          <div className="skeleton-block h-4 w-3/4" />
+        </div>
+      </div>
+    </ReadingLayout>
+  )
 }
 
 export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
@@ -61,11 +93,7 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
   const [growth, setGrowth] = useState<GrowthMetricsLive | null>(null)
   const [coreCard, setCoreCard] = useState<CoreCardPayload | null>(null)
   const [showCoreCardModal, setShowCoreCardModal] = useState(false)
-  const [readingDoc, setReadingDoc] = useState<{
-    doc_path: string
-    content: string
-    sha256: string
-  } | null>(null)
+  const [readingDoc, setReadingDoc] = useState<{ path: string; title: string } | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -90,17 +118,8 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
     }
   }, [overview?.metrics.workflow_runs_total, overview?.metrics.preflight_activations])
 
-  const openDoc = async (path: string) => {
-    try {
-      const data = await api.readKnowledgeDoc(path)
-      setReadingDoc(data)
-    } catch {
-      // ignore
-    }
-  }
-
   if (!overview) {
-    return <div className="py-20 text-center text-[13px] text-ink-4">正在加载控制面态势...</div>
+    return <HomeSkeleton />
   }
 
   const { site, metrics, latest_run, recent_rules, safety_valves } = overview
@@ -124,9 +143,9 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
   const policy = automations?.policy
   const scheduleSummaryText = sched
     ? sched.enabled
-      ? `${sched.human_schedule}${sched.friday_weekly_enabled ? '（含周五蒸馏）' : ''}`
-      : '自动调度已暂停（可随时手动触发）'
-    : '读取调度状态中…'
+      ? `${sched.human_schedule.replace('（上海时间）', '')}${sched.friday_weekly_enabled ? ' · 含周五精简' : ''}`
+      : '自动整理已暂停'
+    : '读取中…'
 
   const effectiveApprovalLabel = policy
     ? labelOf(APPROVAL_MODE_LABELS, policy.effective_approval_mode, policy.effective_approval_mode)
@@ -134,7 +153,6 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
       ? '全部自动'
       : '智能审批'
 
-  // Extract P00 triage stats from latest run if present
   const p00Node = latest_run?.nodes.find((n) => n.node_id === 'P00_PREPARE')
   const triageReport = (p00Node?.payload as any)?.triage_report as
     | { checked?: number; skipped?: number; admitted?: number }
@@ -163,7 +181,7 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
                 <div className="text-[13px] font-medium text-ink leading-snug">{r.title}</div>
                 <div className="mt-1.5 flex items-center justify-between gap-2 text-[11.5px] text-ink-4">
                   <span className="text-ink-3">{labelOf(RULE_STATUS_LABELS, r.status)}</span>
-                  <span className="num">已拦截/提醒 {r.hit_count} 次</span>
+                  <span className="num">已提醒 {r.hit_count} 次</span>
                 </div>
               </div>
             ))}
@@ -171,10 +189,10 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
         )}
         <button
           type="button"
-          onClick={() => onNavigate('rules')}
-          className="mt-3.5 inline-flex items-center gap-0.5 text-[12px] font-semibold text-accent hover:text-accent-ink"
+          onClick={() => onNavigate('rules', { rulesTab: 'rules' })}
+          className="pressable mt-3.5 inline-flex items-center gap-0.5 text-[12px] font-semibold text-accent hover:text-accent-ink"
         >
-          进入规则与进化中心
+          查看全部避坑规则
           <ChevronRight className="w-3.5 h-3.5" />
         </button>
       </AsideCard>
@@ -184,13 +202,12 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
         title={
           <span className="inline-flex items-center gap-1.5">
             <Layers className="w-3.5 h-3.5 text-accent" />
-            跨端核心索引卡
+            AI 随身速查卡
           </span>
         }
       >
         <p className="text-[12px] text-ink-3 leading-relaxed">
-          通过 <code className="mono text-[11px] text-ink-2">flywheel://core-card</code>{' '}
-          暴露给多端智能体的热态治理摘要（≤200 行硬上限）。
+          每次对话自动带给 AI 的核心规矩精要，严格控制在 200 行内不挤占上下文。
         </p>
         {coreCard && (
           <div className="mt-2.5 flex items-center justify-between text-[12px] text-ink-3">
@@ -203,9 +220,9 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
         <button
           type="button"
           onClick={() => setShowCoreCardModal(true)}
-          className="mt-3 inline-flex items-center gap-1 text-[12px] font-semibold text-accent hover:text-accent-ink"
+          className="pressable mt-3 inline-flex items-center gap-1 text-[12px] font-semibold text-accent hover:text-accent-ink"
         >
-          预览 FLYWHEEL-CORE.md
+          预览速查卡内容
           <ChevronRight className="w-3.5 h-3.5" />
         </button>
       </AsideCard>
@@ -215,7 +232,7 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
         title={
           <span className="inline-flex items-center gap-1.5">
             <CalendarClock className="w-3.5 h-3.5 text-accent" />
-            调度与安全阀实况
+            调度与护栏状态
           </span>
         }
         className="!bg-panel-quiet"
@@ -226,23 +243,29 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
             <span className="text-ink font-medium text-right">{scheduleSummaryText}</span>
           </div>
           <div className="flex items-center justify-between gap-2">
-            <span className="text-ink-3">有效审批模式</span>
+            <span className="text-ink-3">写入审批</span>
             <span className="text-ink font-medium">{effectiveApprovalLabel}</span>
           </div>
           <div className="flex items-center justify-between gap-2">
-            <span className="text-ink-3">安全阀护栏</span>
+            <span className="text-ink-3">运行护栏</span>
             <span className="text-ink-2 text-[12px]">
-              {safety_valves.workflow_enabled ? '流水线开' : '流水线关'} ·{' '}
-              {safety_valves.auto_approve_writes ? '允许全自动' : '强制审批否决'}
+              {safety_valves.workflow_enabled ? '自动整理已开' : '自动整理已关'} ·{' '}
+              {safety_valves.auto_approve_writes ? '允许全自动' : '写入前须确认'}
             </span>
           </div>
           <div className="flex items-center justify-between gap-2">
             <span className="text-ink-3">最近批次</span>
             {latest_run ? (
-              <span className="inline-flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() =>
+                  onNavigate('runs', { runsTab: 'pipeline', runId: latest_run.run_id })
+                }
+                className="pressable inline-flex items-center gap-1.5 hover:opacity-85"
+              >
                 <span className="num text-ink-2">{formatDateYMD(latest_run.started_at)}</span>
                 <StatusBadge status={latest_run.status} />
-              </span>
+              </button>
             ) : (
               <span className="text-ink-4">暂无</span>
             )}
@@ -251,9 +274,9 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
         <button
           type="button"
           onClick={() => onNavigate('automations')}
-          className="mt-3.5 inline-flex items-center gap-0.5 text-[12px] font-semibold text-accent hover:text-accent-ink"
+          className="pressable mt-3.5 inline-flex items-center gap-0.5 text-[12px] font-semibold text-accent hover:text-accent-ink"
         >
-          管理自动化调度与蒸馏
+          管理定时调度与周五精简
           <ChevronRight className="w-3.5 h-3.5" />
         </button>
       </AsideCard>
@@ -263,159 +286,225 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
   return (
     <ReadingLayout aside={aside}>
       <div className="space-y-5">
-        {/* 1. Control Plane Header */}
+        {/* 1. Header */}
         <header className="pb-4 border-b border-line">
           <div className="flex flex-wrap items-baseline justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <h1 className="text-[24px] font-semibold leading-[1.3] text-ink">今日态势</h1>
-              <span className="chip">治理与进化控制面</span>
-            </div>
-            <span className="num text-[12.5px] text-ink-4">{todayFormatted()}</span>
+            <h1 className="text-[24px] font-semibold leading-[1.3] text-ink">今日态势</h1>
+            <span className="hidden lg:inline num text-[12.5px] text-ink-4">
+              {formatShanghaiToday()}
+            </span>
           </div>
           <div className="mt-2 flex flex-wrap items-center justify-between gap-3">
             <p className="text-[13.5px] text-ink-3">
               {brand.name} · 开工查规矩、完工交证据、沉淀经审批、经验抗腐烂。
             </p>
-            <button
-              type="button"
-              onClick={() => onNavigate('runs')}
-              className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[var(--radius-control)] border border-line bg-surface text-ink-2 text-[12.5px] font-medium hover:border-line-strong hover:text-ink transition-colors"
-            >
-              <GitBranch className="w-3.5 h-3.5 text-accent" />
-              沉淀与审批台
-            </button>
+            {!awaitingApproval && (
+              <button
+                type="button"
+                onClick={() =>
+                  onNavigate('runs', {
+                    runsTab: metrics.sessions_pending > 0 ? 'queue' : 'pipeline',
+                    queueStatus: metrics.sessions_pending > 0 ? 'queued' : undefined,
+                  })
+                }
+                className="pressable inline-flex items-center gap-1.5 h-8 px-3 rounded-[var(--radius-control)] border border-line bg-surface text-ink-2 text-[12.5px] font-medium hover:border-line-strong hover:text-ink"
+              >
+                <GitBranch className="w-3.5 h-3.5 text-accent" />
+                {metrics.sessions_pending > 0
+                  ? `去整理待审对话 (${metrics.sessions_pending})`
+                  : '沉淀与审批'}
+              </button>
+            )}
           </div>
         </header>
 
-        {/* 2. Actionable Governance Alerts */}
+        {/* 2. Actionable Governance Alerts (every chip deep-links straight to the target view) */}
         {awaitingApproval && latest_run && (
           <section className="rounded-[var(--radius-card)] border border-amber/40 bg-amber-soft/50 px-4 py-3 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2 text-[13px] text-ink">
               <PauseCircle className="w-4 h-4 text-amber-ink shrink-0" />
               <span>
                 <strong className="num font-semibold">{formatDateYMD(latest_run.started_at)}</strong>{' '}
-                批次生成了{' '}
+                批次整理出{' '}
                 <strong className="num font-semibold">{latest_run.planned_writes.length}</strong>{' '}
-                项受控写入计划，等待你的审批
+                项写入建议，确认后才会落盘
               </span>
             </div>
             <button
               type="button"
-              onClick={() => onNavigate('runs')}
-              className="inline-flex items-center gap-1 h-7 px-3 rounded-[var(--radius-control)] bg-amber text-white text-[12px] font-semibold hover:opacity-90"
+              onClick={() =>
+                onNavigate('runs', { runsTab: 'pipeline', runId: latest_run.run_id })
+              }
+              className="pressable inline-flex items-center gap-1 h-8 px-3.5 rounded-[var(--radius-control)] bg-amber text-amber-contrast text-[12.5px] font-semibold hover:opacity-90"
             >
-              去审批
+              立即审批
               <ChevronRight className="w-3.5 h-3.5" />
             </button>
           </section>
         )}
 
         {!awaitingApproval && governanceAlertsCount > 0 && (
-          <section className="rounded-[var(--radius-card)] border border-line-strong bg-surface-2 px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 text-[12.5px]">
+          <section className="rounded-[var(--radius-card)] border border-line-strong bg-surface-2 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2.5 text-[12.5px]">
             <div className="flex flex-wrap items-center gap-2 text-ink-2">
               <AlertTriangle className="w-4 h-4 text-amber-ink shrink-0" />
-              <span>当前治理待办：</span>
+              <span>需要你留意：</span>
               {openDissents > 0 && (
-                <span className="chip">{openDissents} 条未决分歧</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onNavigate('rules', { rulesTab: 'clues', cluesSub: 'dissents' })
+                  }
+                  className="pressable chip hover:border-accent/50 hover:text-ink"
+                >
+                  {openDissents} 条规则分歧待处理
+                  <ChevronRight className="w-3 h-3 text-ink-4" />
+                </button>
               )}
               {expiredCards > 0 && (
-                <span className="chip">{expiredCards} 篇经验卡待复核</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onNavigate('rules', { rulesTab: 'assets', assetsDocFilter: 'expired' })
+                  }
+                  className="pressable chip hover:border-accent/50 hover:text-ink"
+                >
+                  {expiredCards} 篇笔记待复核
+                  <ChevronRight className="w-3 h-3 text-ink-4" />
+                </button>
               )}
               {staleSkills > 0 && (
-                <span className="chip">{staleSkills} 个 Skill 待检修/清理</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onNavigate('rules', { rulesTab: 'assets', assetsSkillFilter: 'failing' })
+                  }
+                  className="pressable chip hover:border-accent/50 hover:text-ink"
+                >
+                  {staleSkills} 个 Skill 待检修
+                  <ChevronRight className="w-3 h-3 text-ink-4" />
+                </button>
               )}
             </div>
-            <button
-              type="button"
-              onClick={() => onNavigate('rules')}
-              className="inline-flex items-center gap-0.5 text-[12px] font-semibold text-accent hover:text-accent-ink"
-            >
-              去处理
-              <ChevronRight className="w-3.5 h-3.5" />
-            </button>
           </section>
         )}
 
-        {/* 3. 4-Card Governance KPI Strip */}
+        {/* 3. 4-Card Clickable KPI Strip (direct deep-links + animated numbers) */}
         <section className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
-          <div className="card p-4">
+          <button
+            type="button"
+            onClick={() => onNavigate('rules', { rulesTab: 'outcomes' })}
+            className="card-interactive p-4 text-left"
+          >
             <div className="flex items-center justify-between text-[11.5px] text-ink-4">
-              <span>真实证据通过率</span>
+              <span>实测交付率</span>
               <CheckCircle2 className="w-3.5 h-3.5 text-ok" />
             </div>
             <div className="mt-1.5 text-[22px] font-bold text-ink num">
-              {metrics.real_verification_rate !== null
-                ? `${metrics.real_verification_rate}%`
-                : '暂无样本'}
+              {metrics.real_verification_rate !== null ? (
+                <AnimatedNumber value={metrics.real_verification_rate} suffix="%" />
+              ) : (
+                '暂无样本'
+              )}
             </div>
-            <div className="mt-1 text-[11.5px] text-ink-4 num">
-              预检激活 {metrics.preflight_activations} 次 · 验收 {metrics.natural_outcomes_total} 次
+            <div className="mt-1 text-[11.5px] text-ink-4 num whitespace-nowrap truncate">
+              开局提醒 {metrics.preflight_activations} · 验收 {metrics.natural_outcomes_total} 次
             </div>
-          </div>
+          </button>
 
-          <div className="card p-4">
+          <button
+            type="button"
+            onClick={() => onNavigate('rules', { rulesTab: 'rules' })}
+            className="card-interactive p-4 text-left"
+          >
             <div className="flex items-center justify-between text-[11.5px] text-ink-4">
               <span>规则健康度</span>
               <Shield className="w-3.5 h-3.5 text-accent" />
             </div>
             <div className="mt-1.5 text-[22px] font-bold text-ink num">
-              {activeRulesCount}{' '}
+              <AnimatedNumber value={activeRulesCount} />{' '}
               <span className="text-[12.5px] font-normal text-ink-3">条生效</span>
             </div>
             <div className="mt-1 text-[11.5px] text-ink-4 num">
-              {verifiedRules} 已验证 · {unverifiedRules} 试运行 · {dormantRules} 休眠
+              {verifiedRules} 已生效 · {unverifiedRules} 试运行 · {dormantRules} 休眠
             </div>
-          </div>
+          </button>
 
-          <div className="card p-4">
+          <button
+            type="button"
+            onClick={() =>
+              onNavigate('rules', {
+                rulesTab: 'clues',
+                cluesSub: growth && growth.red_count > 0 ? 'action' : 'observations',
+              })
+            }
+            className="card-interactive p-4 text-left"
+          >
             <div className="flex items-center justify-between text-[11.5px] text-ink-4">
               <span>错题观察池</span>
               <ShieldAlert className="w-3.5 h-3.5 text-amber-ink" />
             </div>
             <div className="mt-1.5 text-[22px] font-bold text-ink num">
-              {growth ? growth.observing_pool_count : metrics.open_retro_count}{' '}
+              <AnimatedNumber
+                value={growth ? growth.observing_pool_count : metrics.open_retro_count}
+              />{' '}
               <span className="text-[12.5px] font-normal text-ink-3">待观察</span>
             </div>
-            <div className="mt-1 text-[11.5px] text-ink-4 num">
+            <div className="mt-1 flex items-center gap-1.5 text-[11.5px] text-ink-4 num whitespace-nowrap overflow-hidden">
               {growth && growth.red_count > 0 ? (
-                <span className="text-hot font-medium">🔴 {growth.red_count} 沉默错</span>
+                <span className="inline-flex items-center gap-1 text-hot font-medium shrink-0">
+                  <span className="size-1.5 rounded-full bg-hot" />
+                  {growth.red_count} 条漏检
+                </span>
               ) : (
-                <span>无沉默高危错</span>
+                <span className="shrink-0">无高危漏检</span>
               )}
-              {' · '}
-              {growth?.sample_sufficient
-                ? `自查拦截 ${Math.round(growth.self_catch_rate * 100)}%`
-                : `复盘线索 ${metrics.open_retro_count}`}
+              <span className="shrink-0">·</span>
+              <span className="truncate">
+                {growth?.sample_sufficient
+                  ? `自查拦截 ${Math.round(growth.self_catch_rate * 100)}%`
+                  : `线索 ${metrics.open_retro_count}`}
+              </span>
             </div>
-          </div>
+          </button>
 
-          <div className="card p-4">
+          <button
+            type="button"
+            onClick={() =>
+              onNavigate('runs', {
+                runsTab: metrics.sessions_pending > 0 ? 'queue' : 'pipeline',
+                queueStatus: metrics.sessions_pending > 0 ? 'queued' : undefined,
+              })
+            }
+            className="card-interactive p-4 text-left"
+          >
             <div className="flex items-center justify-between text-[11.5px] text-ink-4">
-              <span>会话与自动化</span>
+              <span>待整理对话</span>
               <Activity className="w-3.5 h-3.5 text-accent" />
             </div>
             <div className="mt-1.5 text-[22px] font-bold text-ink num">
-              {metrics.sessions_pending}{' '}
-              <span className="text-[12.5px] font-normal text-ink-3">待审会话</span>
+              <AnimatedNumber value={metrics.sessions_pending} />{' '}
+              <span className="text-[12.5px] font-normal text-ink-3">段待处理</span>
             </div>
             <div className="mt-1 text-[11.5px] text-ink-4 truncate">
-              {sched?.running ? `调度中 · ${sched.human_schedule.replace('（上海时间）', '')}` : '自动调度已暂停'}
+              {sched?.running
+                ? `定时中 · ${sched.human_schedule.replace('（上海时间）', '')}`
+                : '自动调度已暂停'}
             </div>
-          </div>
+          </button>
         </section>
 
-        {/* 4. Latest P00-P07 Governance Digest */}
+        {/* 4. Latest P00-P07 Digest */}
         <section className="card p-5">
           <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-line-soft">
             <div className="flex items-center gap-2">
               <FileText className="w-4 h-4 text-accent" />
-              <h2 className="text-[15.5px] font-bold text-ink">最近一次治理批次摘要</h2>
+              <h2 className="text-[15.5px] font-bold text-ink">最近一次整理摘要</h2>
             </div>
             {latest_run && (
               <div className="flex flex-wrap items-center gap-2">
                 {triageReport && (triageReport.checked || 0) > 0 && (
                   <span className="chip num">
-                    初筛 {triageReport.checked} → 跳过噪音 {triageReport.skipped || 0}
+                    初筛 {triageReport.checked} → 跳过闲聊 {triageReport.skipped || 0}
                   </span>
                 )}
                 <span className="num text-[12px] text-ink-4">
@@ -431,33 +520,45 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
                 <MarkdownView content={latest_run.digest_markdown} />
               ) : (
                 <p className="text-[13px] text-ink-4 py-2">
-                  这一批还在等待审批或执行中，完成后会在这里展示摘要报告。
+                  这一批还在等待审批或整理中，完成后会在这里展示摘要报告。
                 </p>
               )}
               <div className="mt-4 pt-2.5 border-t border-line-soft flex justify-end">
                 <button
                   type="button"
-                  onClick={() => onNavigate('runs')}
-                  className="inline-flex items-center gap-0.5 text-[12px] font-medium text-accent hover:text-accent-ink"
+                  onClick={() =>
+                    onNavigate('runs', { runsTab: 'pipeline', runId: latest_run.run_id })
+                  }
+                  className="pressable inline-flex items-center gap-0.5 text-[12px] font-medium text-accent hover:text-accent-ink"
                 >
-                  查看 8 节点流水线与审计轨迹
+                  查看本批完整进度与明细
                   <ChevronRight className="w-3.5 h-3.5" />
                 </button>
               </div>
             </div>
           ) : (
-            <p className="text-[13px] text-ink-4 py-6 text-center">
-              还没有批次记录，去「沉淀与审批」启动第一轮治理流水线吧。
-            </p>
+            <div className="py-6 text-center space-y-2.5">
+              <p className="text-[13px] text-ink-4">
+                还没有整理批次，启动第一轮即可自动提炼知识笔记与避坑规则。
+              </p>
+              <button
+                type="button"
+                onClick={() => onNavigate('runs')}
+                className="pressable inline-flex items-center gap-1 h-8 px-3.5 rounded-[var(--radius-control)] bg-accent text-accent-contrast text-[12.5px] font-medium hover:bg-accent-ink"
+              >
+                前往沉淀与审批
+                <ChevronRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
           )}
         </section>
 
-        {/* 5. Controlled Write Assets (secondary, with freshness status) */}
+        {/* 5. Recent Knowledge Notes */}
         <section className="card p-5">
           <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-line-soft">
             <div className="flex items-center gap-2">
               <BookOpen className="w-4 h-4 text-ok" />
-              <h2 className="text-[15px] font-bold text-ink">近期受控写入的 Markdown 资产</h2>
+              <h2 className="text-[15px] font-bold text-ink">最近沉淀的知识笔记</h2>
             </div>
             <div className="flex items-center gap-2">
               {sinkInfo && (
@@ -465,32 +566,38 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
               )}
               <button
                 type="button"
-                onClick={() => onNavigate('rules')}
-                className="text-[12px] text-accent hover:text-accent-ink font-medium"
+                onClick={() => onNavigate('rules', { rulesTab: 'assets' })}
+                className="pressable inline-flex items-center gap-0.5 text-[12px] text-accent hover:text-accent-ink font-medium"
               >
-                保鲜明细 →
+                保鲜明细
+                <ChevronRight className="w-3.5 h-3.5" />
               </button>
             </div>
           </div>
           {!docsLoaded ? (
-            <p className="text-[13px] text-ink-4 py-6 text-center">正在加载受控资产...</p>
+            <div className="space-y-2.5 pt-3" aria-busy="true">
+              {[0, 1, 2].map((i) => (
+                <div key={i} className="skeleton-block h-11 w-full" />
+              ))}
+            </div>
           ) : docs.length === 0 ? (
-            <p className="text-[13px] text-ink-4 py-6 text-center">当前落点还没有受控写入的文档。</p>
+            <p className="text-[13px] text-ink-4 py-6 text-center">当前目录还没有沉淀的知识笔记。</p>
           ) : (
             <div className="divide-y divide-line-soft mt-1">
               {docs.slice(0, 8).map((d) => (
                 <button
                   key={d.doc_path}
                   type="button"
-                  onClick={() => openDoc(d.doc_path)}
-                  className="w-full text-left py-2.5 px-2 -mx-2 rounded-[var(--radius-tile)] hover:bg-bg-sunk/70 transition-colors flex items-center justify-between gap-3"
+                  onClick={() => setReadingDoc({ path: d.doc_path, title: d.title })}
+                  className="pressable w-full text-left py-2.5 px-2 -mx-2 rounded-[var(--radius-tile)] hover:bg-bg-sunk/70 flex items-center justify-between gap-3"
                 >
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
                       <span className="text-[13.5px] font-medium text-ink truncate">{d.title}</span>
                       {d.is_expired && (
-                        <span className="px-1.5 py-0.5 rounded bg-amber-soft text-amber-ink text-[10.5px] font-semibold shrink-0">
-                          ⚠️ 待复核
+                        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-soft text-amber-ink text-[10.5px] font-semibold shrink-0">
+                          <span className="size-1.5 rounded-full bg-amber" />
+                          待复核
                         </span>
                       )}
                     </div>
@@ -502,7 +609,7 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
                         {FRESHNESS_TIER_SHORT[d.freshness_tier] || d.freshness_tier}
                       </span>
                     )}
-                    <span>{(d.size_bytes / 1024).toFixed(1)} KB</span>
+                    {d.size_bytes > 0 && <span>{(d.size_bytes / 1024).toFixed(1)} KB</span>}
                   </div>
                 </button>
               ))}
@@ -511,29 +618,12 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
         </section>
       </div>
 
-      {/* Note Reader Modal */}
-      {readingDoc && (
-        <div className="fixed inset-0 z-50 bg-ink/35 backdrop-blur-[1px] flex items-center justify-center p-4">
-          <div className="card max-w-2xl w-full max-h-[82vh] flex flex-col overflow-hidden">
-            <div className="px-5 py-3.5 border-b border-line flex items-center justify-between bg-surface-2">
-              <div className="mono text-[13px] font-semibold text-ink truncate">
-                {readingDoc.doc_path}
-              </div>
-              <button
-                type="button"
-                onClick={() => setReadingDoc(null)}
-                className="p-1.5 rounded-[var(--radius-control)] hover:bg-bg-sunk text-ink-3"
-                aria-label="关闭"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <div className="p-5 overflow-y-auto">
-              <MarkdownView content={readingDoc.content} />
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Shared Document Reader Modal */}
+      <DocumentReaderModal
+        docPath={readingDoc?.path ?? null}
+        title={readingDoc?.title}
+        onClose={() => setReadingDoc(null)}
+      />
 
       {/* Core Card Modal */}
       <CoreCardModal

@@ -1,14 +1,15 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowRight, Wrench } from 'lucide-react'
-import type { PageKey } from '../App'
+import type { NavigateFn } from '../App'
 import { api } from '../api'
 import { CopyButton } from '../components/CodeBlock'
 import { FlywheelRiver } from '../components/FlywheelRiver'
-import { labelOf, RULE_STATUS_LABELS } from '../lib/labels'
+import { AnimatedNumber } from '../components/ui/AnimatedNumber'
+import { DOMAIN_LABELS, labelOf, RULE_STATUS_LABELS } from '../lib/labels'
 import type { AboutPayload, RiverSource, RuleRecord } from '../types'
 
 interface Props {
-  onNavigate: (page: PageKey) => void
+  onNavigate: NavigateFn
   refreshToken: number
 }
 
@@ -31,9 +32,11 @@ function Figure({ n, unit }: { n: number; unit: string }) {
   const f = formatFigure(n)
   return (
     <div className="flex items-baseline gap-1.5">
-      <span className="num text-[30px] font-black leading-none tracking-[-0.03em] text-ink xl:text-[36px]">
-        {f.value}
-      </span>
+      <AnimatedNumber
+        value={n}
+        format={(val) => formatFigure(val).value}
+        className="text-[30px] font-black leading-none tracking-[-0.03em] text-ink xl:text-[36px]"
+      />
       <span className="text-[13px] text-ink-3">
         {f.unit}
         {unit}
@@ -65,7 +68,7 @@ function LatestRule({
     <button
       type="button"
       onClick={onClick}
-      className={`group block text-left ${className}`}
+      className={`pressable group block text-left ${className}`}
     >
       <span className="text-[11px] font-semibold tracking-[0.2em] text-accent">活跃先例规则</span>
       <span key={rule.rule_id} className="animate-fade-up mt-1.5 block">
@@ -73,10 +76,32 @@ function LatestRule({
           {rule.title}
         </span>
         <span className="mt-1 block truncate text-[12px] text-ink-4">
-          {labelOf(RULE_STATUS_LABELS, rule.status)} · {rule.domain}
+          {labelOf(RULE_STATUS_LABELS, rule.status)} · {labelOf(DOMAIN_LABELS, rule.domain, rule.domain)}
         </span>
       </span>
     </button>
+  )
+}
+
+function AboutSkeleton() {
+  return (
+    <div className="mx-auto max-w-[var(--page-max-reading)] pb-14 pt-2 space-y-10" aria-busy="true">
+      <div className="space-y-4">
+        <div className="skeleton-block h-4 w-36" />
+        <div className="skeleton-block h-12 w-2/3" />
+        <div className="skeleton-block h-16 w-4/5" />
+      </div>
+      <div className="skeleton-block h-[260px] w-full rounded-[var(--radius-card)]" />
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+        {[0, 1, 2, 3].map((i) => (
+          <div key={i} className="space-y-3">
+            <div className="skeleton-block h-5 w-24" />
+            <div className="skeleton-block h-9 w-28" />
+            <div className="skeleton-block h-20 w-full" />
+          </div>
+        ))}
+      </div>
+    </div>
   )
 }
 
@@ -104,7 +129,7 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
   }, [rules.length])
 
   if (!data) {
-    return <div className="py-20 text-center text-[13px] text-ink-4">正在加载关于页与接口清单...</div>
+    return <AboutSkeleton />
   }
 
   const { site, metrics, endpoints, mcp_tools } = data
@@ -129,19 +154,19 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
       title: '异常与复盘',
       figure: <Figure n={metrics.open_retro_count} unit="条待复盘" />,
       text: '执行中触发重复报错死循环、高风险操作或验证回归时，自动记录异常信号并推入复盘队列；普通失误先按根因聚类，满 3 次才晋升为规则。',
-      note: `累计登记 ${metrics.sessions_total} 个会话 · 待处理 ${metrics.sessions_pending} 个`,
+      note: `累计登记 ${metrics.sessions_total} 个会话 · 待整理 ${metrics.sessions_pending} 个`,
     },
     {
       no: '03',
       title: '规则沉淀',
       figure: <Figure n={activeRules} unit="条活跃规则" />,
-      text: '新规则先以「试运行」立即生效防复发，经跨会话自然真实验证后晋升「已验证生效」；分歧与反例保留不覆盖，并按 30/90/180 天新鲜度衰减、周五蒸馏持续做减法。',
-      note: `已验证 ${verifiedRules} 条 · 待自然验证 ${unverifiedRules} 条`,
+      text: '新规则先以「试运行」立即生效防复发，经跨会话自然真实验证后晋升「已生效」；分歧与反例保留不覆盖，并按 30/90/180 天新鲜度衰减、周五精简持续做减法。',
+      note: `已生效 ${verifiedRules} 条 · 试运行 ${unverifiedRules} 条`,
     },
     {
       no: '04',
       title: '闭环运行',
-      figure: <Figure n={metrics.workflow_runs_total} unit="次工作流" />,
+      figure: <Figure n={metrics.workflow_runs_total} unit="次整理" />,
       text: 'P00–P07 受控沉淀流水线定时或按需审查会话：P02/P03 严格只读，审批通过后 P04 才执行唯一受控写入，把有效规律安全回写至知识库与防线。',
       note: '同时暴露 MCP、Hook、REST API 与 /llms.txt',
     },
@@ -149,7 +174,7 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
 
   return (
     <div className="mx-auto max-w-[var(--page-max-reading)] pb-14 pt-2 lg:pt-1">
-      {/* 1. AIHOT-inspired Editorial Hero */}
+      {/* 1. Editorial Hero */}
       <header className="grid items-end gap-8 lg:grid-cols-[minmax(0,1fr)_auto]">
         <div>
           <Kicker>关于 {brand.name}</Kicker>
@@ -165,7 +190,7 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
             <span className="font-medium text-ink">{brand.subtitle}</span>
             」把跨客户端的{' '}
             <span className="num font-semibold text-ink">{metrics.preflight_activations}</span>{' '}
-            次预检激活与{' '}
+            次开局提醒与{' '}
             <span className="num font-semibold text-ink">{activeRules}</span>{' '}
             条先例规则收拢成一套实时可验证的协作飞轮——以可审计、可回溯的工程闭环守住交付质量，而不是黑盒聊天记忆库。
           </p>
@@ -174,14 +199,14 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
           <button
             type="button"
             onClick={() => onNavigate('runs')}
-            className="inline-flex h-10 items-center gap-1.5 rounded-[var(--radius-control)] bg-accent px-4 text-[14px] font-semibold text-accent-contrast transition-colors hover:bg-accent-ink"
+            className="pressable inline-flex h-10 items-center gap-1.5 rounded-[var(--radius-control)] bg-accent px-4 text-[14px] font-semibold text-accent-contrast hover:bg-accent-ink"
           >
             查看沉淀与审批 <ArrowRight className="w-4 h-4" />
           </button>
           <button
             type="button"
             onClick={() => onNavigate('settings')}
-            className="inline-flex h-10 items-center gap-1.5 rounded-[var(--radius-control)] border border-line bg-surface px-4 text-[14px] font-medium text-ink transition-colors hover:border-line-strong hover:bg-bg-sunk"
+            className="pressable inline-flex h-10 items-center gap-1.5 rounded-[var(--radius-control)] border border-line bg-surface px-4 text-[14px] font-medium text-ink hover:border-line-strong hover:bg-bg-sunk"
           >
             接入与设置
           </button>
@@ -201,7 +226,7 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
         >
           <LatestRule
             rule={rules[at]}
-            onClick={() => onNavigate('rules')}
+            onClick={() => onNavigate('rules', { rulesTab: 'rules' })}
             className="absolute left-[75%] top-[calc(42%+42px)] hidden w-[25%] px-6 lg:block"
           />
         </FlywheelRiver>
@@ -210,7 +235,7 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
         </p>
         <LatestRule
           rule={rules[at]}
-          onClick={() => onNavigate('rules')}
+          onClick={() => onNavigate('rules', { rulesTab: 'rules' })}
           className="mt-2 border-t border-line pt-4 lg:hidden"
         />
 
@@ -223,7 +248,7 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
               onPointerLeave={() => setFocus(null)}
               onFocus={() => setFocus(i)}
               onBlur={() => setFocus(null)}
-              className={`border-line py-6 outline-none transition-colors ${STAGE_CELL[i]} ${
+              className={`border-line py-6 outline-none transition-colors duration-[180ms] ease-[var(--ease-out-quint)] ${STAGE_CELL[i]} ${
                 focus === i ? 'bg-accent-softer' : ''
               }`}
             >
@@ -241,7 +266,7 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
         </ol>
       </section>
 
-      {/* 3. MCP Protocol & Capabilities (2-Column Editorial Layout) */}
+      {/* 3. MCP Protocol & Capabilities */}
       <section
         aria-labelledby="mcp-protocol"
         className="mt-16 grid gap-10 border-t border-line pt-12 xl:mt-20 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.08fr)] lg:gap-14"
@@ -258,7 +283,6 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
             支持 Claude Code、Codex、Claude Desktop、Antigravity 等任意 MCP 客户端旁路接入，通过 Streamable HTTP 或 Stdio CLI 直接调用执行期门禁与后台沉淀能力。
           </p>
 
-          {/* MCP Endpoints */}
           <div className="mt-6 space-y-2.5">
             <div className="text-[12px] font-semibold tracking-[0.06em] text-ink-4 uppercase">
               MCP Endpoint
@@ -284,14 +308,13 @@ export const AboutPage: React.FC<Props> = ({ onNavigate, refreshToken }) => {
           </div>
         </div>
 
-        {/* Right Column: Available MCP Tools */}
         <div className="min-w-0">
           <div className="flex items-center justify-between">
             <Kicker>MCP TOOLS · {mcp_tools.length} 个核心工具</Kicker>
             <button
               type="button"
-              onClick={() => onNavigate('settings')}
-              className="inline-flex items-center gap-1 text-[12.5px] font-medium text-accent hover:underline"
+              onClick={() => onNavigate('settings', { settingsTab: 'connect' })}
+              className="pressable inline-flex items-center gap-1 text-[12.5px] font-medium text-accent hover:underline"
             >
               配置客户端接入 <ArrowRight className="w-3.5 h-3.5" />
             </button>

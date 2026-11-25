@@ -51,18 +51,18 @@ export const RETRO_KIND_LABELS: Record<string, string> = {
 
 /** Fallback labels for every distill-queue status, used when no dictionary is loaded. */
 export const QUEUE_STATUS_LABELS: Record<string, string> = {
-  queued: '排队中',
+  queued: '待整理',
   processing: '处理中',
   processed: '已沉淀',
-  excluded: '已排除',
+  excluded: '已移出',
   withdrawn: '已撤回',
-  dead_letter: '死信',
+  dead_letter: '处理失败',
 }
 
 /** Fallback labels for every ingress channel, used when no dictionary is loaded. */
 export const INGRESS_CHANNEL_LABELS: Record<string, string> = {
-  mcp_explicit: 'MCP 显式入队',
-  manual_portal: '控制台手动入队',
+  mcp_explicit: 'AI 主动提交',
+  manual_portal: '手动添加',
   codex_archive: 'Codex 归档',
   claude_exit: 'Claude 退出',
   legacy_scan: '历史扫描',
@@ -86,7 +86,7 @@ export const TRIGGER_LABELS: Record<string, string> = {
   scheduled: '定时调度',
   api: '手动触发',
   cli: '命令行触发',
-  manual: '手工补录',
+  manual: '手动添加',
   seed: '示例数据',
   test: '演练',
 }
@@ -100,8 +100,8 @@ export const FEISHU_LISTENER_STATE_LABELS: Record<string, string> = {
 }
 
 export const PHASE_LABELS: Record<string, string> = {
-  daily: '每日沉淀',
-  weekly: '周五复盘',
+  daily: '每日整理',
+  weekly: '周五精简',
   both: '每日 + 周复盘',
   auto: '自动（按日期）',
 }
@@ -111,13 +111,63 @@ export const SINK_TYPE_LABELS: Record<string, string> = {
   local_markdown_wiki: '本地知识库',
 }
 
-/** Every rule status has its own label: "active or not" is not the question. */
+/** Unified freshness tiers for knowledge notes. */
+export const FRESHNESS_TIER_SHORT: Record<string, string> = {
+  volatile: '30天',
+  evolving: '90天',
+  evergreen: '180天',
+}
+
+export const FRESHNESS_TIER_LABELS: Record<string, string> = {
+  volatile: '30天保鲜',
+  evolving: '90天保鲜',
+  evergreen: '180天保鲜',
+}
+
+/** Unified rule status labels across cards, filters, and badges. */
 export const RULE_STATUS_LABELS: Record<string, string> = {
-  verified_active: '已验证生效',
-  unverified_active: '试运行（待自然验证）',
-  needs_revision: '需修订',
+  verified_active: '已生效',
+  unverified_active: '试运行',
+  needs_revision: '需修改',
   dormant: '已休眠',
   retired: '已停用',
+}
+
+/** Unified dissent status labels. */
+export const DISSENT_STATUS_LABELS: Record<string, string> = {
+  open: '待处理',
+  merged: '已纳入规则',
+  dismissed: '已忽略',
+}
+
+/** Unified outcome status labels (used by OutcomesLedgerTab & StatusBadge). */
+export const OUTCOME_STATUS_LABELS: Record<string, string> = {
+  success: '已通过',
+  partial: '部分完成',
+  failed: '未通过',
+}
+
+export const DOMAIN_LABELS: Record<string, string> = {
+  engineering: '工程实践',
+  workflow: '协作流程',
+  ops: '发布运维',
+  data: '数据与存储',
+  security: '安全合规',
+  general: '通用',
+}
+
+export const ANTI_LAZINESS_MODE_LABELS: Record<string, string> = {
+  baseline: '基础规范模式',
+  execution: '严格执行模式',
+  disabled: '未启用',
+}
+
+/** Respect OS `prefers-reduced-motion` for programmatic scrolling. */
+export function preferredScrollBehavior(): ScrollBehavior {
+  if (typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    return 'auto'
+  }
+  return 'smooth'
 }
 
 export function labelOf(
@@ -150,14 +200,51 @@ export function dictLabels(
   return merged
 }
 
+/** Product-facing "today" label strictly in Asia/Shanghai timezone. */
+export function formatShanghaiToday(now: Date = new Date()): string {
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    month: 'numeric',
+    day: 'numeric',
+    weekday: 'short',
+  }).formatToParts(now)
+  const month = parts.find((p) => p.type === 'month')?.value || ''
+  const day = parts.find((p) => p.type === 'day')?.value || ''
+  const weekday = parts.find((p) => p.type === 'weekday')?.value || ''
+  return `${month}月${day}日 · ${weekday}`
+}
+
 export function formatDateYMD(iso: string | null | undefined): string {
   if (!iso) return '—'
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return iso.slice(0, 10)
-  const y = d.getFullYear()
-  const m = String(d.getMonth() + 1).padStart(2, '0')
-  const day = String(d.getDate()).padStart(2, '0')
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(d)
+  const y = parts.find((p) => p.type === 'year')?.value || ''
+  const m = parts.find((p) => p.type === 'month')?.value || ''
+  const day = parts.find((p) => p.type === 'day')?.value || ''
   return `${y}-${m}-${day}`
+}
+
+export function formatShanghaiTimestamp(iso: string | null | undefined): string {
+  if (!iso) return '暂无'
+  const dt = new Date(iso)
+  if (Number.isNaN(dt.getTime())) return iso
+  const fmt = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  })
+  return fmt.format(dt).replace(/\//g, '-')
 }
 
 export function formatRelativeTime(iso: string | null | undefined): string {
