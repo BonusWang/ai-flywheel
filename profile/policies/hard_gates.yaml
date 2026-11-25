@@ -10,6 +10,10 @@ retry_breaker:
   max_same_cause_retries: 2
   alert_at_attempt: 3
   mode: "warning_only" # Always fail-open, never hard-block tool calls
+  ignore_tools:
+    - "update_plan"
+    - "todo_write"
+    - "list_sessions"
 
 high_risk_patterns:
   - "rm -rf"

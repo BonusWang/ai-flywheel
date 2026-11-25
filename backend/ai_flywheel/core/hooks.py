@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from ai_flywheel.core.retro_advisory import is_benign_tool, is_text_edit_tool
 from ai_flywheel.models import (
     IngressChannel,
     PreflightRequest,
@@ -144,29 +145,34 @@ class ThinHookProcessor:
         lower_input = input_str.strip().lower()
 
         hard_gates = self.runtime.policies.get_hard_gates()
+        breaker = hard_gates.get("retry_breaker", {})
+        extra_ignore = breaker.get("ignore_tools") if isinstance(breaker, dict) else None
+        if is_benign_tool(tool_name, extra_ignore if isinstance(extra_ignore, list) else None):
+            return {"continue": True}
+
         warnings: list[str] = []
 
-        # 1. High-risk pattern warning
-        for pattern in hard_gates.get("high_risk_patterns", []):
-            if str(pattern).lower() in lower_input:
-                msg = f"检测到高危命令模式 `{pattern}`（工具: {tool_name}），请先核对范围、备份与授权边界。"
-                warnings.append(f"[ai-flywheel·高危观察] {msg}")
-                self.runtime.receipts.report_signal(
-                    ReportSignalRequest(
-                        client=client,
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        kind=SignalKind.HIGH_RISK_TOOL,
-                        severity="high",
-                        summary=msg,
-                        tool_name=tool_name,
-                        detail={"pattern": pattern},
+        # 1. High-risk pattern warning (execution tools only; skip source/text editors)
+        if not is_text_edit_tool(tool_name):
+            for pattern in hard_gates.get("high_risk_patterns", []):
+                if str(pattern).lower() in lower_input:
+                    msg = f"检测到高危命令模式 `{pattern}`（工具: {tool_name}），请先核对范围、备份与授权边界。"
+                    warnings.append(f"[ai-flywheel·高危观察] {msg}")
+                    self.runtime.receipts.report_signal(
+                        ReportSignalRequest(
+                            client=client,
+                            session_id=session_id,
+                            turn_id=turn_id,
+                            kind=SignalKind.HIGH_RISK_TOOL,
+                            severity="high",
+                            summary=msg,
+                            tool_name=tool_name,
+                            detail={"pattern": pattern},
+                        )
                     )
-                )
-                break
+                    break
 
         # 2. Retry-loop breaker (default alert at >= 3 identical attempts in same turn)
-        breaker = hard_gates.get("retry_breaker", {})
         if breaker.get("enabled", True):
             alert_at = int(breaker.get("alert_at_attempt", 3))
             fp = canonical_hash({"tool": tool_name, "input": input_str[:500]})[:16]

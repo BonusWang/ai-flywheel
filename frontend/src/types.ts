@@ -91,6 +91,17 @@ export interface GrowthMetricsPayload {
   history: Array<Record<string, any>>
 }
 
+export interface RetroAdvisory {
+  group_key: string
+  normalized_summary: string
+  attempt: number
+  verdict: 'ignore' | 'review' | 'keep'
+  verdict_label: string
+  recommended_action: 'dismissed' | 'resolved'
+  reason: string
+  matched_preference?: string
+}
+
 export interface RetroItem {
   retro_id: string
   session_key: string
@@ -102,6 +113,7 @@ export interface RetroItem {
   rule_id: string | null
   detail: Record<string, unknown>
   status: 'open' | 'in_review' | 'resolved' | 'dismissed'
+  advisory?: RetroAdvisory
   created_at: string
   updated_at: string
 }
