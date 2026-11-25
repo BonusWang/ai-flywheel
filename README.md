@@ -53,6 +53,20 @@ flowchart LR
 
 ---
 
+## 3+1 通用生态架构
+
+![AI Flywheel 3+1 Ecosystem Architecture](./docs/architecture.svg)
+
+AI Flywheel 采用「**3+1**」通用生态定位：最外层是一个不持有事实源的**客户端网关与分发层**（Model Routing `/v1` · MCP Hub · Static Asset Sync，明确标注 **Non-SSOT**），面向 Claude Code、Codex、Claude Desktop、Antigravity 等 AI 客户端；其内是三个可独立治理的内核角色：
+
+- **AI Flywheel（治理与进化引擎）**：MCP 6 Tools + 4 Resources、执行期证据门禁、P00–P07 受控流水线、SQLite FTS5、5+1 控制面与多通道审批——所有决策事实源的唯一归属。
+- **外部策略与装备仓（可选覆盖）**：通过 `profile.override_dir` 只读挂载 policies / triggers、`skills/` 与 `agents/`；P04 对 `SKILL.md` 只做追加式更新（旧文件逐字节为新文件前缀）。
+- **挂载知识库（本地 Markdown / Obsidian Wiki）**：人类可读、可进 Git 的知识资产；`.wiki-schema.md` 写入门禁、FTS5 回读索引与 P04 审批后受控写入。
+
+> **v0.6.1 更新指引**：新增上述 3+1 生态架构图与统一 6 段 [`AGENTS.md`](./AGENTS.md) 宪法；`verify_repo.py` 公开仓卫生门禁扩展到 `.svg`；`openspec/config.yaml` 目录与分层描述对齐 v0.6.1 源码结构，并完成 8 个 v0.5 / v0.6 OpenSpec 变更的归档与基线同步。
+
+---
+
 ## 工作原理：一条执行闭环 + 一条受控进化流水线
 
 ### 1. 执行期闭环（标准 MCP：6 Tools + 4 Resources）
@@ -83,7 +97,7 @@ AI 工具通过 `http://127.0.0.1:8765/mcp`（Streamable HTTP）或 `flywheel mc
 
 ---
 
-## 核心能力（v0.6）
+## 核心能力（v0.6.1）
 
 ### 1. 策略与知识解耦 + 执行期实证门禁
 - 反偷懒契约、循环保护阈值、证据分级（`real / test / static / unknown`）与个人协作偏好独立托管在 `profile/policies/`，无需绑定特定知识库。

@@ -47,7 +47,7 @@ TBD - created by archiving change feat-feishu-approval-card-loop. Update Purpose
 - **THEN** 该投递只恢复同步重试，飞书上不出现第二条消息
 
 ### Requirement: 提问卡的发送形态
-提问卡的飞书投递 SHALL 仅在以下条件全部满足时发送为可点击的交互卡片：发送方是 `serve` 进程；交互模式已开启；交互模式自检有效；点击监听就绪；接收人是私聊用户且发送身份为机器人。任一条件不满足时系统 MUST 退回文本通知；文本通知 MUST 是另一条消息、另一条投递记录，不与交互投递共用幂等键，并把退回原因写入交互投递记录、追加审计事件。
+提问卡的飞书投递 SHALL 仅在以下条件全部满足时发送为可点击的交互卡片：发送方是 `serve` 进程；交互模式已开启；交互模式自检有效；点击监听就绪；接收人是私聊用户且发送身份为机器人。任一条件不满足时系统 MUST 退回文本通知；文本通知 MUST 是另一条消息、另一条投递记录，不与交互投递共用幂等键，并把退回原因写入交互投递记录、追加审计事件。文本通知末尾的引导文案 MUST 区分「交互模式未开启」「已开启但尚未通过链路自检」与「飞书按钮暂不可用（监听或发送异常、非 `serve` 进程）」，不得将未开启交互模式误报为按钮故障。
 
 点击监听处于启动中或临时退避时属暂缓：投递保持待发送、不计尝试次数，暂缓从投递首次被判为暂缓时起算并持久化，最长 120 秒，监听恢复就绪即清零，超时仍未就绪再退回文本。`serve` 启动后的首次补投 MUST 等点击监听给出第一个状态之后才执行。非 `serve` 进程登记投递后 MUST 立即在本进程完成这条投递的首次发送。飞书通道启用但未配置接收人时，投递 MUST 记为已跳过并写明原因，不计入重试。
 
@@ -55,13 +55,21 @@ TBD - created by archiving change feat-feishu-approval-card-loop. Update Purpose
 - **WHEN** `serve` 运行中，交互模式已开启、自检有效、监听就绪，接收人是私聊用户，此时有运行挂起
 - **THEN** 飞书收到带按钮的交互卡片
 
-#### Scenario: 监听临时退避时先暂缓
-- **WHEN** 点击监听处于 10 秒级的临时退避中，此时有运行挂起，随后监听恢复就绪
-- **THEN** 提问卡在监听恢复后以交互卡片送达，没有退回文本
+#### Scenario: 未开启交互模式时文本文案如实说明
+- **WHEN** `serve` 运行中，飞书通道已启用但 `delivery.feishu_cli.interactive` 为关闭状态，此时有运行挂起
+- **THEN** 飞书收到纯文本通知，文案提示当前未开启交互审批卡片而非误报「飞书按钮暂不可用」
+
+#### Scenario: 未通过自检时文本文案提示自检
+- **WHEN** `serve` 运行中，交互模式已开启且点击监听就绪，但链路自检尚未通过或已失效，此时有运行挂起
+- **THEN** 飞书收到纯文本通知，文案提示尚未通过链路自检并引导到电脑前处理或运行自检
 
 #### Scenario: 监听不可用时退回文本
 - **WHEN** 点击监听已因永久性错误停止，此时有运行挂起
-- **THEN** 飞书收到一条纯文本通知，交互投递记录写明退回原因
+- **THEN** 飞书收到一条纯文本通知，文案提示飞书按钮暂不可用，交互投递记录写明退回原因
+
+#### Scenario: 监听临时退避时先暂缓
+- **WHEN** 点击监听处于 10 秒级的临时退避中，此时有运行挂起，随后监听恢复就绪
+- **THEN** 提问卡在监听恢复后以交互卡片送达，没有退回文本
 
 #### Scenario: 非 serve 进程触发时退回文本
 - **WHEN** 命令行触发的运行在独立进程里挂起，登记后由该进程完成首次发送
@@ -128,11 +136,15 @@ TBD - created by archiving change feat-feishu-approval-card-loop. Update Purpose
 - **THEN** 这张卡片被改为提示到电脑前处理且不再带按钮；重新打开交互模式并就绪后按钮恢复
 
 ### Requirement: 外发文本清洗
-发往飞书的全部文本（提问卡、文本通知、失败告警、完成通知、回写内容）MUST 经清洗与脱敏后再发送：剔除控制字符、格式字符、代理字符与非字符，折叠空白，把尖括号与命令行特殊字符全角化，把链接样式去活化，剥离 private 片段并按密钥样式掩码；清洗后为空用占位符。
+发往飞书的全部文本（提问卡、文本通知、失败告警、完成通知、回写内容）MUST 经清洗与脱敏后再发送：剔除控制字符、格式字符、代理字符与非字符，折叠空白，把尖括号与命令行特殊字符全角化，把链接样式去活化，剥离 private 片段并按密钥样式掩码；清洗后为空用占位符。纯文本审批通知中的触发原因（`reasons`）、写入项标题与摘要 MUST 全部经过上述清洗与脱敏，写入项类型 MUST 使用中文标签呈现，拼接多个原因或追加说明时 MUST 消除相邻重复终结标点（如 `。；`）。
 
 #### Scenario: 标题含特殊字符与密钥样式文本
 - **WHEN** 某项写入的标题含引号、尖括号、换行、双向控制符，摘要里有一段密钥样式的字符串
 - **THEN** 发往飞书的内容里控制字符与密钥样式内容不出现
+
+#### Scenario: 审批原因含敏感片段与尾部句号
+- **WHEN** 挂起原因中包含 `<private>` 片段、密钥样式文本或末尾带有 `。` 的多条原因，且触发了纯文本审批通知
+- **THEN** 发往飞书的纯文本通知中敏感片段与密钥样式内容不出现，原因间不出现 `。；` 叠加，且条目类型显示中文标签而非内部英文枚举
 
 #### Scenario: 失败原因带敏感片段
 - **WHEN** 某次运行失败，失败原因里带一段 private 片段
@@ -205,13 +217,21 @@ TBD - created by archiving change feat-feishu-approval-card-loop. Update Purpose
 - **THEN** 只有第一次产生效果与审计，第二次被按事件编号去重
 
 ### Requirement: 交互模式自检
-`serve` SHALL 提供人工触发的自检，并复用它自己的点击监听器，MUST NOT 另起消费者。自检 SHALL 依次完成：检查 lark-cli 版本与机器人身份；发送测试卡片；修改测试卡片；等待审批人点击（默认 120 秒，长等待模式 10 分钟）；把结果写回测试卡片并去掉按钮。每次自检 MUST 使用独立的卡片编号与幂等键。任一步失败 MUST 给出具体原因并以失败收场；超时 MUST 把测试卡片改为已失效；`serve` 启动时 MUST 把遗留的未完成测试卡片补改为已失效。
+`serve` SHALL 提供人工触发的自检，并复用它自己的点击监听器，MUST NOT 另起消费者。自检 SHALL 依次完成：检查交互模式已开启、lark-cli 版本与机器人身份；发送测试卡片；修改测试卡片；等待审批人点击（默认 120 秒，长等待模式 10 分钟）；把结果写回测试卡片并去掉按钮。交互模式未开启时自检 MUST 立即失败并说明需先开启交互模式，不得空等监听器超时。每次自检 MUST 使用独立的卡片编号与幂等键。任一步失败 MUST 给出具体原因并以失败收场；超时 MUST 把测试卡片改为已失效；`serve` 启动时 MUST 把遗留的未完成测试卡片补改为已失效。
 
-自检结果 MUST 持久化并在控制台可见，并带有指纹（可执行文件路径、版本、文件哈希、审批人集合、接收人、发送身份）；指纹里任何一项变化 MUST 使其失效。指纹里的审批人集合 MUST 取有效审批人集合的去重排序结果，与回答校验共用同一个归一化函数。测试卡片 MUST 存放在提问卡表里、运行编号用固定占位值，按运行编号读取提问卡的查询 MUST 限定类型。
+自检结果 MUST 持久化并在控制台可见，状态查询接口 MUST 同时返回通道启用标记、交互模式开关与监听可用性，便于控制台区分未开启交互模式与监听异常；Web 控制台 SHALL 提供交互模式开关、额外审批人配置与触发自检入口，且在运行时通过配置接口补齐飞书启用条件后 MUST 无需重启即可唤醒监听并运行自检。自检结果 MUST 带有指纹（可执行文件路径、版本、文件哈希、审批人集合、接收人、发送身份）；指纹里任何一项变化 MUST 使其失效。指纹里的审批人集合 MUST 取有效审批人集合的去重排序结果，与回答校验共用同一个归一化函数。测试卡片 MUST 存放在提问卡表里、运行编号用固定占位值，按运行编号读取提问卡的查询 MUST 限定类型。
 
 #### Scenario: 链路完整
 - **WHEN** 运行自检，飞书应用已订阅卡片回调且审批人点击了测试卡片
 - **THEN** 自检报告通过，测试卡片显示已收到且不再带按钮
+
+#### Scenario: 未开启交互模式时触发自检立即失败
+- **WHEN** `delivery.feishu_cli.interactive` 为关闭状态时触发自检
+- **THEN** 自检立即返回失败原因（提示先开启交互模式），不空等监听超时
+
+#### Scenario: 控制台热开启交互模式后可立即监听与自检
+- **WHEN** `serve` 运行期间维护者通过配置接口开启 `delivery.feishu_cli.interactive` 并保存有效私聊接收人
+- **THEN** 点击监听器被立即唤醒进入启动/就绪流程，无需重启服务即可触发并完成链路自检
 
 #### Scenario: 点击者不是审批人
 - **WHEN** 测试卡片被点击，但点击者不在审批人名单里
@@ -270,4 +290,104 @@ TBD - created by archiving change feat-feishu-approval-card-loop. Update Purpose
 #### Scenario: 默认配置
 - **WHEN** 配置未显式开启交互模式
 - **THEN** 交互模式关闭
+
+### Requirement: 通用 Webhook 通知通道
+`delivery.webhook` 启用且 `url` 非空时，系统 SHALL 以 JSON POST 向该地址推送四类事件：`awaiting_approval`（运行挂起等待审批）、`run_completed`（运行完成）、`run_failed`（运行失败）、`fyi`（日常通知）。载荷 MUST 包含 `event_type`、`run_id`、`status`、`summary`、`portal_url`、`reasons`、`planned_writes` 与 `sent_at`；每个写入项 MUST 只带 `action`、`target_kind`、`title`、`relative_path`、`sensitive` 这些紧凑字段，`sensitive` MUST 与 `models.is_sensitive_write` 的判定一致。`fyi` MUST 受 `notify_on_fyi` 控制，默认关闭；审批、完成与失败通知 MUST NOT 受该开关影响。Webhook 未启用或 `url` 为空时 MUST 不发起任何请求，并返回说明原因的结构化结果。
+
+#### Scenario: 运行挂起时推送审批通知
+- **WHEN** Webhook 已启用并配置了 URL，某次运行挂起等待审批
+- **THEN** 该地址收到一条 `event_type = awaiting_approval` 的 JSON 请求，载荷列出挂起原因与本次的写入项
+
+#### Scenario: 运行失败时推送告警
+- **WHEN** Webhook 已启用并配置了 URL，某次运行在某个节点失败
+- **THEN** 该地址收到一条 `event_type = run_failed` 的 JSON 请求，载荷带失败原因
+
+#### Scenario: 日常通知默认不推送
+- **WHEN** Webhook 已启用而 `notify_on_fyi` 关闭，系统产生一条 `fyi` 通知
+- **THEN** 不发起请求，结果说明 `notify_on_fyi` 未开启
+
+#### Scenario: 启用但未配置 URL
+- **WHEN** Webhook 已启用但 `url` 为空
+- **THEN** 不发起请求，结果说明 URL 为空
+
+### Requirement: Webhook 外发内容脱敏
+Webhook 载荷中的全部字符串（摘要、标题、原因、写入项标题与相对路径、审批理由等）MUST 在序列化之前经过 `core/privacy.py` 的同一套门禁：`<private>...</private>` 片段 MUST 被剥离，`SECRET_PATTERNS` 命中的密钥样式内容 MUST 被掩码。通道 MUST NOT 自建第二套密钥规则。脱敏不得抛出：一条通知的问题 MUST NOT 让运行失败。
+
+#### Scenario: 摘要含 private 片段
+- **WHEN** 待推送的摘要里有一段 `<private>...</private>`
+- **THEN** 请求体中不出现这段内容
+
+#### Scenario: 写入项标题含密钥样式字符串
+- **WHEN** 某个写入项的标题或审批理由里含 API key 样式的字符串
+- **THEN** 请求体中该字符串被掩码，其余字段照常送达
+
+### Requirement: Webhook 签名与失败处理
+配置了 `secret` 时，每个请求 MUST 携带 `X-Flywheel-Signature: sha256=<hex>`，其中 `<hex>` 是对**原始 UTF-8 JSON body** 计算的 HMAC-SHA256。每个请求 MUST 携带 `Content-Type: application/json` 与 `User-Agent: ai-flywheel/<version>`。连接失败、超时、非法 URL 与 HTTP 非 2xx MUST NOT 抛出异常，MUST 返回 `{channel, sent, status_code, reason}` 结构；这类失败 MUST NOT 改变运行状态与终态。`secret` MUST NOT 出现在日志、返回值、运行记录或配置导出中；配置导出 MUST 把该字段置空并给出 `secret_configured` 布尔值。
+
+#### Scenario: 签名可被验证
+- **WHEN** Webhook 配置了签名密钥并发送一条通知
+- **THEN** 请求头中的签名等于用同一密钥对请求体计算的 `sha256=<hex>`
+
+#### Scenario: 接收方返回 500
+- **WHEN** Webhook 接收方返回 HTTP 500
+- **THEN** 调用方得到 `sent = false` 与状态码 500，不抛出异常，运行状态不变
+
+#### Scenario: 请求超时
+- **WHEN** Webhook 请求超时
+- **THEN** 调用方得到 `sent = false` 与原因说明，不抛出异常，运行状态不变
+
+#### Scenario: 配置导出不泄露密钥
+- **WHEN** 已配置 Webhook 签名密钥，维护者打开或导出站点配置
+- **THEN** 导出中的 `delivery.webhook.secret` 为空，且 `secret_configured` 为真
+
+### Requirement: 通道自检覆盖 Webhook
+`flywheel doctor` 的 `channels` 检查 MUST 在 Webhook 启用时报告其可用性：启用且 URL 非空为 `PASS`，启用但 URL 为空为 `FAIL`。检查结果 MUST 只报告签名是否开启，MUST NOT 输出密钥内容。
+
+#### Scenario: 启用但未填 URL 的自检
+- **WHEN** `delivery.webhook.enabled` 为真而 `url` 为空，运行 `flywheel doctor`
+- **THEN** `channels` 检查为 `FAIL` 并指明 URL 为空
+
+#### Scenario: 签名开启的自检
+- **WHEN** Webhook 启用、URL 非空且配置了签名密钥
+- **THEN** `channels` 检查为 `PASS`，说明中只写签名已开启
+
+### Requirement: 审批通道契约
+系统 SHALL 以一个显式的审批通道契约描述编排器与运行时所依赖的全部通道能力：可用性查询（`availability`）、提问卡首次投递（`first_send`）、点击受理（`handle_click`）、启动（`start`）、停止（`stop`）与发件箱轮询（`tick`）。编排器 MUST 只通过该契约触发提问卡投递，MUST NOT 依赖某个具体通道实现的类型或模块。任一通道实现 MUST 同时提供上述全部能力；缺少任一能力的对象 MUST NOT 被装配为审批通道。
+
+#### Scenario: 飞书通道满足契约
+- **WHEN** 运行时装配了飞书审批通道
+- **THEN** 该对象通过契约检查，编排器在运行挂起时经 `first_send` 投递提问卡
+
+#### Scenario: 不完整的实现不被当作通道
+- **WHEN** 某个对象缺少契约要求的任一能力
+- **THEN** 契约检查不通过，该对象不会被装配为审批通道
+
+### Requirement: 通道实现的存放与兼容导入
+具体通道实现（卡片渲染、通道协调、点击监听、链路自检）MUST 位于适配器层，MUST NOT 位于领域引擎层。既有 `core.feishu_card`、`core.feishu_channel`、`core.feishu_check`、`core.feishu_listen` 导入路径 MUST 继续可用，且 MUST 解析到与适配器层完全相同的对象。
+
+#### Scenario: 旧导入路径仍可用
+- **WHEN** 既有代码从 `core.feishu_*` 导入卡片渲染器、通道类、自检服务或监听器
+- **THEN** 导入成功，且对象与从 `adapters.channels.feishu.*` 导入的是同一个
+
+#### Scenario: 实现只在适配器层
+- **WHEN** 维护者查找通道实现
+- **THEN** 卡片、通道、监听与自检的实现在适配器层，领域引擎层只保留再导出
+
+### Requirement: 门户 API 契约不变
+将门户 API 拆分为按业务域组织的路由模块后，全部既有 URL、HTTP 方法、状态码与响应结构 MUST 保持不变；应用 MUST 继续在 `/mcp` 挂载 MCP Streamable HTTP，并 MUST 在未命中 API 时回落到 SPA。
+
+#### Scenario: 路由表与拆分前一致
+- **WHEN** 完成路由拆分后创建应用
+- **THEN** 其注册的应用路由集合（方法 + 路径）与拆分前逐条一致
+
+#### Scenario: 错误语义不变
+- **WHEN** 客户端请求一个不存在的运行、规则、知识文档或 Skill
+- **THEN** 状态码与 `detail` 语义与拆分前一致
+
+### Requirement: 通道忙时的契约化反馈
+审批通道在续接运行遇到独占锁被占用时 MUST 依据契约级忙碌错误识别该结果，并保持卡片待决、提示另一批次正在执行；MUST NOT 依赖编排器模块的具体异常类型。
+
+#### Scenario: 另一批次持锁
+- **WHEN** 审批人点击卡片时另一个运行持有未过期的独占锁
+- **THEN** 通道识别为忙碌，卡片保持待决并提示可稍后再点，并追加一条说明原因的审计事件
 

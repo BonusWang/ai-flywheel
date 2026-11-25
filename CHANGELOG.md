@@ -3,6 +3,26 @@
 All notable changes to **AI Flywheel** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] - 2026-11-25
+
+### Added
+- **3+1 ecosystem architecture document** (`docs/architecture.svg`):
+  - Added a sanitized, vendor-neutral architecture view built around a **Non-SSOT** Client Gateway & Distribution Layer (Model Routing `/v1`, MCP Hub, Static Asset Sync) and three kernel roles: the AI Flywheel governance & evolution engine (MCP 6 Tools + 4 Resources, execution evidence gate, P00–P07 controlled pipeline, SQLite FTS5, 5+1 control plane, approval channels), the optional External Profile & Equipment Repo (`profile.override_dir` policies/triggers, `skills/`, `agents/`; read-only mount with P04 append-only skill updates), and the Mounted Knowledge Base (human-readable Git-tracked Markdown / Obsidian Wiki, `.wiki-schema.md` write gate, FTS5 read-back and approved P04 writes).
+- **Unified six-section `AGENTS.md` constitution** (`AGENTS.md`):
+  - Reorganized the repository contract into six sections — 3+1 ecosystem boundaries, architecture / package map / single sources of truth, the P00–P07 stage matrix and the eight non-negotiable guardrails, working agreement and hot-file discipline, verification and evidence grades, and Git collaboration rules. Every existing hard contract is preserved; the hot-file list now names `adapters/channels/feishu/*` as the implementation and `core/feishu_*.py` as thin compatibility shims.
+
+### Changed
+- **Version `0.6.1`** (`backend/ai_flywheel/__init__.py`, `pyproject.toml`, `frontend/package.json`, `profile/site.yaml`, `README.md`):
+  - Bumped the single version source and its parity layers to `0.6.1`, embedded the 3+1 ecosystem diagram in `README.md`, and added a concise release guide for this version.
+- **Public-repo hygiene now scans SVG** (`scripts/verify_repo.py`):
+  - Added `.svg` to `SCAN_SUFFIXES`, so personal paths, nicknames, private repository names and credentials are rejected in diagrams as well as in code, configuration and prose.
+- **OpenSpec baseline closure** (`openspec/`):
+  - Archived eight completed v0.5 / v0.6 changes — automation console, control-plane console views, onboarding CLI & neutral wiki gate, webhook approval & rule lineage, Feishu approval-loop UX & config, approval-channel abstraction, frontend page split, and orchestrator pipeline package — and synced their delta specs into `openspec/specs/`; `openspec/changes/` now contains only `archive/`.
+
+### Fixed
+- **Stale console wording and package map in `openspec/config.yaml`**:
+  - Corrected `4+1 Web 控制台` to `5+1 Web 控制台` and aligned the directory / layer description with the v0.6.1 source tree (`core/pipeline/`, `core/automation.py`, `core/approval_channel.py`, `core/doctor.py`, `core/onboarding.py`, `adapters/channels/`, `routes/`, plus the `core/feishu_*.py` compatibility-shim note).
+
 ## [0.6.0] - 2026-11-25
 
 ### Added

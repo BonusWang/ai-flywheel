@@ -1,0 +1,184 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" role="img" aria-labelledby="archTitle archDesc">
+  <title id="archTitle">AI Flywheel 3+1 ecosystem architecture</title>
+  <desc id="archDesc">A sanitized four-layer view: a non-SSOT client gateway and distribution layer on the outside, the AI Flywheel governance and evolution engine as the decision source of truth, an optional external profile and equipment repository, and a mounted local Markdown knowledge base.</desc>
+
+  <defs>
+    <filter id="softShadow" x="-8%" y="-8%" width="116%" height="124%">
+      <feDropShadow dx="0" dy="2" stdDeviation="6" flood-color="#0F172A" flood-opacity="0.07"/>
+    </filter>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563EB"/>
+    </marker>
+    <marker id="arrowSlate" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748B"/>
+    </marker>
+  </defs>
+
+  <!-- canvas -->
+  <rect x="0" y="0" width="1200" height="720" fill="#F5F7FB"/>
+
+  <!-- header -->
+  <text x="40" y="50" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="26" font-weight="700" fill="#0F172A">AI Flywheel · 3+1 Ecosystem Architecture</text>
+  <text x="40" y="74" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="12.5" fill="#64748B">Sanitized, vendor-neutral view · three abstract kernel roles plus one non-SSOT client gateway</text>
+  <text x="1160" y="50" text-anchor="end" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="12" fill="#94A3B8">PUBLIC · v0.6.1</text>
+  <line x1="40" y1="90" x2="1160" y2="90" stroke="#E2E8F0" stroke-width="1"/>
+
+  <!-- ================= layer 0: client gateway & distribution ================= -->
+  <g id="client-gateway-distribution">
+    <rect x="40" y="100" width="1120" height="120" rx="16" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1" filter="url(#softShadow)"/>
+    <rect x="64" y="112" width="4" height="20" rx="2" fill="#4F46E5"/>
+    <text x="78" y="129" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="12" font-weight="700" letter-spacing="1.4" fill="#475569">CLIENT GATEWAY &amp; DISTRIBUTION LAYER</text>
+    <rect x="1042" y="114" width="94" height="20" rx="10" fill="#EEF2FF" stroke="#C7D2FE" stroke-width="1"/>
+    <text x="1089" y="128" text-anchor="middle" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="9.5" font-weight="700" letter-spacing="0.5" fill="#4338CA">NON-SSOT</text>
+    <text x="78" y="148" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11.5" fill="#64748B">Claude Code · Codex · Claude Desktop · Antigravity · any MCP-capable client</text>
+
+    <rect x="64" y="160" width="344" height="46" rx="10" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1"/>
+    <text x="80" y="181" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="12.5" font-weight="700" fill="#0F172A">Model Routing /v1</text>
+    <text x="80" y="198" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10.5" fill="#64748B">OpenAI-compatible model endpoint</text>
+
+    <rect x="424" y="160" width="344" height="46" rx="10" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1"/>
+    <text x="440" y="181" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="12.5" font-weight="700" fill="#0F172A">MCP Hub</text>
+    <text x="440" y="198" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10.5" fill="#64748B">Streamable HTTP /mcp · stdio transport</text>
+
+    <rect x="784" y="160" width="352" height="46" rx="10" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1"/>
+    <text x="800" y="181" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="12.5" font-weight="700" fill="#0F172A">Static Asset Sync</text>
+    <text x="800" y="198" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10.5" fill="#64748B">SPA bundle · /llms.txt discovery</text>
+  </g>
+
+  <!-- flow 1: gateway -> engine -->
+  <line x1="324" y1="220" x2="324" y2="246" stroke="#2563EB" stroke-width="2" marker-end="url(#arrowBlue)"/>
+  <circle cx="344" cy="234" r="10" fill="#FFFFFF" stroke="#2563EB" stroke-width="1.5"/>
+  <text x="344" y="237.5" text-anchor="middle" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10.5" font-weight="700" fill="#1D4ED8">1</text>
+
+  <!-- ================= kernel 1: AI Flywheel ================= -->
+  <g id="kernel-ai-flywheel">
+    <rect x="40" y="248" width="568" height="332" rx="16" fill="#FFFFFF" stroke="#DBEAFE" stroke-width="1.2" filter="url(#softShadow)"/>
+    <rect x="64" y="268" width="4" height="36" rx="2" fill="#2563EB"/>
+    <text x="78" y="288" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="18" font-weight="700" letter-spacing="0.4" fill="#0F172A">AI FLYWHEEL</text>
+    <rect x="478" y="262" width="106" height="20" rx="10" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1"/>
+    <text x="531" y="276" text-anchor="middle" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="9.5" font-weight="700" letter-spacing="0.5" fill="#1D4ED8">DECISION SSOT</text>
+    <text x="78" y="307" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11.5" fill="#64748B">Governance &amp; Evolution Engine · the only source of truth for decisions</text>
+    <line x1="64" y1="322" x2="584" y2="322" stroke="#EEF2F6" stroke-width="1"/>
+
+    <circle cx="76" cy="346" r="9" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1"/>
+    <text x="76" y="349.5" text-anchor="middle" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="9.5" font-weight="700" fill="#1D4ED8">1</text>
+    <text x="94" y="350" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="13" font-weight="700" fill="#0F172A">MCP 6 Tools + 4 Resources</text>
+    <text x="94" y="366" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11" fill="#64748B">preflight · evidence outcome · register &amp; ingest · signal · status</text>
+
+    <circle cx="76" cy="385" r="9" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1"/>
+    <text x="76" y="388.5" text-anchor="middle" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="9.5" font-weight="700" fill="#1D4ED8">2</text>
+    <text x="94" y="389" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="13" font-weight="700" fill="#0F172A">Execution Evidence Gate</text>
+    <text x="94" y="405" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11" fill="#64748B">real / test / static / unknown — no evidence, no pass</text>
+
+    <circle cx="76" cy="424" r="9" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1"/>
+    <text x="76" y="427.5" text-anchor="middle" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="9.5" font-weight="700" fill="#1D4ED8">3</text>
+    <text x="94" y="428" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="13" font-weight="700" fill="#0F172A">P00–P07 Controlled Pipeline</text>
+    <text x="94" y="444" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11" fill="#64748B">read-only review → approved write → settle → deliver</text>
+
+    <circle cx="76" cy="463" r="9" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1"/>
+    <text x="76" y="466.5" text-anchor="middle" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="9.5" font-weight="700" fill="#1D4ED8">4</text>
+    <text x="94" y="467" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="13" font-weight="700" fill="#0F172A">SQLite + FTS5 Store</text>
+    <text x="94" y="483" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11" fill="#64748B">runs · rules · observations · outcomes · audit trail</text>
+
+    <circle cx="76" cy="502" r="9" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1"/>
+    <text x="76" y="505.5" text-anchor="middle" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="9.5" font-weight="700" fill="#1D4ED8">5</text>
+    <text x="94" y="506" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="13" font-weight="700" fill="#0F172A">5+1 Control Plane UI</text>
+    <text x="94" y="522" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11" fill="#64748B">Home · Workflows · Automations · Rules · Connect + About</text>
+
+    <circle cx="76" cy="541" r="9" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1"/>
+    <text x="76" y="544.5" text-anchor="middle" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="9.5" font-weight="700" fill="#1D4ED8">6</text>
+    <text x="94" y="545" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="13" font-weight="700" fill="#0F172A">Approval Channels</text>
+    <text x="94" y="561" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11" fill="#64748B">Web console · sanitized Webhook (HMAC) · Feishu cards</text>
+  </g>
+
+  <!-- flow 2: profile -> engine (read-only) -->
+  <line x1="648" y1="328" x2="611" y2="328" stroke="#64748B" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#arrowSlate)"/>
+  <circle cx="628" cy="328" r="10" fill="#FFFFFF" stroke="#D97706" stroke-width="1.5"/>
+  <text x="628" y="331.5" text-anchor="middle" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10.5" font-weight="700" fill="#B45309">2</text>
+
+  <!-- flow 3: engine -> knowledge base (controlled write) -->
+  <line x1="608" y1="480" x2="645" y2="480" stroke="#2563EB" stroke-width="2" marker-end="url(#arrowBlue)"/>
+  <circle cx="628" cy="480" r="10" fill="#FFFFFF" stroke="#2563EB" stroke-width="1.5"/>
+  <text x="628" y="483.5" text-anchor="middle" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10.5" font-weight="700" fill="#1D4ED8">3</text>
+
+  <!-- flow 4: knowledge base -> engine (read-back) -->
+  <line x1="648" y1="536" x2="611" y2="536" stroke="#64748B" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#arrowSlate)"/>
+  <circle cx="628" cy="536" r="10" fill="#FFFFFF" stroke="#059669" stroke-width="1.5"/>
+  <text x="628" y="539.5" text-anchor="middle" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10.5" font-weight="700" fill="#047857">4</text>
+
+  <!-- ================= kernel 2: external profile & equipment repo ================= -->
+  <g id="kernel-external-profile">
+    <rect x="648" y="248" width="512" height="160" rx="16" fill="#FFFFFF" stroke="#FDE68A" stroke-width="1.2" filter="url(#softShadow)"/>
+    <rect x="672" y="262" width="4" height="30" rx="2" fill="#D97706"/>
+    <text x="686" y="282" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="14" font-weight="700" letter-spacing="0.2" fill="#0F172A">EXTERNAL PROFILE &amp; EQUIPMENT REPO</text>
+    <rect x="1028" y="262" width="108" height="20" rx="10" fill="#FFFBEB" stroke="#FCD34D" stroke-width="1"/>
+    <text x="1082" y="276" text-anchor="middle" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="9" font-weight="700" letter-spacing="0.4" fill="#B45309">OPTIONAL OVERRIDE</text>
+    <text x="686" y="300" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11" fill="#64748B">Private-by-default mount · never committed to this repository</text>
+
+    <rect x="672" y="314" width="192" height="44" rx="10" fill="#FFFBEB" stroke="#FDE68A" stroke-width="1"/>
+    <text x="686" y="333" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11" font-weight="700" fill="#78350F">profile.override_dir</text>
+    <text x="686" y="348" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10.5" fill="#92400E">policies / triggers</text>
+
+    <rect x="874" y="314" width="124" height="44" rx="10" fill="#FFFBEB" stroke="#FDE68A" stroke-width="1"/>
+    <text x="888" y="333" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11" font-weight="700" fill="#78350F">skills/</text>
+    <text x="888" y="348" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10.5" fill="#92400E">SKILL.md</text>
+
+    <rect x="1008" y="314" width="128" height="44" rx="10" fill="#FFFBEB" stroke="#FDE68A" stroke-width="1"/>
+    <text x="1022" y="333" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11" font-weight="700" fill="#78350F">agents/</text>
+    <text x="1022" y="348" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10.5" fill="#92400E">subagents</text>
+
+    <text x="672" y="384" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10.5" fill="#475569">Read-only mount · P04 skill updates are append-only (old bytes stay the prefix)</text>
+  </g>
+
+  <!-- ================= kernel 3: mounted knowledge base ================= -->
+  <g id="kernel-mounted-knowledge-base">
+    <rect x="648" y="420" width="512" height="160" rx="16" fill="#FFFFFF" stroke="#A7F3D0" stroke-width="1.2" filter="url(#softShadow)"/>
+    <rect x="672" y="434" width="4" height="30" rx="2" fill="#059669"/>
+    <text x="686" y="454" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="14" font-weight="700" letter-spacing="0.2" fill="#0F172A">MOUNTED KNOWLEDGE BASE</text>
+    <rect x="1032" y="434" width="104" height="20" rx="10" fill="#ECFDF5" stroke="#6EE7B7" stroke-width="1"/>
+    <text x="1084" y="448" text-anchor="middle" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="9" font-weight="700" letter-spacing="0.4" fill="#047857">PLUGGABLE SINK</text>
+    <text x="686" y="472" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11" fill="#64748B">Local Markdown / Obsidian Wiki · human-readable · Git-tracked</text>
+
+    <rect x="672" y="486" width="196" height="44" rx="10" fill="#F0FDF4" stroke="#A7F3D0" stroke-width="1"/>
+    <text x="686" y="505" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11" font-weight="700" fill="#064E3B">.wiki-schema.md</text>
+    <text x="686" y="520" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10.5" fill="#047857">write gate &amp; routing</text>
+
+    <rect x="878" y="486" width="124" height="44" rx="10" fill="#F0FDF4" stroke="#A7F3D0" stroke-width="1"/>
+    <text x="892" y="505" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11" font-weight="700" fill="#064E3B">FTS5</text>
+    <text x="892" y="520" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10.5" fill="#047857">read-back index</text>
+
+    <rect x="1012" y="486" width="124" height="44" rx="10" fill="#F0FDF4" stroke="#A7F3D0" stroke-width="1"/>
+    <text x="1026" y="505" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11" font-weight="700" fill="#064E3B">P04 writes</text>
+    <text x="1026" y="520" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10.5" fill="#047857">approved only</text>
+
+    <text x="672" y="556" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10.5" fill="#475569">Privacy-gated · atomic LF write · read-back verification</text>
+  </g>
+
+  <!-- ================= flow legend ================= -->
+  <g id="flow-legend">
+    <rect x="40" y="604" width="1120" height="88" rx="16" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1" filter="url(#softShadow)"/>
+
+    <circle cx="74" cy="630" r="9" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1"/>
+    <text x="74" y="633.5" text-anchor="middle" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="9.5" font-weight="700" fill="#1D4ED8">1</text>
+    <text x="90" y="634" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11.5" font-weight="700" fill="#0F172A">MCP calls &amp; session ingest</text>
+    <text x="90" y="651" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10" fill="#94A3B8">client gateway → engine</text>
+
+    <circle cx="354" cy="630" r="9" fill="#FFFBEB" stroke="#FCD34D" stroke-width="1"/>
+    <text x="354" y="633.5" text-anchor="middle" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="9.5" font-weight="700" fill="#B45309">2</text>
+    <text x="370" y="634" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11.5" font-weight="700" fill="#0F172A">Read-only policy &amp; skill mount</text>
+    <text x="370" y="651" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10" fill="#94A3B8">external profile → engine</text>
+
+    <circle cx="634" cy="630" r="9" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1"/>
+    <text x="634" y="633.5" text-anchor="middle" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="9.5" font-weight="700" fill="#1D4ED8">3</text>
+    <text x="650" y="634" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11.5" font-weight="700" fill="#0F172A">Approved controlled writes</text>
+    <text x="650" y="651" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10" fill="#94A3B8">engine → knowledge base</text>
+
+    <circle cx="914" cy="630" r="9" fill="#ECFDF5" stroke="#6EE7B7" stroke-width="1"/>
+    <text x="914" y="633.5" text-anchor="middle" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="9.5" font-weight="700" fill="#047857">4</text>
+    <text x="930" y="634" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="11.5" font-weight="700" fill="#0F172A">Routing &amp; FTS5 read-back</text>
+    <text x="930" y="651" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10" fill="#94A3B8">knowledge base → engine</text>
+
+    <text x="64" y="677" font-family="Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif" font-size="10.5" fill="#94A3B8">Solid arrows: MCP call / approved write · Dashed arrows: read-only mount / FTS5 read-back · The gateway is Non-SSOT and never stores a decision.</text>
+  </g>
+</svg>

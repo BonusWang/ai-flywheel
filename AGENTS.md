@@ -6,7 +6,7 @@
 
 ---
 
-## 1. What this repository is
+## 1. What this repository is & the 3+1 ecosystem boundaries
 
 A **local-first, evidence-driven AI collaboration flywheel**. AI tools (Codex, Claude Code,
 Claude Desktop, Antigravity, …) talk to it over standard **MCP**; an optional ultra-thin
@@ -17,13 +17,30 @@ shows the batches, the automations, the rules and the audit trail.
 The methodology is deliberately decoupled from the knowledge base: `profile/` holds the
 policies, the knowledge sink is pluggable, and the wiki gate is contract-driven.
 
+The architecture is a **3+1 ecosystem**: three kernel roles plus one non-SSOT client
+gateway. The rendered, sanitized view lives in
+[`docs/architecture.svg`](./docs/architecture.svg).
+
+| Layer | Owns | Does **not** own |
+|---|---|---|
+| **Client Gateway & Distribution Layer** — Model Routing `/v1`, MCP Hub (`/mcp`, stdio), Static Asset Sync | transport, protocol translation and distribution of the SPA / `llms.txt` to Claude Code, Codex, Claude Desktop, Antigravity and any MCP-capable client | any decision, evidence record or knowledge write. It is **Non-SSOT** and stores no source of truth |
+| **AI Flywheel — Governance & Evolution Engine** | the P00–P07 state machine, the execution evidence gate, rules / observations / dissents, SQLite + FTS5, the 5+1 console, approval channels, and the MCP tools & resources | client-side model routing; the human's editorial style for knowledge; personal policy content |
+| **External Profile & Equipment Repo** (optional) — `profile.override_dir` policies/triggers, `skills/`, `agents/` | personal overrides, mounted **read-only**; the target of P04 **append-only** `SKILL.md` updates | engine state or knowledge documents. Nothing here is committed to this public repository |
+| **Mounted Knowledge Base** — local Markdown / Obsidian Wiki | human-readable, Git-tracked knowledge; the `.wiki-schema.md` write contract; the FTS5 read-back index | policies, triggers, run state or approval decisions |
+
+**Boundary rule of thumb:** if it stores a decision, it belongs to the engine; if a human
+reads it, it belongs to the knowledge base; if it is personal, it belongs outside this
+public repository.
+
 - Python 3.11+ · FastAPI · Pydantic v2 · SQLite (FTS5) · MCP SDK · httpx · APScheduler
 - Frontend: React 19 + TypeScript + Vite (`frontend/`)
 - Version: **`ai_flywheel.__version__`** — it is the only place the version is written down.
 
 ---
 
-## 2. Architecture & package map
+## 2. Architecture, package map & single sources of truth
+
+### Package map
 
 | Path | Owns |
 |---|---|
@@ -40,6 +57,7 @@ policies, the knowledge sink is pluggable, and the wiki gate is contract-driven.
 | `backend/ai_flywheel/` | `app.py` (assembly: lifespan, MCP mount, CORS, SSE, SPA hosting), `routes/` (the portal API split by domain: `overview`, `governance`, `runs`, `automations`), `mcp_server.py`, `cli.py`, `config.py`, `models.py`, `runtime.py` (the dependency container) |
 | `frontend/src/` | The console: `pages/` (Home, Workflows, Automations, Rules, Connect, About), `components/`, `api.ts`, `types.ts`, `lib/labels.ts` |
 | `profile/` | Methodology policies and the portal branding — decoupled from the knowledge base |
+| `docs/architecture.svg` | The sanitized 3+1 ecosystem view: the picture this contract describes |
 | `openspec/` | Spec-driven development: `config.yaml` (injected into every generated artifact), `specs/` (the baseline), `changes/` (in flight and archived) |
 | `tests/` | pytest. `tests/test_arch_invariants.py` holds the cross-layer invariants. |
 | `scripts/verify_repo.py` | The one-shot verification gate (hygiene → openspec → pytest → frontend build) |
@@ -48,9 +66,27 @@ policies, the knowledge sink is pluggable, and the wiki gate is contract-driven.
 (`core/`) → adapters (`adapters/`) → storage (`storage/`). Adapters never import the app
 layer; the core never imports an adapter's transport.
 
+### Single sources of truth
+
+| Question | The one place to look |
+|---|---|
+| What version is this? | `ai_flywheel.__version__` — the portal, `/health`, `/llms.txt` and the MCP server all read it from there |
+| Which runner will a batch use? | `adapters/runners/clients.py` → `resolve_runner_mode(cfg)` (`api:<model>` / `cli` / `dry_run`) |
+| Is this write sensitive? | `models.is_sensitive_write()` — the portal, the approval gate and the Feishu card all call it |
+| What does the mounted wiki allow? | `adapters/wiki/schema.py` → `WikiSchemaLoader` (the `.wiki-schema.md` contract, cached per file revision) |
+| What date is "today"? | `core/time_utils.py` — every product-facing date is a **Shanghai** date, never a host date |
+| What counts as a secret? | `core/privacy.py` → `SECRET_PATTERNS` — one set shared by the write gate, the receipt store and the card renderer |
+| What does the run look like? | The `workflow_runs` row plus its normalized child tables (`workflow_nodes`, `planned_writes`, `run_sessions`, `decision_cards`) — the portal, the API and MCP read the same projection |
+| Which node ids exist? | `core/pipeline/constants.py` → `NODE_TEMPLATES` (re-exported by `core/orchestrator.py`; the frontend labels cover exactly these ids) |
+
+If two layers disagree about one of these, one of them is wrong — and the invariant test
+in `tests/test_arch_invariants.py` says which.
+
 ---
 
-## 3. The P00–P07 pipeline and what each stage may touch
+## 3. P00–P07 pipeline & non-negotiable guardrails
+
+### The P00–P07 stage matrix
 
 A run is one batch. The stage boundaries are a **side-effect contract**: a stage that writes
 something the contract does not list is a bug, even when the batch still ends `PASS`.
@@ -71,27 +107,7 @@ the admitted sessions go back to `pending`, the exclusive lock is released, and 
 `FAILED`. A rejected approval ends the run `CANCELLED` — not `PARTIAL`: "nothing was
 written" and "half of it was written" must never look the same.
 
----
-
-## 4. Single sources of truth
-
-| Question | The one place to look |
-|---|---|
-| What version is this? | `ai_flywheel.__version__` — the portal, `/health`, `/llms.txt` and the MCP server all read it from there |
-| Which runner will a batch use? | `adapters/runners/clients.py` → `resolve_runner_mode(cfg)` (`api:<model>` / `cli` / `dry_run`) |
-| Is this write sensitive? | `models.is_sensitive_write()` — the portal, the approval gate and the Feishu card all call it |
-| What does the mounted wiki allow? | `adapters/wiki/schema.py` → `WikiSchemaLoader` (the `.wiki-schema.md` contract, cached per file revision) |
-| What date is "today"? | `core/time_utils.py` — every product-facing date is a **Shanghai** date, never a host date |
-| What counts as a secret? | `core/privacy.py` → `SECRET_PATTERNS` — one set shared by the write gate, the receipt store and the card renderer |
-| What does the run look like? | The `workflow_runs` row plus its normalized child tables (`workflow_nodes`, `planned_writes`, `run_sessions`, `decision_cards`) — the portal, the API and MCP read the same projection |
-| Which node ids exist? | `core/pipeline/constants.py` → `NODE_TEMPLATES` (re-exported by `core/orchestrator.py`; the frontend labels cover exactly these ids) |
-
-If two layers disagree about one of these, one of them is wrong — and the invariant test
-in `tests/test_arch_invariants.py` says which.
-
----
-
-## 5. Non-negotiable guardrails
+### The eight non-negotiable guardrails
 
 1. **No silent fallbacks.** When the configured planner or reviewer cannot produce a
    usable result, the run **fails** with a reason code and structured diagnostics. It
@@ -109,7 +125,7 @@ in `tests/test_arch_invariants.py` says which.
    calls a model or a local CLI.
 6. **This repository is public.** No personal paths, no nicknames, no credentials, no
    references to private projects or local checkouts — not in code, not in comments, not
-   in docs. Personal configuration belongs in the git-ignored `flywheel.yaml`.
+   in docs, not in SVG. Personal configuration belongs in the git-ignored `flywheel.yaml`.
    `scripts/verify_repo.py` fails the build when a leak appears.
 7. **Background daemons need the `serve` role.** The recovery loop, the outbox tick and
    the Feishu listener only run when the process role is `serve`. A daemon started
@@ -120,29 +136,7 @@ in `tests/test_arch_invariants.py` says which.
 
 ---
 
-## 6. Verification — before you say "done"
-
-```bash
-# The whole gate: hygiene → openspec → pytest (add --frontend for the build)
-python scripts/verify_repo.py --frontend
-
-# Or the pieces
-pytest tests -q
-openspec validate --all --strict
-cd frontend && npm run build
-```
-
-`python scripts/verify_repo.py` is the one command a reviewer runs. It exits non-zero as
-soon as one check fails, and it never repairs anything: a failing check is a report.
-
-Evidence grades used across this repository: **real** (a real run) / **test** (an automated
-test) / **static** (a reading of the code) / **unknown** (not verified). Claiming "fixed"
-needs at least `test`; anything that touches the write path, the API or a script needs
-`real`.
-
----
-
-## 7. Working agreement
+## 4. Working agreement & hot-file discipline
 
 This repository is spec-driven. The flow is **Explore → Propose → Apply → Verify → Archive**:
 
@@ -159,11 +153,12 @@ This repository is spec-driven. The flow is **Explore → Propose → Apply → 
 
 ### Hot-file discipline
 
-`core/pipeline/*` (the P00–P07 state machine; `core/orchestrator.py` is only its
-facade), `core/feishu_*.py`, `adapters/runners/*` and `storage/db/*` are hot
-files: several people and agents edit them. **Serialize the edits** — do not stack
-concurrent changes on the same pipeline module before the previous one is archived. When
-two changes must touch the same hot file, land one, archive it, then start the next.
+`core/pipeline/*` (the P00–P07 state machine; `core/orchestrator.py` is only its facade),
+`adapters/channels/feishu/*` (the real implementation — `core/feishu_*.py` are thin
+compatibility shims), `adapters/runners/*` and `storage/db/*` are hot files: several
+people and agents edit them. **Serialize the edits** — do not stack concurrent changes on
+the same pipeline module before the previous one is archived. When two changes must touch
+the same hot file, land one, archive it, then start the next.
 
 ### Cross-layer checklist
 
@@ -175,3 +170,45 @@ A change is done only when every layer that knows about it agrees:
 - [ ] A new write target → `is_sensitive_write`, the approval gate and the card agree
 - [ ] A new secret shape → `core/privacy.py` `SECRET_PATTERNS` (one set, every surface)
 - [ ] A new stage side effect → the matrix above, and a test that pins it
+- [ ] A new public text artifact kind → `scripts/verify_repo.py` `SCAN_SUFFIXES` scans it (SVG included)
+
+---
+
+## 5. Verification & evidence grades
+
+```bash
+# The whole gate: hygiene → openspec → pytest (add --frontend for the build)
+python scripts/verify_repo.py --frontend
+
+# Or the pieces
+pytest tests -q
+openspec validate --all --strict
+cd frontend && npm run build
+```
+
+`python scripts/verify_repo.py` is the one command a reviewer runs. It exits non-zero as
+soon as one check fails, and it never repairs anything: a failing check is a report. The
+hygiene check covers code, docs, configuration and SVG text.
+
+Evidence grades used across this repository: **real** (a real run) / **test** (an automated
+test) / **static** (a reading of the code) / **unknown** (not verified). Claiming "fixed"
+needs at least `test`; anything that touches the write path, the API or a script needs
+`real`.
+
+---
+
+## 6. Git collaboration & commit rules
+
+- **Stage explicit paths.** `git add -- <path> [<path> …]`; never `git add -A` or
+  `git add .`. Review `git diff --cached` before committing — an unrelated file in the
+  index is a bug, not a convenience.
+- **Conventional Commits.** `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`, `test:` with
+  an optional scope (`feat(automation): …`), an imperative subject, and the OpenSpec
+  change name in the body when one exists. One logical change per commit.
+- **Never commit local configuration or secrets.** `flywheel.yaml`, credentials, tokens,
+  generated data and local caches stay untracked (the hygiene gate enforces the public
+  surface).
+- **No unauthorized history rewriting.** Do not `git push --force`, `--force-with-lease`,
+  rebase, amend or otherwise rewrite published history without explicit maintainer
+  approval. A commit or a push is a maintainer-authorized action: an agent implements and
+  verifies, the maintainer lands.
