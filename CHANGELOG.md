@@ -5,6 +5,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-25
+
+### Added
+- **Automation Console & Hot-Reloadable Scheduler** (`core/automation.py`, `runtime.py`, `app.py`, `frontend/src/pages/AutomationsPage.tsx`):
+  - Promoted APScheduler from a local `create_app` variable into `AutomationManager` owned by `FlywheelRuntime`, strictly pinned to `Asia/Shanghai` timezone (`core/time_utils.SHANGHAI_TZ`) and gated on the `serve` process role.
+  - Added REST control plane: `GET /api/site/automations` (live scheduler state, `next_run_at`, daily/cumulative KPI metrics, recovery watchdog & Feishu daemon status, and recent runs), `PUT /api/site/automations/schedule` (strict 5-field cron validation + live hot-reload without restarting `serve`), and `POST /api/site/automations/recover` (one-click stale-run recovery pass).
+  - Removed `workflow.schedule_enabled` and `workflow.daily_cron` from `STARTUP_ONLY_PATHS`: editing schedule settings via `/api/site/automations/schedule` or `/api/site/config` now reloads the live job immediately (`restart_required: false`) and broadcasts `automation_updated` over SSE.
+  - Added the **自动化任务** (`/automations`) page in the Web Console sidebar (`5+1` console): master auto-execution toggle + live status banner, visual Cron schedule editor (preset frequency + Shanghai hour/minute pickers synced with 5-field Cron input + Friday weekly Dream checkbox), today/cumulative KPI tiles, background daemon watchdog cards (Recovery Watchdog & Feishu channel), and filterable scheduled/manual execution history.
+
 ## [0.4.1] - 2026-11-25
 
 ### Fixed

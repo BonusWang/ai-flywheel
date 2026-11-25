@@ -336,3 +336,82 @@ export interface AboutPayload {
   river_sources: RiverSource[]
   recent_rules: RuleRecord[]
 }
+
+export interface AutomationRunSummary {
+  run_id: string
+  batch_date: string
+  batch_seq: number
+  trigger: string
+  phase: string
+  status: WorkflowRunRecord['status']
+  runner_mode: string
+  approval_mode: string
+  admitted_count: number
+  planned_writes_count: number
+  duration_ms: number
+  started_at?: string | null
+  finished_at?: string | null
+  created_at: string
+  error?: string | null
+}
+
+export interface AutomationsSnapshot {
+  scheduler: {
+    enabled: boolean
+    running: boolean
+    role_active: boolean
+    timezone: string
+    cron: string
+    human_schedule: string
+    friday_weekly_enabled: boolean
+    next_run_at: string | null
+    preview_next_run_at: string | null
+    last_scheduled_run_at: string | null
+    last_run_at: string | null
+    last_run_id: string | null
+    last_run_status: WorkflowRunRecord['status'] | null
+    last_run_trigger: string | null
+    cron_error: string | null
+  }
+  metrics: {
+    today_date: string
+    today_runs_count: number
+    today_passed_count: number
+    today_awaiting_count: number
+    today_failed_count: number
+    today_scheduled_ran: boolean
+    total_scheduled_runs: number
+    total_scheduled_passed: number
+    total_runs: number
+    pending_sessions: number
+    awaiting_approval_runs: number
+  }
+  policy: {
+    workflow_enabled: boolean
+    approval_mode: string
+    effective_approval_mode: string
+    runner_mode: string
+    max_sessions_per_run: number
+    max_writes_per_run: number
+  }
+  daemons: {
+    recovery: {
+      role_active: boolean
+      interval_seconds: number
+      stale_after_seconds: number
+      last_pass_at: string | null
+      last_reaped_count: number
+      total_reaped_count: number
+      last_error: string | null
+    }
+    feishu: {
+      enabled: boolean
+      interactive: boolean
+      availability: string
+      listener_state: string
+      check_valid: boolean
+    }
+  }
+  lock: WorkflowLock | null
+  recent_runs: AutomationRunSummary[]
+}

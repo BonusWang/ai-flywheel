@@ -8,8 +8,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
@@ -74,6 +72,13 @@ class DissentStatusBody(BaseModel):
     status: str
 
 
+class AutomationScheduleBody(BaseModel):
+    schedule_enabled: bool | None = None
+    daily_cron: str | None = None
+    friday_weekly_enabled: bool | None = None
+    approval_mode: str | None = None
+
+
 def create_app(
     runtime: FlywheelRuntime | None = None,
     *,
@@ -103,7 +108,6 @@ def create_app(
         ),
     )
 
-    scheduler: BackgroundScheduler | None = None
     recovery_stop: threading.Event | None = None
     recovery_thread: threading.Thread | None = None
 
@@ -113,20 +117,9 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        nonlocal scheduler, recovery_stop, recovery_thread
-        if rt.cfg.workflow.schedule_enabled:
-            scheduler = BackgroundScheduler()
-            try:
-                scheduler.add_job(
-                    lambda: rt.orchestrator.start_run(trigger="scheduled", phase="auto"),
-                    CronTrigger.from_crontab(rt.cfg.workflow.daily_cron),
-                    id="daily_flywheel",
-                    replace_existing=True,
-                )
-                scheduler.start()
-            except Exception:
-                scheduler = None
+        nonlocal recovery_stop, recovery_thread
         if effective_role == "serve":
+            rt.automation.start(process_role=effective_role)
             # Recovery loop: reap runs whose executor is gone and reconcile ask cards.
             # First execution happens inside the thread so lifespan startup never blocks.
             recovery_stop = threading.Event()
@@ -136,8 +129,10 @@ def create_app(
                 stale_after = int(os.environ.get("FLYWHEEL_RECOVERY_STALE_SECONDS", "300"))
                 while True:
                     try:
-                        rt.orchestrator.recover_interrupted_runs(stale_after_seconds=stale_after)
-                    except Exception:
+                        reaped = rt.orchestrator.recover_interrupted_runs(stale_after_seconds=stale_after)
+                        rt.automation.record_recovery_pass(list(reaped), error=None)
+                    except Exception as exc:
+                        rt.automation.record_recovery_pass([], error=str(exc))
                         logging.getLogger("ai_flywheel.recovery").exception("recovery pass failed")
                     if recovery_stop.wait(interval):
                         break
@@ -150,8 +145,7 @@ def create_app(
         rt.stop_feishu()
         if recovery_stop is not None:
             recovery_stop.set()
-        if scheduler and scheduler.running:
-            scheduler.shutdown(wait=False)
+        rt.automation.stop()
 
     app = FastAPI(
         title="AI Flywheel",
@@ -259,12 +253,58 @@ def create_app(
 
     @app.put("/api/site/config")
     def site_update_config(patch: dict[str, Any]) -> dict[str, Any]:
-        result = rt.update_runtime_config(patch)
+        try:
+            result = rt.update_runtime_config(patch)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {
             "status": "saved",
             "config": _safe_config_dump(),
             "restart_required": result["restart_required"],
             "restart_reasons": result["restart_reasons"],
+        }
+
+    # ---- Automation Scheduler & Daemons ----
+    @app.get("/api/site/automations")
+    def site_get_automations() -> dict[str, Any]:
+        return rt.automation.get_snapshot()
+
+    @app.put("/api/site/automations/schedule")
+    def site_update_automation_schedule(body: AutomationScheduleBody) -> dict[str, Any]:
+        wf_patch: dict[str, Any] = {}
+        if body.schedule_enabled is not None:
+            wf_patch["schedule_enabled"] = body.schedule_enabled
+        if body.daily_cron is not None:
+            wf_patch["daily_cron"] = body.daily_cron
+        if body.friday_weekly_enabled is not None:
+            wf_patch["friday_weekly_enabled"] = body.friday_weekly_enabled
+        if body.approval_mode is not None:
+            mode = body.approval_mode.strip().lower()
+            if mode not in {"smart", "always", "auto"}:
+                raise HTTPException(status_code=400, detail=f"Invalid approval_mode: {body.approval_mode}")
+            wf_patch["approval_mode"] = mode
+        if not wf_patch:
+            return {
+                "automations": rt.automation.get_snapshot(),
+                "restart_required": False,
+                "restart_reasons": [],
+            }
+        try:
+            result = rt.update_runtime_config({"workflow": wf_patch})
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "automations": rt.automation.get_snapshot(),
+            "restart_required": result["restart_required"],
+            "restart_reasons": result["restart_reasons"],
+        }
+
+    @app.post("/api/site/automations/recover")
+    def site_trigger_automation_recovery() -> dict[str, Any]:
+        res = rt.automation.run_recovery_now()
+        return {
+            **res,
+            "automations": rt.automation.get_snapshot(),
         }
 
     @app.post("/api/site/seed")

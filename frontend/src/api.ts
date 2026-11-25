@@ -1,6 +1,7 @@
 import type {
   AboutPayload,
   AuditEventRecord,
+  AutomationsSnapshot,
   ConfigSaveResponse,
   ConnectPayload,
   DissentRecord,
@@ -182,4 +183,27 @@ export const api = {
     ),
   skillPreview: (skillName: string) =>
     req<SkillPreview>(`/api/site/skills/${encodeURIComponent(skillName)}/preview`),
+
+  automations: () => req<AutomationsSnapshot>('/api/site/automations'),
+  updateAutomationSchedule: (body: {
+    schedule_enabled?: boolean
+    daily_cron?: string
+    friday_weekly_enabled?: boolean
+    approval_mode?: string
+  }) =>
+    req<{
+      automations: AutomationsSnapshot
+      restart_required: boolean
+      restart_reasons: string[]
+    }>('/api/site/automations/schedule', {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
+  triggerAutomationRecovery: () =>
+    req<{
+      reaped_count: number
+      reaped_run_ids: string[]
+      checked_at: string | null
+      automations: AutomationsSnapshot
+    }>('/api/site/automations/recover', { method: 'POST' }),
 }

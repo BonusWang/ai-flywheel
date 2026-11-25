@@ -11,6 +11,7 @@ from ai_flywheel.adapters.sessions import SessionAdapter
 from ai_flywheel.adapters.skills import SkillWriterAdapter
 from ai_flywheel.config import FlywheelConfig, deep_merge, load_config, save_config
 from ai_flywheel.core.activation import ActivationEngine
+from ai_flywheel.core.automation import AutomationManager, validate_cron
 from ai_flywheel.core.core_card import read_core_card, rebuild_core_card
 from ai_flywheel.core.hooks import ThinHookProcessor
 from ai_flywheel.core.orchestrator import EventBroker, WorkflowOrchestrator
@@ -63,6 +64,14 @@ class FlywheelRuntime:
         self.feishu_check = None
         self.feishu_channel = None
         self._build_feishu()
+        self.automation = AutomationManager(
+            cfg=cfg,
+            db=self.db,
+            orchestrator=self.orchestrator,
+            broker=self.broker,
+            process_role=self.process_role,
+            feishu_provider=self._feishu_daemon_status,
+        )
         # An outcome or a signal changes rules, dissents and freshness: the
         # derived core card is a projection of those, so it is refreshed with them.
         self.receipts.set_state_change_hook(self.refresh_core_card)
@@ -167,6 +176,37 @@ class FlywheelRuntime:
         if self.feishu_listener is not None:
             self.feishu_listener.stop()
 
+    def _feishu_daemon_status(self) -> dict[str, Any]:
+        fcfg = self.cfg.delivery.feishu_cli
+        if not fcfg.enabled:
+            return {
+                "enabled": False,
+                "interactive": False,
+                "availability": "disabled",
+                "listener_state": "stopped",
+                "check_valid": False,
+            }
+        listener_state = (
+            self.feishu_listener.state.get("state", "stopped")
+            if self.feishu_listener is not None
+            else "stopped"
+        )
+        availability = (
+            self.feishu_channel.availability()
+            if self.feishu_channel is not None
+            else "down:unconfigured"
+        )
+        check_valid = bool(
+            self.feishu_check is not None and self.feishu_check.status().get("valid")
+        )
+        return {
+            "enabled": True,
+            "interactive": bool(fcfg.interactive),
+            "availability": availability,
+            "listener_state": listener_state,
+            "check_valid": check_valid,
+        }
+
     def refresh_core_card(self) -> dict[str, Any]:
         return rebuild_core_card(self.cfg, self.db)
 
@@ -227,8 +267,9 @@ class FlywheelRuntime:
     # The settings that are read once, at startup: changing them only takes
     # effect after the process is restarted.
     STARTUP_ONLY_PATHS: tuple[tuple[str, ...], ...] = (
-        ("workflow", "schedule_enabled"),
-        ("workflow", "daily_cron"),
+        ("server", "host"),
+        ("server", "port"),
+        ("server", "data_dir"),
         ("delivery", "feishu_cli", "command"),
         ("delivery", "feishu_cli", "command_args"),
         ("delivery", "feishu_cli", "identity"),
@@ -289,6 +330,10 @@ class FlywheelRuntime:
         }
         merged = deep_merge(current, self._without_empty_api_key(scoped))
         updated = FlywheelConfig.model_validate(merged)
+        if "workflow" in scoped and "daily_cron" in scoped["workflow"]:
+            cleaned_cron, _ = validate_cron(updated.workflow.daily_cron)
+            updated.workflow.daily_cron = cleaned_cron
+            merged["workflow"]["daily_cron"] = cleaned_cron
         updated.base_dir = self.cfg.base_dir
         updated.config_path = self.cfg.config_path
         save_config(updated)
@@ -297,6 +342,7 @@ class FlywheelRuntime:
             if field_name in {"base_dir", "config_path"}:
                 continue
             setattr(self.cfg, field_name, getattr(updated, field_name))
+        self.automation.sync_from_config()
         for section, values in patch.items():
             if isinstance(values, dict):
                 for k, v in values.items():
@@ -311,6 +357,8 @@ class FlywheelRuntime:
             summary=f"更新系统配置分组：{', '.join(patch.keys())}",
         )
         self.knowledge.sync_fts_index()
+        if any(k in scoped for k in ("workflow", "safety_valves", "delivery")):
+            self.broker.publish("automation_updated", {"reason": "config_updated"})
         restart_reasons = self._restart_reasons(current, merged)
         return {
             "config": self.cfg,

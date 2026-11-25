@@ -269,9 +269,14 @@ def test_the_config_update_reports_the_settings_that_need_a_restart(tmp_path: Pa
     assert result["restart_required"] is False
     assert result["restart_reasons"] == []
 
+    # Schedule settings hot-reload into AutomationManager without a restart.
     result = rt.update_runtime_config({"workflow": {"daily_cron": "30 21 * * *"}})
+    assert result["restart_required"] is False
+    assert result["restart_reasons"] == []
+
+    result = rt.update_runtime_config({"server": {"port": 9876}})
     assert result["restart_required"] is True
-    assert "workflow.daily_cron" in result["restart_reasons"]
+    assert "server.port" in result["restart_reasons"]
 
     result = rt.update_runtime_config({"delivery": {"feishu_cli": {"identity": "user"}}})
     assert result["restart_required"] is True
@@ -282,11 +287,11 @@ def test_the_config_endpoint_reports_the_restart_metadata(tmp_path: Path):
     rt = _runtime(tmp_path)
     app = create_app(runtime=rt, process_role="cli")
     with TestClient(app) as client:
-        resp = client.put("/api/site/config", json={"workflow": {"daily_cron": "45 22 * * *"}})
+        resp = client.put("/api/site/config", json={"delivery": {"feishu_cli": {"identity": "user"}}})
         assert resp.status_code == 200
         body = resp.json()
         assert body["restart_required"] is True
-        assert "workflow.daily_cron" in body["restart_reasons"]
+        assert "delivery.feishu_cli.identity" in body["restart_reasons"]
 
 
 # ---------------- W2.5 核心卡只读 ----------------

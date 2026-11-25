@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import {
   BookOpen,
+  Clock,
   GitBranch,
   Info,
   RefreshCw,
@@ -10,17 +11,19 @@ import {
 import { api } from './api'
 import { ThemeSwitch } from './components/ThemeSwitch'
 import { AboutPage } from './pages/AboutPage'
+import { AutomationsPage } from './pages/AutomationsPage'
 import { ConnectPolicyPage } from './pages/ConnectPolicyPage'
 import { HomePage } from './pages/HomePage'
 import { RulesRetroPage } from './pages/RulesRetroPage'
 import { WorkflowsPage } from './pages/WorkflowsPage'
 import type { OverviewResponse } from './types'
 
-export type PageKey = 'home' | 'runs' | 'rules' | 'settings' | 'about'
+export type PageKey = 'home' | 'runs' | 'automations' | 'rules' | 'settings' | 'about'
 
 const PAGE_PATHS: Record<PageKey, string> = {
   home: '/',
   runs: '/runs',
+  automations: '/automations',
   rules: '/rules',
   settings: '/settings',
   about: '/about',
@@ -33,6 +36,7 @@ function pageFromPathname(pathname: string): {
 } {
   const clean = pathname.replace(/\/+$/, '') || '/'
   if (clean === '/workflows' || clean === '/runs') return { page: 'runs' }
+  if (clean === '/automations' || clean === '/scheduler') return { page: 'automations' }
   if (clean === '/policies') return { page: 'rules', rulesTab: 'guidelines' }
   if (clean === '/rules') return { page: 'rules', rulesTab: 'rules' }
   if (clean === '/connect') return { page: 'settings', settingsTab: 'connect' }
@@ -104,6 +108,7 @@ export function App() {
     es.addEventListener('run_completed', onLive)
     es.addEventListener('run_failed', onLive)
     es.addEventListener('run_rejected', onLive)
+    es.addEventListener('automation_updated', onLive)
     es.onerror = () => setSseConnected(false)
     return () => es.close()
   }, [refreshAll])
@@ -119,6 +124,7 @@ export function App() {
   }> = [
     { key: 'home', label: '每日成果', icon: BookOpen },
     { key: 'runs', label: '每日沉淀', icon: GitBranch, dot: hasApprovalWaiting },
+    { key: 'automations', label: '自动化任务', icon: Clock },
     { key: 'rules', label: '规则与规矩', icon: Shield },
     { key: 'settings', label: '接入与设置', icon: Settings },
   ]
@@ -242,6 +248,13 @@ export function App() {
           {page === 'runs' && (
             <WorkflowsPage refreshToken={refreshToken} onGlobalRefresh={refreshAll} />
           )}
+          {page === 'automations' && (
+            <AutomationsPage
+              refreshToken={refreshToken}
+              onNavigate={setPage}
+              onGlobalRefresh={refreshAll}
+            />
+          )}
           {page === 'rules' && (
             <RulesRetroPage
               refreshToken={refreshToken}
@@ -261,10 +274,10 @@ export function App() {
         </main>
       </div>
 
-      {/* Mobile Bottom Tab Bar (4 clean items) */}
+      {/* Mobile Bottom Tab Bar (5 clean items) */}
       <nav
         aria-label="移动端导航"
-        className="fixed inset-x-0 bottom-0 z-40 grid grid-cols-4 border-t border-line bg-sidebar/95 backdrop-blur py-1.5 lg:hidden"
+        className="fixed inset-x-0 bottom-0 z-40 grid grid-cols-5 border-t border-line bg-sidebar/95 backdrop-blur py-1.5 lg:hidden"
       >
         {mainNav.map((t) => {
           const active = page === t.key

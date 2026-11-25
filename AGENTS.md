@@ -11,8 +11,8 @@
 A **local-first, evidence-driven AI collaboration flywheel**. AI tools (Codex, Claude Code,
 Claude Desktop, Antigravity, …) talk to it over standard **MCP**; an optional ultra-thin
 forwarding hook is available for clients that cannot speak MCP. In the background a fixed
-**P00–P07** workflow turns conversations into knowledge, and a minimal **4+1** web console
-shows the batches, the rules and the audit trail.
+**P00–P07** workflow turns conversations into knowledge, and a minimal **5+1** web console
+shows the batches, the automations, the rules and the audit trail.
 
 The methodology is deliberately decoupled from the knowledge base: `profile/` holds the
 policies, the knowledge sink is pluggable, and the wiki gate is contract-driven.
@@ -27,7 +27,7 @@ policies, the knowledge sink is pluggable, and the wiki gate is contract-driven.
 
 | Path | Owns |
 |---|---|
-| `backend/ai_flywheel/core/` | The domain engine: `orchestrator` (the P00–P07 state machine), `activation` (preflight & rules), `triage` (session triage), `dream` (weekly distillation), `core_card` (the derived index card), `privacy`, `receipts`, `heartbeat`, `feishu_*` (card / channel / listener / self-check), `time_utils` |
+| `backend/ai_flywheel/core/` | The domain engine: `orchestrator` (the P00–P07 state machine), `automation` (hot-reloadable Shanghai-tz scheduler & daemon control plane), `activation` (preflight & rules), `triage` (session triage), `dream` (weekly distillation), `core_card` (the derived index card), `privacy`, `receipts`, `heartbeat`, `feishu_*` (card / channel / listener / self-check), `time_utils` |
 | `backend/ai_flywheel/adapters/runners/` | The execution layer: `clients` (CLI + OpenAI-compatible API), `heuristic` (dry-run), `contracts` (the wire contract + diagnostics), `prompts`, `normalizers`, `outcomes` |
 | `backend/ai_flywheel/adapters/wiki/` | The mounted-wiki contract: `schema` (`.wiki-schema.md`), `router` (routing candidates & evidence), `gate` (pre-write validation), `validator`, `t5_adapter`, `postflight` |
 | `backend/ai_flywheel/adapters/knowledge.py` | The knowledge sink: privacy gate → schema gate → atomic LF write → read-back verification → FTS refresh |
@@ -36,7 +36,7 @@ policies, the knowledge sink is pluggable, and the wiki gate is contract-driven.
 | `backend/ai_flywheel/storage/db/` | SQLite, split per repository (`workflow_repo`, `session_repo`, `rule_repo`, `knowledge_repo`, `asset_repo`, `audit_repo`) + `schema.py` / `migrations.py` |
 | `backend/ai_flywheel/storage/` | `fs_store` (immutable receipts), `outbox` (managed delivery outbox), `clock` (injectable clock), `seed` |
 | `backend/ai_flywheel/` | `app.py` (REST + SSE + lifespan), `mcp_server.py`, `cli.py`, `config.py`, `models.py`, `runtime.py` (the dependency container) |
-| `frontend/src/` | The console: `pages/` (Home, Workflows, Rules, Connect, About), `components/`, `api.ts`, `types.ts`, `lib/labels.ts` |
+| `frontend/src/` | The console: `pages/` (Home, Workflows, Automations, Rules, Connect, About), `components/`, `api.ts`, `types.ts`, `lib/labels.ts` |
 | `profile/` | Methodology policies and the portal branding — decoupled from the knowledge base |
 | `openspec/` | Spec-driven development: `config.yaml` (injected into every generated artifact), `specs/` (the baseline), `changes/` (in flight and archived) |
 | `tests/` | pytest. `tests/test_arch_invariants.py` holds the cross-layer invariants. |
