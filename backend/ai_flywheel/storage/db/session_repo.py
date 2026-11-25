@@ -48,7 +48,12 @@ class SessionRepoMixin:
         now = self._now_iso()
         with self.connect() as conn:
             existing = conn.execute(
-                "SELECT created_at, status, tags_json, metadata_json FROM sessions WHERE session_key = ?",
+                """
+                SELECT created_at, status, tags_json, metadata_json,
+                       opt_out, opt_out_reason, latest_content_hash,
+                       latest_turn_count, last_consumed_turn, last_consumed_hash
+                FROM sessions WHERE session_key = ?
+                """,
                 (record.session_key,),
             ).fetchone()
             created_at = existing["created_at"] if existing else record.created_at
@@ -68,13 +73,37 @@ class SessionRepoMixin:
             elif existing and existing["status"] == SessionStatus.PROCESSED.value and record.content:
                 # Re-open if substantial new content was pushed
                 status = SessionStatus.PENDING.value
+            # The opt-out is a user decision: a late lifecycle hook never undoes it.
+            opt_out = bool(record.opt_out)
+            opt_out_reason = record.opt_out_reason
+            if preserve_existing_lifecycle and existing and existing["opt_out"]:
+                opt_out = True
+                opt_out_reason = existing["opt_out_reason"] or opt_out_reason
+            # The fingerprint / watermark columns only move forward, so an
+            # update that carries no content never erases them.
+            latest_content_hash = record.latest_content_hash or (
+                existing["latest_content_hash"] if existing else ""
+            )
+            latest_turn_count = max(
+                int(record.latest_turn_count),
+                int(existing["latest_turn_count"]) if existing else 0,
+            )
+            last_consumed_turn = max(
+                int(record.last_consumed_turn),
+                int(existing["last_consumed_turn"]) if existing else 0,
+            )
+            last_consumed_hash = record.last_consumed_hash or (
+                existing["last_consumed_hash"] if existing else ""
+            )
             conn.execute(
                 """
                 INSERT INTO sessions (
                     session_key, client, session_id, title, project, workspace,
                     transcript_path, summary, content, tags_json, priority, status,
-                    metadata_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    metadata_json, opt_out, opt_out_reason, latest_content_hash,
+                    latest_turn_count, last_consumed_turn, last_consumed_hash,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_key) DO UPDATE SET
                     title = CASE WHEN excluded.title != '' THEN excluded.title ELSE sessions.title END,
                     project = CASE WHEN excluded.project != 'generic' THEN excluded.project ELSE sessions.project END,
@@ -86,6 +115,12 @@ class SessionRepoMixin:
                     priority = excluded.priority,
                     status = excluded.status,
                     metadata_json = excluded.metadata_json,
+                    opt_out = excluded.opt_out,
+                    opt_out_reason = excluded.opt_out_reason,
+                    latest_content_hash = excluded.latest_content_hash,
+                    latest_turn_count = excluded.latest_turn_count,
+                    last_consumed_turn = excluded.last_consumed_turn,
+                    last_consumed_hash = excluded.last_consumed_hash,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -102,6 +137,12 @@ class SessionRepoMixin:
                     record.priority,
                     status,
                     json.dumps(metadata, ensure_ascii=False),
+                    1 if opt_out else 0,
+                    opt_out_reason,
+                    latest_content_hash,
+                    latest_turn_count,
+                    last_consumed_turn,
+                    last_consumed_hash,
                     created_at,
                     now,
                 ),
@@ -109,6 +150,7 @@ class SessionRepoMixin:
         return self.get_session(record.session_key)  # type: ignore[return-value]
 
     def _row_to_session(self, row: sqlite3.Row) -> SessionRecord:
+        keys = set(row.keys())
         return SessionRecord(
             session_key=row["session_key"],
             client=row["client"],
@@ -123,6 +165,20 @@ class SessionRepoMixin:
             priority=row["priority"],
             status=SessionStatus(row["status"]),
             metadata=json.loads(row["metadata_json"]),
+            opt_out=bool(row["opt_out"]) if "opt_out" in keys else False,
+            opt_out_reason=row["opt_out_reason"] if "opt_out_reason" in keys else "",
+            latest_content_hash=(
+                row["latest_content_hash"] if "latest_content_hash" in keys else ""
+            ),
+            latest_turn_count=(
+                int(row["latest_turn_count"]) if "latest_turn_count" in keys else 0
+            ),
+            last_consumed_turn=(
+                int(row["last_consumed_turn"]) if "last_consumed_turn" in keys else 0
+            ),
+            last_consumed_hash=(
+                row["last_consumed_hash"] if "last_consumed_hash" in keys else ""
+            ),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -180,6 +236,60 @@ class SessionRepoMixin:
             conn.execute(
                 "UPDATE sessions SET status = ?, updated_at = ? WHERE session_key = ?",
                 (status.value, self._now_iso(), session_key),
+            )
+
+    def set_session_opt_out(
+        self, session_key: str, opt_out: bool, reason: str = ""
+    ) -> SessionRecord | None:
+        """Record (or clear) a user's opt-out on the session profile."""
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET opt_out = ?, opt_out_reason = ?, updated_at = ?
+                WHERE session_key = ?
+                """,
+                (1 if opt_out else 0, reason if opt_out else "", self._now_iso(), session_key),
+            )
+        return self.get_session(session_key)
+
+    def update_session_watermark(
+        self,
+        session_key: str,
+        *,
+        latest_content_hash: str | None = None,
+        latest_turn_count: int | None = None,
+        last_consumed_turn: int | None = None,
+        last_consumed_hash: str | None = None,
+    ) -> None:
+        """Move the content fingerprint / consumption watermark of a session.
+
+        Only the arguments that are not ``None`` are written, so a caller can
+        update the consumed pointer without restating the latest fingerprint.
+        """
+        assignments: list[str] = []
+        params: list[Any] = []
+        if latest_content_hash is not None:
+            assignments.append("latest_content_hash = ?")
+            params.append(latest_content_hash)
+        if latest_turn_count is not None:
+            assignments.append("latest_turn_count = ?")
+            params.append(int(latest_turn_count))
+        if last_consumed_turn is not None:
+            assignments.append("last_consumed_turn = ?")
+            params.append(int(last_consumed_turn))
+        if last_consumed_hash is not None:
+            assignments.append("last_consumed_hash = ?")
+            params.append(last_consumed_hash)
+        if not assignments:
+            return
+        assignments.append("updated_at = ?")
+        params.append(self._now_iso())
+        params.append(session_key)
+        with self.connect() as conn:
+            conn.execute(
+                f"UPDATE sessions SET {', '.join(assignments)} WHERE session_key = ?",
+                params,
             )
 
     # ---------------- Preflight & Outcomes ----------------

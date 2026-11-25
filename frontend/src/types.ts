@@ -120,8 +120,83 @@ export interface SessionRecord {
   priority: string
   status: 'pending' | 'in_progress' | 'processed' | 'archived'
   metadata?: Record<string, unknown>
+  /** The user's opt-out from distillation, recorded on the session profile. */
+  opt_out?: boolean
+  opt_out_reason?: string
+  /** Content fingerprint of the newest revision, and how far the pipeline consumed it. */
+  latest_content_hash?: string
+  latest_turn_count?: number
+  last_consumed_turn?: number
+  last_consumed_hash?: string
   created_at: string
   updated_at: string
+}
+
+/** The lifecycle of one distill-queue item (one revision / chunk of a session). */
+export type QueueStatus = 'queued' | 'processing' | 'processed' | 'excluded' | 'withdrawn' | 'dead_letter'
+
+/** How a distill-queue item entered the queue. */
+export type IngressChannel = 'mcp_explicit' | 'manual_portal' | 'codex_archive' | 'claude_exit' | 'legacy_scan'
+
+/** One row of the unified code dictionary (`sys_dict_items`). */
+export interface DictItem {
+  dict_type: string
+  code: string
+  label_zh: string
+  label_en: string
+  group_key: string
+  description: string
+  sort_order: number
+  is_builtin: boolean
+  enabled: boolean
+  meta: Record<string, unknown>
+  created_at: string
+  updated_at: string
+}
+
+/** One unit of distill work: a session revision, optionally one chunk of it. */
+export interface DistillQueueItem {
+  queue_id: string
+  session_key: string
+  client: string
+  project: string
+  workspace: string
+  title: string
+  revision: number
+  chunk_index: number
+  chunk_total: number
+  ingress_channel: IngressChannel
+  status: QueueStatus
+  priority: string
+  exclude_reason_code: string
+  exclude_reason_detail: string
+  focus_note: string
+  content_hash: string
+  total_chars: number
+  compacted_chars: number
+  is_oversized: boolean
+  consumed_from_turn: number
+  consumed_to_turn: number
+  retry_count: number
+  max_retries: number
+  last_error: string
+  run_id: string | null
+  source_path: string | null
+  payload: Record<string, unknown>
+  enqueued_at: string
+  claimed_at: string | null
+  completed_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+/** The inventory aggregation of `distill_queue`. */
+export interface QueueSummary {
+  total: number
+  by_status: Record<QueueStatus, number>
+  by_client: Record<string, Record<string, number>>
+  by_channel: Record<IngressChannel, number>
+  estimated_batches: number
 }
 
 export interface PlannedWrite {
@@ -208,6 +283,10 @@ export interface AuditEventRecord {
   actor: string
   summary: string
   payload: Record<string, unknown>
+  /** Structured state transition; empty strings on events that are not transitions. */
+  from_status?: string
+  to_status?: string
+  reason_code?: string
   created_at: string
 }
 

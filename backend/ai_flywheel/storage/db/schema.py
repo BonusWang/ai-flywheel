@@ -36,7 +36,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     status TEXT NOT NULL DEFAULT 'pending',
     metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    opt_out INTEGER NOT NULL DEFAULT 0,
+    opt_out_reason TEXT NOT NULL DEFAULT '',
+    latest_content_hash TEXT NOT NULL DEFAULT '',
+    latest_turn_count INTEGER NOT NULL DEFAULT 0,
+    last_consumed_turn INTEGER NOT NULL DEFAULT 0,
+    last_consumed_hash TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS rules (
@@ -194,7 +200,10 @@ CREATE TABLE IF NOT EXISTS audit_events (
     actor TEXT NOT NULL DEFAULT 'system',
     summary TEXT NOT NULL DEFAULT '',
     payload_json TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    from_status TEXT NOT NULL DEFAULT '',
+    to_status TEXT NOT NULL DEFAULT '',
+    reason_code TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS workflow_nodes (
@@ -369,6 +378,66 @@ CREATE INDEX IF NOT EXISTS idx_system_settings_cat ON system_settings(category);
 CREATE INDEX IF NOT EXISTS idx_mistake_obs_status_count ON mistake_observations(status, occurrence_count DESC, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_dissent_target_status ON dissent_records(target_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_metrics_snapshots_period ON flywheel_metrics_snapshots(period_key DESC);
+
+-- ---------------- v4 Data Foundation: Unified Code Dictionary & Distill Queue ----------------
+CREATE TABLE IF NOT EXISTS sys_dict_items (
+    dict_type TEXT NOT NULL,
+    code TEXT NOT NULL,
+    label_zh TEXT NOT NULL,
+    label_en TEXT NOT NULL DEFAULT '',
+    group_key TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    sort_order INTEGER NOT NULL DEFAULT 100,
+    is_builtin INTEGER NOT NULL DEFAULT 1,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    meta_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (dict_type, code)
+);
+
+CREATE TABLE IF NOT EXISTS distill_queue (
+    queue_id TEXT PRIMARY KEY,
+    session_key TEXT NOT NULL REFERENCES sessions(session_key) ON DELETE CASCADE,
+    client TEXT NOT NULL,
+    project TEXT NOT NULL DEFAULT 'generic',
+    workspace TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    revision INTEGER NOT NULL DEFAULT 1,
+    chunk_index INTEGER NOT NULL DEFAULT 1,
+    chunk_total INTEGER NOT NULL DEFAULT 1,
+    ingress_channel TEXT NOT NULL DEFAULT 'codex_archive',
+    status TEXT NOT NULL DEFAULT 'queued',
+    priority TEXT NOT NULL DEFAULT 'P1_GENERAL',
+    exclude_reason_code TEXT NOT NULL DEFAULT '',
+    exclude_reason_detail TEXT NOT NULL DEFAULT '',
+    focus_note TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL DEFAULT '',
+    total_chars INTEGER NOT NULL DEFAULT 0,
+    compacted_chars INTEGER NOT NULL DEFAULT 0,
+    is_oversized INTEGER NOT NULL DEFAULT 0,
+    consumed_from_turn INTEGER NOT NULL DEFAULT 0,
+    consumed_to_turn INTEGER NOT NULL DEFAULT 0,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    max_retries INTEGER NOT NULL DEFAULT 3,
+    last_error TEXT NOT NULL DEFAULT '',
+    run_id TEXT,
+    source_path TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    enqueued_at TEXT NOT NULL,
+    claimed_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(session_key, revision, chunk_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sys_dict_type_enabled ON sys_dict_items(dict_type, enabled, sort_order ASC);
+CREATE INDEX IF NOT EXISTS idx_distill_queue_status_priority ON distill_queue(status, priority, enqueued_at ASC);
+CREATE INDEX IF NOT EXISTS idx_distill_queue_client_status ON distill_queue(client, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_distill_queue_session_rev ON distill_queue(session_key, revision DESC, chunk_index ASC);
+CREATE INDEX IF NOT EXISTS idx_distill_queue_run ON distill_queue(run_id);
+CREATE INDEX IF NOT EXISTS idx_audit_events_event_type ON audit_events(event_type, seq DESC);
 """
 
 KNOWLEDGE_FTS_COLUMNS = (

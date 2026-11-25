@@ -92,6 +92,31 @@ class RetroStatus(str, Enum):
     DISMISSED = "dismissed"
 
 
+class QueueStatus(str, Enum):
+    """The lifecycle of one distill-queue inventory item.
+
+    Distinct from :class:`SessionStatus`: a session is an entity, a queue item
+    is one unit of work over it (one revision, one chunk).
+    """
+
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    PROCESSED = "processed"
+    EXCLUDED = "excluded"
+    WITHDRAWN = "withdrawn"
+    DEAD_LETTER = "dead_letter"
+
+
+class IngressChannel(str, Enum):
+    """How a distill-queue item entered the queue."""
+
+    MCP_EXPLICIT = "mcp_explicit"
+    MANUAL_PORTAL = "manual_portal"
+    CODEX_ARCHIVE = "codex_archive"
+    CLAUDE_EXIT = "claude_exit"
+    LEGACY_SCAN = "legacy_scan"
+
+
 class RegisterSessionRequest(BaseModel):
     client: str = Field(..., description="AI client identifier, e.g. codex, claude-code, claude, cursor")
     session_id: str = Field(..., description="Client-side session/thread ID")
@@ -119,6 +144,68 @@ class SessionRecord(BaseModel):
     priority: str = "P1_GENERAL"
     status: SessionStatus = SessionStatus.PENDING
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # The profile extensions. They carry safe defaults so every pre-v4 caller
+    # keeps constructing a valid record without naming them.
+    opt_out: bool = False
+    opt_out_reason: str = ""
+    latest_content_hash: str = ""
+    latest_turn_count: int = 0
+    last_consumed_turn: int = 0
+    last_consumed_hash: str = ""
+    created_at: str = Field(default_factory=utc_now_iso)
+    updated_at: str = Field(default_factory=utc_now_iso)
+
+
+class DictItem(BaseModel):
+    """One row of the unified ``sys_dict_items`` code dictionary."""
+
+    dict_type: str
+    code: str
+    label_zh: str
+    label_en: str = ""
+    group_key: str = ""
+    description: str = ""
+    sort_order: int = 100
+    is_builtin: bool = True
+    enabled: bool = True
+    meta: dict[str, Any] = Field(default_factory=dict)
+    created_at: str = Field(default_factory=utc_now_iso)
+    updated_at: str = Field(default_factory=utc_now_iso)
+
+
+class DistillQueueItem(BaseModel):
+    """One unit of distill work: a session revision, optionally one chunk of it."""
+
+    queue_id: str
+    session_key: str
+    client: str
+    project: str = "generic"
+    workspace: str = ""
+    title: str = ""
+    revision: int = 1
+    chunk_index: int = 1
+    chunk_total: int = 1
+    ingress_channel: IngressChannel = IngressChannel.CODEX_ARCHIVE
+    status: QueueStatus = QueueStatus.QUEUED
+    priority: str = "P1_GENERAL"
+    exclude_reason_code: str = ""
+    exclude_reason_detail: str = ""
+    focus_note: str = ""
+    content_hash: str = ""
+    total_chars: int = 0
+    compacted_chars: int = 0
+    is_oversized: bool = False
+    consumed_from_turn: int = 0
+    consumed_to_turn: int = 0
+    retry_count: int = 0
+    max_retries: int = 3
+    last_error: str = ""
+    run_id: str | None = None
+    source_path: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    enqueued_at: str = Field(default_factory=utc_now_iso)
+    claimed_at: str | None = None
+    completed_at: str | None = None
     created_at: str = Field(default_factory=utc_now_iso)
     updated_at: str = Field(default_factory=utc_now_iso)
 

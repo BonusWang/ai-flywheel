@@ -64,6 +64,22 @@ def build_governance_router(rt: FlywheelRuntime) -> APIRouter:
     def list_policies() -> dict[str, Any]:
         return {"policies": rt.policies.list_policies()}
 
+    # ---- Unified Code Dictionary (read-only display metadata) ----
+    @router.get("/api/site/dicts")
+    def site_list_dicts(
+        dict_type: str | None = None,
+        include_disabled: bool = False,
+    ) -> dict[str, Any]:
+        items = rt.db.list_dicts(dict_type=dict_type, include_disabled=include_disabled)
+        grouped = rt.db.get_dicts_grouped(
+            dict_type=dict_type, include_disabled=include_disabled
+        )
+        return {
+            "dicts": grouped,
+            "items": [item.model_dump(mode="json") for item in items],
+            "total": len(items),
+        }
+
     @router.put("/api/site/policies/{policy_id}")
     def update_policy(policy_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         updated = rt.policies.update_policy(policy_id, patch)

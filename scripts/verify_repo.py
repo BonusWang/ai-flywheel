@@ -40,8 +40,8 @@ if str(REPO_ROOT / "backend") not in sys.path:
 # ---------------------------------------------------------------- file surface
 
 #: The file kinds the public-repo rules apply to. SVG is text: a path or a name in a
-#: diagram is just as public as one in a Markdown file.
-SCAN_SUFFIXES = frozenset({".py", ".ts", ".tsx", ".md", ".yaml", ".yml", ".example", ".svg"})
+#: diagram is just as public as one in a Markdown file. SQL is the authoritative DDL.
+SCAN_SUFFIXES = frozenset({".py", ".ts", ".tsx", ".md", ".yaml", ".yml", ".example", ".svg", ".sql"})
 
 #: Directories that never hold shipped source.
 EXCLUDED_DIRS = frozenset(

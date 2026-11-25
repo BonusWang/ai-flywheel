@@ -5,6 +5,7 @@ import type {
   ConfigSaveResponse,
   ConnectPayload,
   CoreCardPayload,
+  DictItem,
   DissentRecord,
   DreamResult,
   DreamStatusPayload,
@@ -192,6 +193,12 @@ export const api = {
     }),
 
   listPolicies: () => req<{ policies: Record<string, any> }>('/api/site/policies'),
+  listDicts: (dictType?: string) =>
+    req<{ dicts: Record<string, DictItem[]>; items: DictItem[]; total: number }>(
+      dictType
+        ? `/api/site/dicts?dict_type=${encodeURIComponent(dictType)}`
+        : '/api/site/dicts'
+    ),
   updatePolicy: (policyId: string, patch: Record<string, any>) =>
     req<{ policy: any }>(`/api/site/policies/${policyId}`, {
       method: 'PUT',

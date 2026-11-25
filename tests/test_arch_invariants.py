@@ -23,6 +23,7 @@ import json
 import logging
 import re
 import shutil
+import sqlite3
 import sys
 import threading
 from pathlib import Path
@@ -43,8 +44,16 @@ from ai_flywheel.app import create_app
 from ai_flywheel.config import ApiRunnerConfig, FlywheelConfig
 from ai_flywheel.core.feishu_card import is_sensitive
 from ai_flywheel.core.orchestrator import NODE_TEMPLATES
-from ai_flywheel.models import RunStatus, SignalKind, is_sensitive_write
+from ai_flywheel.models import (
+    IngressChannel,
+    QueueStatus,
+    RuleStatus,
+    RunStatus,
+    SignalKind,
+    is_sensitive_write,
+)
 from ai_flywheel.runtime import FlywheelRuntime
+from ai_flywheel.storage.db import FlywheelDB
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FRONTEND_SRC = REPO_ROOT / "frontend" / "src"
@@ -503,3 +512,100 @@ def test_a_usable_model_reply_is_cached(tmp_path: Path, monkeypatch: pytest.Monk
     cached = sorted(p.name for p in cache_dir.glob("*.json"))
     assert any(name.startswith("p02_review-") for name in cached), cached
     assert any(name.startswith("p03_plan-") for name in cached), cached
+
+
+# ---------------------------------------------------------------- 7. 数据底座建模
+
+
+def _schema_snapshot(path: Path) -> dict[str, set[str]]:
+    """Every user table and its column set, minus SQLite internals and FTS shadow tables."""
+    conn = sqlite3.connect(str(path))
+    try:
+        tables = [
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        ]
+        kept = sorted(
+            table
+            for table in tables
+            if not table.startswith("sqlite_") and not table.startswith("knowledge_fts_")
+        )
+        return {
+            table: {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')")}
+            for table in kept
+        }
+    finally:
+        conn.close()
+
+
+def test_the_authoritative_ddl_matches_the_runtime_schema(tmp_path: Path):
+    """`docs/schema.sql` 与运行时 `FlywheelDB` 的表集合、逐表列集合必须完全一致。"""
+    ddl = (REPO_ROOT / "docs" / "schema.sql").read_text(encoding="utf-8")
+    reference_db = tmp_path / "reference.db"
+    conn = sqlite3.connect(str(reference_db))
+    try:
+        conn.executescript(ddl)
+    finally:
+        conn.close()
+
+    FlywheelDB(tmp_path / "runtime.db")
+
+    documented = _schema_snapshot(reference_db)
+    runtime = _schema_snapshot(tmp_path / "runtime.db")
+    assert set(documented) == set(runtime), {
+        "documented_only": sorted(set(documented) - set(runtime)),
+        "runtime_only": sorted(set(runtime) - set(documented)),
+    }
+    for table in sorted(documented):
+        assert documented[table] == runtime[table], {
+            "table": table,
+            "documented_only": sorted(documented[table] - runtime[table]),
+            "runtime_only": sorted(runtime[table] - documented[table]),
+        }
+
+
+def test_the_builtin_dictionary_covers_every_execution_enum_value(tmp_path: Path):
+    """五个执行枚举的每个值都必须在 `sys_dict_items` 里有启用记录。"""
+    db = FlywheelDB(tmp_path / "dicts.db")
+    coverage = {
+        "queue_status": QueueStatus,
+        "ingress_channel": IngressChannel,
+        "run_status": RunStatus,
+        "rule_status": RuleStatus,
+        "signal_kind": SignalKind,
+    }
+    for dict_type, enum_cls in coverage.items():
+        enabled = {item.code for item in db.list_dicts(dict_type=dict_type) if item.enabled}
+        missing = {member.value for member in enum_cls} - enabled
+        assert not missing, f"{dict_type} is missing {sorted(missing)}"
+
+
+def test_the_frontend_queue_types_and_labels_match_the_backend_enums():
+    """前端 `QueueStatus` / `IngressChannel` 联合与标签必须与后端枚举逐值一致。"""
+    types = (FRONTEND_SRC / "types.ts").read_text(encoding="utf-8")
+
+    def _union(name: str) -> set[str]:
+        line = re.search(rf"export type {name} = ([^\n]+)", types)
+        assert line is not None, f"{name} union is missing from types.ts"
+        return set(re.findall(r"'([^']+)'", line.group(1)))
+
+    assert _union("QueueStatus") == {status.value for status in QueueStatus}
+    assert _union("IngressChannel") == {channel.value for channel in IngressChannel}
+
+    labels = (FRONTEND_SRC / "lib" / "labels.ts").read_text(encoding="utf-8")
+
+    def _label_keys(name: str) -> set[str]:
+        match = re.search(
+            rf"export const {name}: Record<string, string> = \{{(.*?)\n\}}", labels, re.S
+        )
+        assert match is not None, f"{name} is missing from labels.ts"
+        return set(re.findall(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:", match.group(1), re.M))
+
+    assert {status.value for status in QueueStatus} <= _label_keys("QUEUE_STATUS_LABELS")
+    assert {channel.value for channel in IngressChannel} <= _label_keys("INGRESS_CHANNEL_LABELS")
+
+
+def test_the_hygiene_scan_covers_the_authoritative_ddl():
+    """权威 DDL 也是公开仓文本，必须纳入卫生扫描后缀。"""
+    assert ".sql" in verify_repo.SCAN_SUFFIXES
+    assert (REPO_ROOT / "docs" / "schema.sql").is_file()

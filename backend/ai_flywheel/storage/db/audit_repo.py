@@ -10,6 +10,50 @@ class AuditRepoMixin:
 
 
     # ---------------- v2 Audit Events, Decision Cards, Deliveries, Skill Assets, System Settings ----------------
+    def _insert_audit_event(
+        self,
+        conn: Any,
+        *,
+        entity_type: str,
+        entity_id: str,
+        event_type: str,
+        actor: str = "system",
+        summary: str = "",
+        payload: dict[str, Any] | None = None,
+        from_status: str = "",
+        to_status: str = "",
+        reason_code: str = "",
+    ) -> int:
+        """Write one audit row on an existing connection.
+
+        Repositories that already hold a write transaction (the queue status
+        transition) call this so the state update and its trail commit or roll
+        back together, instead of opening a second connection.
+        """
+        now = self._now_iso()
+        cur = conn.execute(
+            """
+            INSERT INTO audit_events (
+                entity_type, entity_id, event_type, actor, summary, payload_json,
+                from_status, to_status, reason_code, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                entity_type,
+                entity_id,
+                event_type,
+                actor,
+                summary,
+                json.dumps(payload or {}, ensure_ascii=False),
+                from_status,
+                to_status,
+                reason_code,
+                now,
+            ),
+        )
+        return int(cur.lastrowid or 0)
+
     def append_audit_event(
         self,
         *,
@@ -19,25 +63,28 @@ class AuditRepoMixin:
         actor: str = "system",
         summary: str = "",
         payload: dict[str, Any] | None = None,
+        from_status: str = "",
+        to_status: str = "",
+        reason_code: str = "",
     ) -> int:
-        now = self._now_iso()
+        """Append one audit event; the status-transition arguments are optional.
+
+        Existing callers keep the old keyword set: an omitted transition lands
+        as the empty string, so no caller has to change to stay compatible.
+        """
         with self.connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO audit_events (entity_type, entity_id, event_type, actor, summary, payload_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    entity_type,
-                    entity_id,
-                    event_type,
-                    actor,
-                    summary,
-                    json.dumps(payload or {}, ensure_ascii=False),
-                    now,
-                ),
+            return self._insert_audit_event(
+                conn,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                event_type=event_type,
+                actor=actor,
+                summary=summary,
+                payload=payload,
+                from_status=from_status,
+                to_status=to_status,
+                reason_code=reason_code,
             )
-            return int(cur.lastrowid or 0)
 
     def list_audit_events(
         self,

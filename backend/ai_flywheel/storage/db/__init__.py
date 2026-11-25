@@ -16,8 +16,10 @@ from ai_flywheel.models import utc_now_iso
 from ai_flywheel.storage.clock import Clock
 from ai_flywheel.storage.db.asset_repo import AssetRepoMixin
 from ai_flywheel.storage.db.audit_repo import AuditRepoMixin
+from ai_flywheel.storage.db.dict_repo import BUILTIN_DICT_SEEDS, DictRepoMixin
 from ai_flywheel.storage.db.knowledge_repo import KnowledgeRepoMixin
 from ai_flywheel.storage.db.migrations import MigrationsMixin
+from ai_flywheel.storage.db.queue_repo import QueueRepoMixin
 from ai_flywheel.storage.db.rule_repo import RuleRepoMixin
 from ai_flywheel.storage.db.schema import (
     INTERNAL_RUN_TRIGGER,
@@ -44,6 +46,7 @@ from ai_flywheel.storage.db.workflow_repo import WorkflowRepoMixin
 
 # Everything the old monolith exported stays importable from here.
 __all__ = [
+    "BUILTIN_DICT_SEEDS",
     "FlywheelDB",
     "INTERNAL_RUN_TRIGGER",
     "KNOWLEDGE_FTS_COLUMNS",
@@ -73,6 +76,8 @@ class FlywheelDB(
     AssetRepoMixin,
     KnowledgeRepoMixin,
     AuditRepoMixin,
+    DictRepoMixin,
+    QueueRepoMixin,
     MigrationsMixin,
 ):
     """The flywheel store: one SQLite database, one class.

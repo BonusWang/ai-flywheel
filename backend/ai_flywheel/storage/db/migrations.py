@@ -41,6 +41,12 @@ class MigrationsMixin:
             # the Feishu layer: the schema must be the same whether or not the
             # Feishu channel is enabled at startup.
             self._ensure_outbox_columns(conn)
+            # v4: the unified dictionary, the distill queue and the structured
+            # state-transition columns of the one generic trail table.
+            self._migrate_to_v4(conn, preexisting=preexisting)
+            # The builtin dictionary is planted on every start, not only when the
+            # migration first runs: a new builtin item reaches an existing database.
+            self._seed_builtin_dicts(conn)
 
     @staticmethod
     def _to_shanghai_date(iso_str: str | None) -> str:
@@ -251,6 +257,66 @@ class MigrationsMixin:
         )
         conn.execute(
             "INSERT OR REPLACE INTO schema_migrations (version, name, applied_at) VALUES (3, 'v3_true_flywheel_evolution', ?)",
+            (now,),
+        )
+
+    def _migrate_to_v4(self, conn: sqlite3.Connection, *, preexisting: bool) -> None:
+        """The data foundation: dictionary table, distill queue and trail columns.
+
+        Idempotent by construction: the tables and indexes come from
+        ``SCHEMA_SQL`` with ``IF NOT EXISTS``, and every added column goes
+        through ``_ensure_column``. A pre-existing (v3) database is first copied
+        to ``<db>.bak-v3``; existing rows are never rewritten.
+        """
+        applied = conn.execute(
+            "SELECT version FROM schema_migrations WHERE version = 4"
+        ).fetchone()
+        if applied:
+            return
+
+        # Auto-backup the existing v3 database before the v4 upgrade.
+        if preexisting and self.db_path.exists():
+            backup = self.db_path.with_name(f"{self.db_path.name}.bak-v3")
+            if not backup.exists():
+                try:
+                    shutil.copy2(self.db_path, backup)
+                except OSError:
+                    pass
+
+        now = self._now_iso()
+        # The session profile: opt-out plus the content fingerprint / consumption watermark.
+        self._ensure_column(conn, "sessions", "opt_out", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "sessions", "opt_out_reason", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "sessions", "latest_content_hash", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "sessions", "latest_turn_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "sessions", "last_consumed_turn", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "sessions", "last_consumed_hash", "TEXT NOT NULL DEFAULT ''")
+        # The one generic trail table gains structured state transitions.
+        self._ensure_column(conn, "audit_events", "from_status", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "audit_events", "to_status", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "audit_events", "reason_code", "TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_events_event_type ON audit_events(event_type, seq DESC)"
+        )
+        # The v4 tables and their indexes, re-asserted for a database that was
+        # created by an older build but somehow lacks them.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sys_dict_type_enabled ON sys_dict_items(dict_type, enabled, sort_order ASC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_distill_queue_status_priority ON distill_queue(status, priority, enqueued_at ASC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_distill_queue_client_status ON distill_queue(client, status, updated_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_distill_queue_session_rev ON distill_queue(session_key, revision DESC, chunk_index ASC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_distill_queue_run ON distill_queue(run_id)"
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_migrations (version, name, applied_at) VALUES (4, 'v4_data_foundation_dicts_and_queue', ?)",
             (now,),
         )
 

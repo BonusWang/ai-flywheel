@@ -47,6 +47,25 @@ export const RETRO_KIND_LABELS: Record<string, string> = {
   custom: '自定义信号',
 }
 
+/** Fallback labels for every distill-queue status, used when no dictionary is loaded. */
+export const QUEUE_STATUS_LABELS: Record<string, string> = {
+  queued: '排队中',
+  processing: '处理中',
+  processed: '已沉淀',
+  excluded: '已排除',
+  withdrawn: '已撤回',
+  dead_letter: '死信',
+}
+
+/** Fallback labels for every ingress channel, used when no dictionary is loaded. */
+export const INGRESS_CHANNEL_LABELS: Record<string, string> = {
+  mcp_explicit: 'MCP 显式入队',
+  manual_portal: '控制台手动入队',
+  codex_archive: 'Codex 归档',
+  claude_exit: 'Claude 退出',
+  legacy_scan: '历史扫描',
+}
+
 export const POLICY_SOURCE_LABELS: Record<string, string> = {
   default: '系统默认',
   profile_override: '个人配置覆盖',
