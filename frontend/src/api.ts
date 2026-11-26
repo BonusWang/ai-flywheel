@@ -13,6 +13,9 @@ import type {
   FeishuCheckStatus,
   GrowthMetricsPayload,
   KnowledgeDocSummary,
+  KnowledgeFreshnessAction,
+  KnowledgeFreshnessUpdateRequest,
+  KnowledgeFreshnessUpdateResponse,
   MistakeObservation,
   OutcomeRecord,
   OverviewResponse,
@@ -318,6 +321,11 @@ export const api = {
       total?: number
       expired_total?: number
     }>('/api/site/knowledge'),
+  updateKnowledgeFreshness: (body: KnowledgeFreshnessUpdateRequest) =>
+    req<KnowledgeFreshnessUpdateResponse>('/api/site/knowledge/freshness', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
   feishuCheckStatus: () => req<FeishuCheckStatus>('/api/site/feishu-check'),
   startFeishuCheck: (waitSeconds = 120) =>
     req<{ started: boolean; wait_seconds: number }>('/api/site/feishu-check', {

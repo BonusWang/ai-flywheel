@@ -317,10 +317,11 @@ export const AutomationsPage: React.FC<Props> = ({
     try {
       const res = await api.runDream(dryRun)
       setDreamResult(res.result)
+      const retiredCount = res.result.auto_archived_cards?.length || 0
       toast.push(
         dryRun
-          ? `预览完成：待休眠 ${res.result.auto_dormant_rules.length} 条零命中规则，待复核 ${res.result.expired_cards.length} 篇笔记（未改动数据）`
-          : `精简完成：已休眠 ${res.result.auto_dormant_rules.length} 条零命中规则，标记 ${res.result.expired_cards.length} 篇待复核笔记`
+          ? `预览完成：待休眠 ${res.result.auto_dormant_rules.length} 条零命中规则，${retiredCount > 0 ? `待自动退场 ${retiredCount} 篇超期零助益笔记，` : ''}待复核 ${res.result.expired_cards.length} 篇笔记（未改动数据）`
+          : `精简完成：已休眠 ${res.result.auto_dormant_rules.length} 条零命中规则，${retiredCount > 0 ? `已自动归档 ${retiredCount} 篇超期零助益笔记，` : ''}标记 ${res.result.expired_cards.length} 篇待复核笔记`
       )
       await load(false)
       if (!dryRun) onGlobalRefresh()
@@ -755,6 +756,14 @@ export const AutomationsPage: React.FC<Props> = ({
                   <span>周期：{activeDream.period_key}</span>
                   <span>·</span>
                   <span>待休眠规则：{activeDream.auto_dormant_rules.length} 条</span>
+                  {activeDream.auto_archived_cards && activeDream.auto_archived_cards.length > 0 && (
+                    <>
+                      <span>·</span>
+                      <span className="text-amber-ink font-medium">
+                        自动退场笔记：{activeDream.auto_archived_cards.length} 篇
+                      </span>
+                    </>
+                  )}
                   <span>·</span>
                   <span>待复核笔记：{activeDream.expired_cards.length} 篇</span>
                   <span>·</span>

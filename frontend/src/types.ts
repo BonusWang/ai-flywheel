@@ -433,6 +433,19 @@ export interface KnowledgeDocSummary {
   helped_count?: number
 }
 
+export type KnowledgeFreshnessAction = 'verify' | 'archive' | 'restore' | 'set_tier'
+
+export interface KnowledgeFreshnessUpdateRequest {
+  doc_path: string
+  action: KnowledgeFreshnessAction
+  freshness_tier?: 'volatile' | 'evolving' | 'evergreen'
+}
+
+export interface KnowledgeFreshnessUpdateResponse {
+  card: KnowledgeDocSummary
+  expired_total: number
+}
+
 export interface SkillAssetRecord {
   skill_name: string
   source_dir: string
@@ -492,6 +505,20 @@ export interface DreamResult {
   dry_run?: boolean
   period_key: string
   auto_dormant_rules: Array<{ rule_id: string; title: string; created_at?: string }>
+  auto_archived_observations?: Array<{
+    obs_id: string
+    root_cause_key?: string
+    title?: string
+    severity_grade?: string
+    updated_at?: string
+  }>
+  auto_archived_cards?: Array<{
+    doc_path: string
+    freshness_tier?: string
+    valid_until?: string | null
+    freshness_state?: string
+    helped_count?: number
+  }>
   expired_cards: Array<{
     doc_path: string
     freshness_tier?: string

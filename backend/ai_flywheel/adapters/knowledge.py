@@ -528,12 +528,14 @@ class KnowledgeSinkAdapter:
             fm_parsed.get("valid_until")
             or compute_valid_until(tier, last_verified)
         ).strip()
+        doc_status = str(fm_parsed.get("status") or "").strip().lower()
+        initial_state = doc_status if doc_status in {"archived", "superseded"} else "fresh"
         self.db.upsert_knowledge_freshness(
             rel,
             freshness_tier=tier,
             last_verified_at=last_verified,
             valid_until=valid_until,
-            freshness_state="fresh",
+            freshness_state=initial_state,
         )
         return {
             "relative_path": rel,
@@ -597,18 +599,52 @@ class KnowledgeSinkAdapter:
 
     def sync_fts_index(self) -> int:
         docs, _skipped = self._search_documents()
-        count = self.db.rebuild_knowledge_fts(docs)
+        fts_docs = [
+            d
+            for d in docs
+            if str(d.get("status") or "").strip().lower() not in {"archived", "superseded"}
+        ]
+        count = self.db.rebuild_knowledge_fts(fts_docs)
         existing_map = self.db.get_knowledge_freshness_map()
-        for doc in docs:
-            tier = doc.get("freshness_tier") or ""
-            last_v = doc.get("last_verified") or ""
-            valid_u = doc.get("valid_until") or ""
-            if not (tier or last_v or valid_u):
-                continue
-            rel = doc["doc_path"]
+        synced_paths: set[str] = set()
+
+        def _sync_freshness_entry(
+            rel: str, doc_status: str, tier: str, last_v: str, valid_u: str
+        ) -> None:
+            synced_paths.add(rel)
             prev = existing_map.get(rel)
+            if doc_status in {"archived", "superseded"}:
+                if not (tier or last_v or valid_u or prev):
+                    return
+                if not prev or prev.get("freshness_state") != doc_status:
+                    effective_tier = tier or (prev.get("freshness_tier") if prev else "") or "evolving"
+                    if effective_tier not in {"volatile", "evolving", "evergreen"}:
+                        effective_tier = "evolving"
+                    effective_v = last_v or (prev.get("last_verified_at") if prev else "") or shanghai_today_ymd()
+                    effective_u = (
+                        valid_u
+                        or (prev.get("valid_until") if prev else "")
+                        or compute_valid_until(effective_tier, effective_v)
+                    )
+                    self.db.upsert_knowledge_freshness(
+                        rel,
+                        freshness_tier=effective_tier,
+                        last_verified_at=effective_v,
+                        valid_until=effective_u,
+                        freshness_state=doc_status,
+                    )
+                return
+
+            if not (tier or last_v or valid_u):
+                return
+
+            if prev and prev.get("freshness_state") in {"archived", "superseded"}:
+                if not (last_v and last_v > str(prev.get("last_verified_at") or "")):
+                    return
+
             if prev and prev.get("last_verified_at") and last_v and str(prev["last_verified_at"]) >= last_v:
-                continue
+                return
+
             effective_tier = tier if tier in {"volatile", "evolving", "evergreen"} else "evolving"
             effective_v = last_v or shanghai_today_ymd()
             effective_u = valid_u or compute_valid_until(effective_tier, effective_v)
@@ -618,6 +654,37 @@ class KnowledgeSinkAdapter:
                 last_verified_at=effective_v,
                 valid_until=effective_u,
                 freshness_state="fresh",
+            )
+
+        for doc in docs:
+            _sync_freshness_entry(
+                doc["doc_path"],
+                str(doc.get("status") or "").strip().lower(),
+                doc.get("freshness_tier") or "",
+                doc.get("last_verified") or "",
+                doc.get("valid_until") or "",
+            )
+
+        # In schema-governed Wikis, `_search_documents` excludes `status: archived`
+        # from `knowledge_fts`; still inspect those skipped files leniently so
+        # `knowledge_card_metrics` retires them cleanly without indexing them.
+        for md, rel in self._iter_candidate_files():
+            if rel in synced_paths:
+                continue
+            try:
+                text = md.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            fm = self._parse_page_lenient(text).get("frontmatter") or {}
+            doc_status = str(fm.get("status") or "").strip().lower()
+            if doc_status not in {"archived", "superseded"}:
+                continue
+            _sync_freshness_entry(
+                rel,
+                doc_status,
+                str(fm.get("freshness_tier") or "").strip(),
+                str(fm.get("last_verified") or "").strip(),
+                str(fm.get("valid_until") or "").strip(),
             )
         return count
 

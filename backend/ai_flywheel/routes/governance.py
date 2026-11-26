@@ -57,6 +57,12 @@ class DissentBulkStatusBody(BaseModel):
     status: str
 
 
+class KnowledgeFreshnessBody(BaseModel):
+    doc_path: str
+    action: str
+    freshness_tier: str | None = None
+
+
 def build_governance_router(rt: FlywheelRuntime) -> APIRouter:
     router = APIRouter()
 
@@ -379,13 +385,15 @@ def build_governance_router(rt: FlywheelRuntime) -> APIRouter:
                 "helped_count": int(finfo.get("helped_count") or 0),
             }
 
-        # Ensure every tracked expired or surfaced card from freshness_map is visible
+        # Ensure every tracked expired, archived, or surfaced card from freshness_map is visible
         # even when the mounted knowledge base holds more than `limit` files.
         for doc_path, finfo in freshness_map.items():
             if doc_path in by_path:
                 continue
             expired = _is_card_expired(finfo)
-            if not expired and int(finfo.get("surface_count") or 0) == 0 and int(finfo.get("helped_count") or 0) == 0:
+            state = str(finfo.get("freshness_state") or "")
+            is_archived = state in {"archived", "superseded"}
+            if not expired and not is_archived and int(finfo.get("surface_count") or 0) == 0 and int(finfo.get("helped_count") or 0) == 0:
                 continue
             stem = Path(doc_path).stem
             by_path[doc_path] = {
@@ -416,6 +424,69 @@ def build_governance_router(rt: FlywheelRuntime) -> APIRouter:
             "root": str(rt.knowledge.root),
             "documents": enriched,
             "total": len(enriched),
+            "expired_total": expired_total,
+        }
+
+    @router.post("/api/site/knowledge/freshness")
+    def site_update_knowledge_freshness(body: KnowledgeFreshnessBody) -> dict[str, Any]:
+        doc_path = body.doc_path.strip()
+        if not doc_path:
+            raise HTTPException(status_code=422, detail="doc_path is required")
+        action = body.action.strip().lower()
+        if action not in {"verify", "archive", "restore", "set_tier"}:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid action '{body.action}'. Must be one of verify, archive, restore, set_tier",
+            )
+        tier = (body.freshness_tier or "").strip().lower() or None
+        if action == "set_tier":
+            if not tier or tier not in {"volatile", "evolving", "evergreen"}:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Invalid freshness_tier '{body.freshness_tier}'. Must be volatile, evolving, or evergreen",
+                )
+        elif tier and tier not in {"volatile", "evolving", "evergreen"}:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid freshness_tier '{body.freshness_tier}'. Must be volatile, evolving, or evergreen",
+            )
+
+        today = shanghai_today_ymd()
+        try:
+            card = rt.db.update_knowledge_freshness_action(
+                doc_path,
+                action,
+                today_ymd=today,
+                freshness_tier=tier,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        action_labels = {
+            "verify": "确认笔记有效并顺延保鲜期",
+            "archive": "移出待复核（台账归档）",
+            "restore": "恢复保鲜跟踪",
+            "set_tier": f"调整保鲜档位为 {tier}",
+        }
+        rt.db.append_audit_event(
+            entity_type="knowledge_card",
+            entity_id=doc_path,
+            event_type=f"knowledge_freshness_{action}",
+            actor="portal",
+            summary=f"人工台账复核：{action_labels.get(action, action)}（{doc_path}）",
+            payload={
+                "doc_path": doc_path,
+                "action": action,
+                "freshness_tier": tier,
+                "card": card,
+            },
+        )
+        rt.refresh_core_card()
+
+        freshness_map = rt.db.get_knowledge_freshness_map()
+        expired_total = sum(1 for finfo in freshness_map.values() if finfo.get("is_expired"))
+        return {
+            "card": card,
             "expired_total": expired_total,
         }
 

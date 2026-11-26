@@ -218,3 +218,163 @@ def test_dream_auto_archives_stale_low_severity_only(tmp_path: Path) -> None:
     assert archived_ids == [low_obs["obs_id"]]
     assert rt.db.get_mistake_observation(low_obs["obs_id"])["status"] == "archived"
     assert rt.db.get_mistake_observation(red_obs["obs_id"])["status"] == "observing"
+
+
+def test_dream_auto_archives_stale_zero_help_cards_only(tmp_path: Path) -> None:
+    rt = _make_runtime(tmp_path)
+    now_utc = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    # Card A: valid_until is 40 days ago (< cutoff 30 days), helped_count = 0 -> must auto-archive
+    rt.db.upsert_knowledge_freshness(
+        doc_path="projects/card-a.md",
+        freshness_tier="evolving",
+        last_verified_at="2026-01-01",
+        valid_until="2026-04-20",
+        freshness_state="needs_recheck",
+    )
+    # Card B: valid_until is 40 days ago, but helped_count = 2 -> protected from auto-archive
+    rt.db.upsert_knowledge_freshness(
+        doc_path="projects/card-b.md",
+        freshness_tier="evolving",
+        last_verified_at="2026-01-01",
+        valid_until="2026-04-20",
+        freshness_state="needs_recheck",
+    )
+    rt.db.record_knowledge_usage(["projects/card-b.md"], "2026-04-01")
+    rt.db.record_knowledge_usage(["projects/card-b.md"], "2026-04-15")
+
+    # Card C: valid_until is only 10 days ago (> cutoff 30 days), helped_count = 0 -> within grace, not auto-archived
+    rt.db.upsert_knowledge_freshness(
+        doc_path="projects/card-c.md",
+        freshness_tier="evolving",
+        last_verified_at="2026-03-01",
+        valid_until="2026-05-22",
+        freshness_state="needs_recheck",
+    )
+
+    # Create dummy files on disk to verify zero byte modification
+    kb_dir = Path(rt.cfg.knowledge_sink.root)
+    (kb_dir / "projects").mkdir(parents=True, exist_ok=True)
+    card_a_file = kb_dir / "projects" / "card-a.md"
+    card_b_file = kb_dir / "projects" / "card-b.md"
+    card_a_bytes = b"# Card A\nImmutable content\n"
+    card_b_bytes = b"# Card B\nImmutable content\n"
+    card_a_file.write_bytes(card_a_bytes)
+    card_b_file.write_bytes(card_b_bytes)
+
+    # 1. Preview: strictly read-only
+    preview = preview_dream_consolidation(rt.cfg, rt.db, now_utc=now_utc)
+    preview_archived_paths = [c["doc_path"] for c in preview["auto_archived_cards"]]
+    assert "projects/card-a.md" in preview_archived_paths
+    assert "projects/card-b.md" not in preview_archived_paths
+    assert "projects/card-c.md" not in preview_archived_paths
+
+    preview_expired_paths = [c["doc_path"] for c in preview["expired_cards"]]
+    assert "projects/card-a.md" not in preview_expired_paths
+    assert "projects/card-b.md" in preview_expired_paths
+    assert "projects/card-c.md" in preview_expired_paths
+
+    # Confirm zero database modification during preview
+    fmap_pre = rt.db.get_knowledge_freshness_map()
+    assert fmap_pre["projects/card-a.md"]["freshness_state"] == "needs_recheck"
+
+    # 2. Run Dream
+    res = run_dream_consolidation(rt.cfg, rt.db, now_utc=now_utc)
+    archived_paths = [c["doc_path"] for c in res["auto_archived_cards"]]
+    assert archived_paths == ["projects/card-a.md"]
+
+    expired_paths = [c["doc_path"] for c in res["expired_cards"]]
+    assert "projects/card-a.md" not in expired_paths
+    assert "projects/card-b.md" in expired_paths
+    assert "projects/card-c.md" in expired_paths
+
+    fmap_post = rt.db.get_knowledge_freshness_map()
+    assert fmap_post["projects/card-a.md"]["freshness_state"] == "archived"
+    assert fmap_post["projects/card-b.md"]["freshness_state"] == "needs_recheck"
+    assert fmap_post["projects/card-c.md"]["freshness_state"] == "needs_recheck"
+
+    # Confirm audit event was recorded
+    audit_events = rt.db.list_audit_events(entity_type="knowledge_card", limit=10)
+    assert any(e["event_type"] == "knowledge_freshness_auto_archived" for e in audit_events)
+
+    # Confirm zero disk file changes
+    assert card_a_file.read_bytes() == card_a_bytes
+    assert card_b_file.read_bytes() == card_b_bytes
+
+
+def test_knowledge_freshness_actions_api_and_file_preservation(tmp_path: Path) -> None:
+    rt = _make_runtime(tmp_path)
+    kb_dir = Path(rt.cfg.knowledge_sink.root)
+    doc_path = "fresh-doc.md"
+    doc_file = kb_dir / doc_path
+    original_bytes = doc_file.read_bytes()
+
+    app = create_app(runtime=rt)
+    client = TestClient(app)
+
+    # Initial state: doc is in kb, freshness entry created with volatile (30d) in past
+    rt.db.upsert_knowledge_freshness(
+        doc_path=doc_path,
+        freshness_tier="volatile",
+        last_verified_at="2025-01-01",
+        valid_until="2025-01-31",
+        freshness_state="needs_recheck",
+    )
+
+    # 1. Action: verify -> renews validity and state to fresh
+    res = client.post(
+        "/api/site/knowledge/freshness",
+        json={"doc_path": doc_path, "action": "verify"},
+    )
+    assert res.status_code == 200
+    data = res.json()
+    card = data["card"]
+    assert card["freshness_state"] == "fresh"
+    assert card["is_expired"] is False
+    assert card["last_verified_at"] is not None
+    assert doc_file.read_bytes() == original_bytes
+
+    # 2. Action: set_tier -> change tier to evergreen (180d)
+    res = client.post(
+        "/api/site/knowledge/freshness",
+        json={"doc_path": doc_path, "action": "set_tier", "freshness_tier": "evergreen"},
+    )
+    assert res.status_code == 200
+    card = res.json()["card"]
+    assert card["freshness_tier"] == "evergreen"
+    assert doc_file.read_bytes() == original_bytes
+
+    # 3. Action: archive -> moves out of needs_recheck
+    res = client.post(
+        "/api/site/knowledge/freshness",
+        json={"doc_path": doc_path, "action": "archive"},
+    )
+    assert res.status_code == 200
+    card = res.json()["card"]
+    assert card["freshness_state"] == "archived"
+    assert card["is_expired"] is False
+    assert doc_file.read_bytes() == original_bytes
+
+    # GET /api/site/knowledge returns the archived card
+    list_res = client.get("/api/site/knowledge")
+    assert list_res.status_code == 200
+    docs = list_res.json()["documents"]
+    archived_doc = next(d for d in docs if d["doc_path"] == doc_path)
+    assert archived_doc["freshness_state"] == "archived"
+
+    # 4. Action: restore -> brings back to active tracking
+    res = client.post(
+        "/api/site/knowledge/freshness",
+        json={"doc_path": doc_path, "action": "restore"},
+    )
+    assert res.status_code == 200
+    card = res.json()["card"]
+    assert card["freshness_state"] == "fresh"
+    assert card["is_expired"] is False
+    assert doc_file.read_bytes() == original_bytes
+
+    # 5. Validation errors
+    assert client.post("/api/site/knowledge/freshness", json={"doc_path": "", "action": "verify"}).status_code == 422
+    assert client.post("/api/site/knowledge/freshness", json={"doc_path": doc_path, "action": "invalid_act"}).status_code == 422
+    assert client.post("/api/site/knowledge/freshness", json={"doc_path": doc_path, "action": "set_tier", "freshness_tier": "invalid_tier"}).status_code == 422
+

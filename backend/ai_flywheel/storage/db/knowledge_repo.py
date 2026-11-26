@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Any
 
 from ai_flywheel.core.time_utils import compute_valid_until, shanghai_today_ymd
@@ -259,12 +259,164 @@ class KnowledgeRepoMixin:
                        surface_count, helped_count
                 FROM knowledge_card_metrics
                 WHERE freshness_state = 'needs_recheck'
-                   OR (valid_until IS NOT NULL AND valid_until != '' AND valid_until < ? AND freshness_state != 'archived')
+                   OR (valid_until IS NOT NULL AND valid_until != '' AND valid_until < ? AND freshness_state NOT IN ('archived', 'superseded'))
                 ORDER BY valid_until ASC
                 """,
                 (today_ymd,),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def list_stale_zero_help_cards(
+        self, today_ymd: str, *, grace_days: int = 30
+    ) -> list[dict[str, Any]]:
+        """Read-only query for cards past valid_until by at least grace_days with helped_count == 0."""
+        cutoff_ymd = (date.fromisoformat(today_ymd) - timedelta(days=grace_days)).isoformat()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT doc_path, freshness_tier, last_verified_at, valid_until, freshness_state,
+                       surface_count, helped_count
+                FROM knowledge_card_metrics
+                WHERE valid_until IS NOT NULL AND valid_until != ''
+                  AND valid_until < ?
+                  AND COALESCE(helped_count, 0) = 0
+                  AND freshness_state NOT IN ('archived', 'superseded')
+                ORDER BY valid_until ASC
+                """,
+                (cutoff_ymd,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def auto_archive_stale_zero_help_cards(
+        self, today_ymd: str, *, grace_days: int = 30
+    ) -> list[dict[str, Any]]:
+        """Auto-archive stale zero-help cards into freshness_state='archived' and return the list."""
+        cutoff_ymd = (date.fromisoformat(today_ymd) - timedelta(days=grace_days)).isoformat()
+        now = self._now_iso()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT doc_path, freshness_tier, last_verified_at, valid_until, freshness_state,
+                       surface_count, helped_count
+                FROM knowledge_card_metrics
+                WHERE valid_until IS NOT NULL AND valid_until != ''
+                  AND valid_until < ?
+                  AND COALESCE(helped_count, 0) = 0
+                  AND freshness_state NOT IN ('archived', 'superseded')
+                ORDER BY valid_until ASC
+                """,
+                (cutoff_ymd,),
+            ).fetchall()
+            cards = [dict(r) for r in rows]
+            if cards:
+                doc_paths = [c["doc_path"] for c in cards]
+                placeholders = ",".join("?" for _ in doc_paths)
+                conn.execute(
+                    f"""
+                    UPDATE knowledge_card_metrics
+                    SET freshness_state = 'archived', updated_at = ?
+                    WHERE doc_path IN ({placeholders})
+                    """,
+                    (now, *doc_paths),
+                )
+                for c in cards:
+                    c["freshness_state"] = "archived"
+            return cards
+
+    def update_knowledge_freshness_action(
+        self,
+        doc_path: str,
+        action: str,
+        *,
+        today_ymd: str,
+        freshness_tier: str | None = None,
+    ) -> dict[str, Any]:
+        """Update knowledge freshness ledger atomically for portal review.
+        Actions: verify, archive, restore, set_tier.
+        Strictly modifies SQLite ledger only; never touches markdown files on disk.
+        """
+        if not doc_path:
+            raise ValueError("doc_path is required")
+        act = action.strip().lower()
+        if act not in {"verify", "archive", "restore", "set_tier"}:
+            raise ValueError(f"Invalid action '{action}'. Must be one of verify, archive, restore, set_tier")
+
+        now = self._now_iso()
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT doc_path, freshness_tier, last_verified_at, valid_until, freshness_state,
+                       surface_count, helped_count
+                FROM knowledge_card_metrics
+                WHERE doc_path = ?
+                """,
+                (doc_path,),
+            ).fetchone()
+            curr = dict(row) if row else {
+                "doc_path": doc_path,
+                "freshness_tier": "evolving",
+                "last_verified_at": today_ymd,
+                "valid_until": compute_valid_until("evolving", today_ymd),
+                "freshness_state": "fresh",
+                "surface_count": 0,
+                "helped_count": 0,
+            }
+
+            tier = curr.get("freshness_tier") or "evolving"
+            if freshness_tier and freshness_tier in {"volatile", "evolving", "evergreen"}:
+                tier = freshness_tier
+
+            last_v = curr.get("last_verified_at") or today_ymd
+            valid_u = curr.get("valid_until") or compute_valid_until(tier, last_v)
+            state = curr.get("freshness_state") or "fresh"
+
+            if act == "verify":
+                last_v = today_ymd
+                valid_u = compute_valid_until(tier, today_ymd)
+                state = "fresh"
+            elif act == "archive":
+                state = "archived"
+            elif act == "restore":
+                state = "fresh"
+                last_v = today_ymd
+                valid_u = compute_valid_until(tier, today_ymd)
+            elif act == "set_tier":
+                if not freshness_tier or freshness_tier not in {"volatile", "evolving", "evergreen"}:
+                    raise ValueError(f"Invalid freshness_tier '{freshness_tier}' for set_tier")
+                tier = freshness_tier
+                valid_u = compute_valid_until(tier, last_v)
+                if state == "needs_recheck" and valid_u >= today_ymd:
+                    state = "fresh"
+
+            conn.execute(
+                """
+                INSERT INTO knowledge_card_metrics (
+                    doc_path, freshness_tier, last_verified_at, valid_until, freshness_state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(doc_path) DO UPDATE SET
+                    freshness_tier = excluded.freshness_tier,
+                    last_verified_at = excluded.last_verified_at,
+                    valid_until = excluded.valid_until,
+                    freshness_state = excluded.freshness_state,
+                    updated_at = excluded.updated_at
+                """,
+                (doc_path, tier, last_v, valid_u, state, now, now),
+            )
+
+            is_expired = bool(
+                state == "needs_recheck"
+                or (valid_u and valid_u < today_ymd and state not in {"archived", "superseded"})
+            )
+            return {
+                "doc_path": doc_path,
+                "freshness_tier": tier,
+                "last_verified_at": last_v,
+                "valid_until": valid_u,
+                "freshness_state": state,
+                "is_expired": is_expired,
+                "surface_count": int(curr.get("surface_count") or 0),
+                "helped_count": int(curr.get("helped_count") or 0),
+            }
 
     def get_knowledge_freshness_map(self, doc_paths: list[str] | None = None) -> dict[str, dict[str, Any]]:
         today_ymd = shanghai_today_ymd()

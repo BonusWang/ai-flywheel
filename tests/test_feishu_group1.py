@@ -248,7 +248,7 @@ def test_check_success_flow(tmp_path: Path):
     t = threading.Thread(target=_run)
     t.start()
     deadline = time.time() + 10
-    while time.time() < deadline and not runner.sends:
+    while time.time() < deadline and (not runner.sends or svc._read_setting().get("message_id") != "om_check"):
         time.sleep(0.05)
     assert runner.sends, "test card was sent"
     clicked = False
@@ -618,7 +618,7 @@ def test_check_persists_the_running_state_for_startup_cleanup(tmp_path: Path):
     t = threading.Thread(target=_run)
     t.start()
     deadline = time.time() + 10
-    while time.time() < deadline and not runner.sends:
+    while time.time() < deadline and (not runner.sends or svc._read_setting().get("message_id") != "om_check"):
         time.sleep(0.05)
     try:
         stored = svc._read_setting()

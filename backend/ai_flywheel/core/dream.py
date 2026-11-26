@@ -78,6 +78,7 @@ def _build_proposals(
     skill_alerts: list[dict[str, Any]],
     expired_cards: list[dict[str, Any]],
     open_dissents: list[dict[str, Any]],
+    auto_archived_cards: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     proposals: list[str] = []
     for pair in merge_candidates[:5]:
@@ -86,6 +87,8 @@ def _build_proposals(
         )
     for sk_alert in skill_alerts[:5]:
         proposals.append(f"Skill 清理/检修建议：`{sk_alert['skill_name']}` — {sk_alert['reason']}")
+    if auto_archived_cards:
+        proposals.append(f"经验卡自动退场：已归档 {len(auto_archived_cards)} 篇超期零助益经验卡")
     if expired_cards:
         proposals.append(f"经验卡复核提醒：共 {len(expired_cards)} 篇经验卡已超过有效复核期，建议核实或归档")
     if open_dissents:
@@ -100,6 +103,7 @@ def preview_dream_consolidation(
     dormant_days: int = 14,
     stale_skill_days: int = 21,
     stale_observation_days: int = 30,
+    stale_card_grace_days: int = 30,
     now_utc: datetime | None = None,
 ) -> dict[str, Any]:
     """Read-only preview of Friday Dream Consolidation with zero database writes."""
@@ -135,15 +139,21 @@ def preview_dream_consolidation(
         and str(o.get("updated_at") or "") < cutoff_obs
     ]
 
+    auto_archived_cards = db.list_stale_zero_help_cards(today, grace_days=stale_card_grace_days)
+    auto_archived_paths = {c["doc_path"] for c in auto_archived_cards}
+
     freshness_map = db.get_knowledge_freshness_map()
     expired_cards = [
         info
         for info in freshness_map.values()
-        if bool(info.get("is_expired"))
-        or (
-            bool(info.get("valid_until"))
-            and str(info.get("valid_until")) < today
-            and info.get("freshness_state") not in {"archived", "superseded"}
+        if info.get("doc_path") not in auto_archived_paths
+        and (
+            bool(info.get("is_expired"))
+            or (
+                bool(info.get("valid_until"))
+                and str(info.get("valid_until")) < today
+                and info.get("freshness_state") not in {"archived", "superseded"}
+            )
         )
     ]
     expired_cards.sort(key=lambda item: str(item.get("valid_until") or ""))
@@ -151,13 +161,14 @@ def preview_dream_consolidation(
     merge_candidates = find_overlapping_rule_pairs(all_rules, threshold=0.7)
     skill_alerts = _collect_skill_alerts(db, now, stale_skill_days=stale_skill_days)
     open_dissents = db.list_dissent_records(status="open", limit=30)
-    proposals = _build_proposals(merge_candidates, skill_alerts, expired_cards, open_dissents)
+    proposals = _build_proposals(merge_candidates, skill_alerts, expired_cards, open_dissents, auto_archived_cards)
 
     return {
         "dry_run": True,
         "period_key": period_key,
         "auto_dormant_rules": dormant_candidates,
         "auto_archived_observations": stale_obs_candidates,
+        "auto_archived_cards": auto_archived_cards,
         "expired_cards": expired_cards,
         "merge_candidates": merge_candidates,
         "skill_alerts": skill_alerts,
@@ -175,12 +186,14 @@ def run_dream_consolidation(
     dormant_days: int = 14,
     stale_skill_days: int = 21,
     stale_observation_days: int = 30,
+    stale_card_grace_days: int = 30,
     now_utc: datetime | None = None,
 ) -> dict[str, Any]:
     """Friday Dream Consolidation: tiered subtraction, expiry sweep, dissent convergence hints, and weekly ledger.
 
     Tier 1 (auto-executed, reversible, audit-logged):
       - Auto-dormant `unverified_active` rules older than `dormant_days` with `hit_count == 0`.
+      - Auto-archive stale zero-help knowledge cards older than `stale_card_grace_days`.
       - Auto-archive low-severity single-occurrence observing mistakes older than `stale_observation_days`.
       - Mark expired knowledge cards (`valid_until < today`) as `needs_recheck`.
       - Persist weekly `flywheel_metrics_snapshots` row.
@@ -200,7 +213,22 @@ def run_dream_consolidation(
     # Tier 1a: Auto-dormant zero-hit stale trial rules
     dormant_rules = db.mark_dormant_stale_rules(days=dormant_days)
 
-    # Tier 1b: Sweep expired knowledge cards into needs_recheck
+    # Tier 1b1: Auto-archive stale zero-help cards older than grace period
+    auto_archived_cards = db.auto_archive_stale_zero_help_cards(today, grace_days=stale_card_grace_days)
+    if auto_archived_cards:
+        db.append_audit_event(
+            entity_type="knowledge_card",
+            entity_id=period_key,
+            event_type="knowledge_freshness_auto_archived",
+            actor="dream",
+            summary=f"每周蒸馏自动归档 {len(auto_archived_cards)} 篇超期零助益知识卡片",
+            payload={
+                "period_key": period_key,
+                "auto_archived_cards": [c["doc_path"] for c in auto_archived_cards],
+            },
+        )
+
+    # Tier 1b2: Sweep expired knowledge cards into needs_recheck
     expired_cards = db.mark_expired_knowledge_cards(today)
 
     # Tier 1c: Auto-archive stale low-severity single-occurrence observations
@@ -235,7 +263,7 @@ def run_dream_consolidation(
         }
     )
 
-    proposals = _build_proposals(merge_candidates, skill_alerts, expired_cards, open_dissents)
+    proposals = _build_proposals(merge_candidates, skill_alerts, expired_cards, open_dissents, auto_archived_cards)
 
     db.append_audit_event(
         entity_type="dream_consolidation",
@@ -245,12 +273,14 @@ def run_dream_consolidation(
         summary=(
             f"每周蒸馏完成（{period_key}）：自动休眠 {len(dormant_rules)} 条零命中试运行规则，"
             f"归档 {len(archived_observations)} 条超期低危单次错题，"
+            f"自动归档 {len(auto_archived_cards)} 篇超期零助益经验卡，"
             f"标记 {len(expired_cards)} 篇过期经验卡，生成 {len(proposals)} 项精简建议"
         ),
         payload={
             "period_key": period_key,
             "dormant_rules": [d["rule_id"] for d in dormant_rules],
             "archived_observations": [o["obs_id"] for o in archived_observations],
+            "auto_archived_cards": [c["doc_path"] for c in auto_archived_cards],
             "expired_cards": [c["doc_path"] for c in expired_cards[:10]],
             "merge_candidates": merge_candidates[:5],
             "skill_alerts": skill_alerts[:5],
@@ -264,6 +294,7 @@ def run_dream_consolidation(
         "period_key": period_key,
         "auto_dormant_rules": dormant_rules,
         "auto_archived_observations": archived_observations,
+        "auto_archived_cards": auto_archived_cards,
         "expired_cards": expired_cards,
         "merge_candidates": merge_candidates,
         "skill_alerts": skill_alerts,

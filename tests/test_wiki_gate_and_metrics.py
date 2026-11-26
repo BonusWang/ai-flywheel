@@ -805,3 +805,96 @@ def test_feishu_approval_card_shows_the_exact_index_side_effect():
     assert "wiki/笔记索引.md" in serialized
     assert "审批卡" in serialized
     assert "2026-11-23" in serialized
+
+
+def test_sync_fts_index_syncs_wiki_archived_status_and_protects_ledger(tmp_path: Path):
+    rt = _make_runtime(tmp_path)
+    wiki_root = Path(rt.cfg.knowledge_sink.root)
+    proj_dir = wiki_root / "wiki-知识库" / "projects-项目" / "demo-project" / "实战笔记"
+    proj_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Document with status: archived in frontmatter
+    doc1 = proj_dir / "2026-01-01-旧笔记.md"
+    doc1_content = textwrap.dedent(
+        """\
+        ---
+        title: 旧实战笔记
+        description: 验证归档状态同步
+        type: project-practice-lite
+        project_id: demo-project
+        record_id: rec-old-01
+        load_policy: manual
+        default_load: false
+        created: 2026-01-01
+        updated: 2026-01-01
+        status: archived
+        freshness_tier: evolving
+        last_verified: 2026-01-01
+        ---
+
+        # 旧实战笔记
+        已归档的内容
+        """
+    )
+    doc1.write_text(doc1_content, encoding="utf-8")
+
+    # 2. Document with status: active in frontmatter
+    doc2 = proj_dir / "2026-01-01-活跃笔记.md"
+    doc2_content = textwrap.dedent(
+        """\
+        ---
+        title: 活跃实战笔记
+        description: 验证活跃笔记保鲜
+        type: project-practice-lite
+        project_id: demo-project
+        record_id: rec-act-02
+        load_policy: manual
+        default_load: false
+        created: 2026-01-01
+        updated: 2026-01-01
+        status: active
+        freshness_tier: evolving
+        last_verified: 2026-01-01
+        ---
+
+        # 活跃实战笔记
+        活跃的内容
+        """
+    )
+    doc2.write_text(doc2_content, encoding="utf-8")
+
+    rt.knowledge.sync_fts_index()
+
+    rel1 = "wiki-知识库/projects-项目/demo-project/实战笔记/2026-01-01-旧笔记.md"
+    rel2 = "wiki-知识库/projects-项目/demo-project/实战笔记/2026-01-01-活跃笔记.md"
+
+    fmap = rt.db.get_knowledge_freshness_map()
+    assert rel1 in fmap
+    assert fmap[rel1]["freshness_state"] == "archived"
+    assert fmap[rel1]["is_expired"] is False
+    # Archived pages stay excluded from FTS recall even though their freshness state is synced.
+    assert all(hit["doc_path"] != rel1 for hit in rt.db.search_knowledge_fts("旧实战笔记"))
+
+    assert rel2 in fmap
+    assert fmap[rel2]["freshness_state"] == "fresh"
+
+    # Manually archive doc2 in the flywheel SQLite ledger
+    rt.db.update_knowledge_freshness_action(rel2, "archive", today_ymd="2026-01-15")
+    fmap_archived = rt.db.get_knowledge_freshness_map()
+    assert fmap_archived[rel2]["freshness_state"] == "archived"
+
+    # Re-sync without updating disk file: must stay archived, never overwritten to fresh
+    rt.knowledge.sync_fts_index()
+    fmap_after_resync = rt.db.get_knowledge_freshness_map()
+    assert fmap_after_resync[rel2]["freshness_state"] == "archived"
+
+    # Update doc2 on disk with strictly newer last_verified date
+    updated_doc2_content = doc2_content.replace("last_verified: 2026-01-01", "last_verified: 2026-02-15")
+    doc2.write_text(updated_doc2_content, encoding="utf-8")
+
+    # Re-sync: must re-activate as fresh with new date
+    rt.knowledge.sync_fts_index()
+    fmap_reactivated = rt.db.get_knowledge_freshness_map()
+    assert fmap_reactivated[rel2]["freshness_state"] == "fresh"
+    assert fmap_reactivated[rel2]["last_verified_at"] == "2026-02-15"
+

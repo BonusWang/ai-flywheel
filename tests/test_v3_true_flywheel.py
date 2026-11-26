@@ -256,10 +256,12 @@ def test_friday_dream_freshness_expiry_renewal_and_skill_theater(rt: FlywheelRun
     )
     rt.db.upsert_rule(stale_rule)
 
-    # 2. Seed an expired knowledge card (valid_until in the past)
+    # 2. Seed an expired knowledge card (valid_until in the past, within 30-day grace)
+    recent_v = (datetime.now(timezone.utc) - timedelta(days=35)).strftime("%Y-%m-%d")
+    recent_until = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
     rt.knowledge.write_document_verified(
         "lessons/2026-01-01-old-api.md",
-        "---\ntitle: 旧版网关超时排查指南\nfreshness_tier: volatile\nlast_verified: 2026-01-01\nvalid_until: 2026-01-31\n---\n\n# 旧版网关超时排查指南\n网关超时需要检查代理配置。\n",
+        f"---\ntitle: 旧版网关超时排查指南\nfreshness_tier: volatile\nlast_verified: {recent_v}\nvalid_until: {recent_until}\n---\n\n# 旧版网关超时排查指南\n网关超时需要检查代理配置。\n",
     )
 
     # 3. Seed a stale unused flywheel skill (>21d, 0 invocations) and a failing skill

@@ -13,25 +13,27 @@ const SKILL_ORIGIN_LABELS: Record<string, string> = {
 export const AssetsFreshnessTab: React.FC<{
   skills: SkillAssetRecord[]
   knowledgeDocs: KnowledgeDocSummary[]
-  initialDocFilter?: 'all' | 'expired' | 'fresh'
+  initialDocFilter?: 'all' | 'expired' | 'fresh' | 'archived'
   initialSkillFilter?: 'all' | 'used' | 'untested' | 'failing'
   intentNonce?: number
+  onChanged?: () => void
 }> = ({
   skills,
   knowledgeDocs,
   initialDocFilter,
   initialSkillFilter,
   intentNonce,
+  onChanged,
 }) => {
   const [skillQuery, setSkillQuery] = useState('')
   const [skillFilter, setSkillFilter] = useState<'all' | 'used' | 'untested' | 'failing'>(
     initialSkillFilter || 'all'
   )
   const [docQuery, setDocQuery] = useState('')
-  const [docFilter, setDocFilter] = useState<'all' | 'expired' | 'fresh'>(
+  const [docFilter, setDocFilter] = useState<'all' | 'expired' | 'fresh' | 'archived'>(
     initialDocFilter || 'all'
   )
-  const [readingDoc, setReadingDoc] = useState<{ path: string; title: string } | null>(null)
+  const [readingDoc, setReadingDoc] = useState<KnowledgeDocSummary | null>(null)
 
   useEffect(() => {
     if (!intentNonce) return
@@ -57,17 +59,27 @@ export const AssetsFreshnessTab: React.FC<{
       )
   }, [skills, skillQuery, skillFilter])
 
-  const expiredCount = useMemo(
-    () => knowledgeDocs.filter((d) => d.is_expired).length,
-    [knowledgeDocs]
-  )
+  const { expiredCount, freshCount, archivedCount } = useMemo(() => {
+    let exp = 0
+    let fr = 0
+    let arc = 0
+    for (const d of knowledgeDocs) {
+      const isArchived = d.freshness_state === 'archived' || d.freshness_state === 'superseded'
+      if (isArchived) arc++
+      else if (d.is_expired) exp++
+      else fr++
+    }
+    return { expiredCount: exp, freshCount: fr, archivedCount: arc }
+  }, [knowledgeDocs])
 
   const filteredDocs = useMemo(() => {
     const q = docQuery.trim().toLowerCase()
     return knowledgeDocs
       .filter((d) => {
+        const isArchived = d.freshness_state === 'archived' || d.freshness_state === 'superseded'
         if (docFilter === 'expired') return Boolean(d.is_expired)
-        if (docFilter === 'fresh') return !d.is_expired
+        if (docFilter === 'fresh') return !d.is_expired && !isArchived
+        if (docFilter === 'archived') return isArchived
         return true
       })
       .filter((d) =>
@@ -75,7 +87,11 @@ export const AssetsFreshnessTab: React.FC<{
           ? true
           : `${d.title} ${d.doc_path} ${d.freshness_tier || ''}`.toLowerCase().includes(q)
       )
-      .sort((a, b) => Number(Boolean(b.is_expired)) - Number(Boolean(a.is_expired)))
+      .sort((a, b) => {
+        const aScore = a.is_expired ? 0 : a.freshness_state === 'archived' || a.freshness_state === 'superseded' ? 2 : 1
+        const bScore = b.is_expired ? 0 : b.freshness_state === 'archived' || b.freshness_state === 'superseded' ? 2 : 1
+        return aScore - bScore
+      })
   }, [knowledgeDocs, docQuery, docFilter])
 
   const skillPager = usePagination(filteredSkills, 10)
@@ -221,14 +237,15 @@ export const AssetsFreshnessTab: React.FC<{
                 aria-label="笔记保鲜状态筛选"
                 value={docFilter}
                 onChange={(e) => {
-                  setDocFilter(e.target.value as 'all' | 'expired' | 'fresh')
+                  setDocFilter(e.target.value as 'all' | 'expired' | 'fresh' | 'archived')
                   docPager.resetPage()
                 }}
                 className="field-input h-8 px-2 text-[12px]"
               >
-                <option value="all">全部</option>
+                <option value="all">全部 ({knowledgeDocs.length})</option>
                 <option value="expired">仅看待复核 ({expiredCount})</option>
-                <option value="fresh">仅看有效</option>
+                <option value="fresh">仅看有效 ({freshCount})</option>
+                <option value="archived">仅看已归档 ({archivedCount})</option>
               </select>
             </ListToolbar>
           )}
@@ -240,11 +257,13 @@ export const AssetsFreshnessTab: React.FC<{
               {docPager.pageItems.map((doc) => {
                 const tierKey = doc.freshness_tier || 'evolving'
                 const tierLabel = FRESHNESS_TIER_SHORT[tierKey] || tierKey
+                const isArchived =
+                  doc.freshness_state === 'archived' || doc.freshness_state === 'superseded'
                 return (
                   <button
                     key={doc.doc_path}
                     type="button"
-                    onClick={() => setReadingDoc({ path: doc.doc_path, title: doc.title })}
+                    onClick={() => setReadingDoc(doc)}
                     className="pressable w-full text-left py-2.5 px-2 -mx-2 rounded-[var(--radius-tile)] hover:bg-bg-sunk/70 space-y-1"
                   >
                     <div className="flex flex-wrap items-center justify-between gap-2">
@@ -252,7 +271,11 @@ export const AssetsFreshnessTab: React.FC<{
                         {doc.title}
                       </span>
                       <div className="flex items-center gap-1.5 shrink-0">
-                        {doc.is_expired ? (
+                        {isArchived ? (
+                          <span className="px-1.5 py-0.5 rounded bg-bg-sunk text-ink-4 text-[10.5px] font-medium border border-line-soft">
+                            已归档
+                          </span>
+                        ) : doc.is_expired ? (
                           <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-soft text-amber-ink text-[10.5px] font-semibold">
                             <span className="size-1.5 rounded-full bg-amber" />
                             待复核
@@ -290,8 +313,13 @@ export const AssetsFreshnessTab: React.FC<{
       </div>
 
       <DocumentReaderModal
-        docPath={readingDoc?.path ?? null}
+        docPath={readingDoc?.doc_path ?? null}
         title={readingDoc?.title}
+        freshness={readingDoc}
+        onFreshnessUpdated={(updated) => {
+          setReadingDoc(updated)
+          onChanged?.()
+        }}
         onClose={() => setReadingDoc(null)}
       />
     </>

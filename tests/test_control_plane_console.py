@@ -96,11 +96,13 @@ def test_dream_preview_is_strictly_read_only_and_explicit_run_persists(tmp_path:
             (old_ts, rule.rule_id),
         )
 
+    recent_until = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
+    recent_verified = (datetime.now(timezone.utc) - timedelta(days=35)).strftime("%Y-%m-%d")
     rt.db.upsert_knowledge_freshness(
         doc_path="lessons/stale-card.md",
         freshness_tier="volatile",
-        last_verified_at="2025-01-01",
-        valid_until="2025-02-01",
+        last_verified_at=recent_verified,
+        valid_until=recent_until,
         freshness_state="fresh",
     )
 

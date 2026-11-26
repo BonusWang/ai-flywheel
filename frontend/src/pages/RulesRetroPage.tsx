@@ -374,6 +374,7 @@ export const RulesRetroPage: React.FC<Props> = ({
             initialDocFilter={intent?.assetsDocFilter}
             initialSkillFilter={intent?.assetsSkillFilter}
             intentNonce={intent?.nonce}
+            onChanged={reload}
           />
         </div>
       )}
