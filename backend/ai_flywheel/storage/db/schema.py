@@ -399,6 +399,8 @@ CREATE TABLE IF NOT EXISTS sys_dict_items (
 CREATE TABLE IF NOT EXISTS distill_queue (
     queue_id TEXT PRIMARY KEY,
     session_key TEXT NOT NULL REFERENCES sessions(session_key) ON DELETE CASCADE,
+    parent_session_key TEXT NOT NULL DEFAULT '',
+    is_subagent INTEGER NOT NULL DEFAULT 0,
     client TEXT NOT NULL,
     project TEXT NOT NULL DEFAULT 'generic',
     workspace TEXT NOT NULL DEFAULT '',

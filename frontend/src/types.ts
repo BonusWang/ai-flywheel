@@ -170,6 +170,8 @@ export interface DictItem {
 export interface DistillQueueItem {
   queue_id: string
   session_key: string
+  parent_session_key?: string
+  is_subagent?: boolean
   client: string
   project: string
   workspace: string
@@ -231,6 +233,8 @@ export interface QueueReTriageResult {
   checked: number
   /** How many items the pass would change (or did change, when applied). */
   changed_count: number
+  /** How many items had display title / workspace / parentage metadata refreshed. */
+  metadata_refresh_count?: number
   /** Items a real apply would move to `excluded`. */
   would_exclude: QueueReTriageChange[]
   /** Items a real apply would move back to `queued`. */

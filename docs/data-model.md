@@ -100,6 +100,8 @@ erDiagram
     DISTILL_QUEUE {
         TEXT queue_id PK
         TEXT session_key FK
+        TEXT parent_session_key
+        INTEGER is_subagent
         TEXT client
         INTEGER revision
         INTEGER chunk_index
@@ -210,6 +212,7 @@ db.append_audit_event(
 
 - 唯一约束 `(session_key, revision, chunk_index)`：同一会话的同一 revision 只允许一条
   同序号分片；不同 revision 或不同分片可以共存。
+- `parent_session_key` 与 `is_subagent`：标识子代理会话与其所属主会话的层级归属；带 `parent_session_key` 的子代理记录（`is_subagent = 1`）默认不进入自动批次认领，仅在显式指定 `queue_ids` 时被放行。
 - `chunk_total` 记录该 revision 的总分片数；`chunk_index` 从 1 开始。
 - `revision` 单调递增，`get_latest_queue_revision(session_key)` 返回当前最高 revision。
 - `is_oversized` 标记该 revision 是否因上下文过大被拆分。

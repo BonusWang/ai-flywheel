@@ -99,6 +99,7 @@ const QueueRow: React.FC<{
   trailLoading: boolean
   acting: boolean
   triggerBusy: boolean
+  isChild?: boolean
   onToggleChecked: () => void
   onToggleTrail: () => void
   onAction: (action: QueueAction) => void
@@ -120,6 +121,7 @@ const QueueRow: React.FC<{
   trailLoading,
   acting,
   triggerBusy,
+  isChild = false,
   onToggleChecked,
   onToggleTrail,
   onAction,
@@ -137,6 +139,21 @@ const QueueRow: React.FC<{
     item.status === 'dead_letter'
   const title = item.title || item.session_key
 
+  const wsShort = useMemo(() => {
+    if (!item.workspace) return ''
+    const norm = item.workspace.replace(/\\/g, '/').replace(/\/+$/, '')
+    const parts = norm.split('/')
+    return parts[parts.length - 1] || item.workspace
+  }, [item.workspace])
+
+  const subagentInfo = useMemo(() => {
+    if (!item.is_subagent) return null
+    const payload = (item.payload || {}) as Record<string, any>
+    const nickname = (payload.subagent_nickname as string) || ''
+    const role = (payload.subagent_role as string) || ''
+    return { nickname, role }
+  }, [item.is_subagent, item.payload])
+
   const quickBtn =
     'pressable inline-flex items-center gap-1 h-7 px-2 rounded-[var(--radius-mark)] text-[11.5px] text-ink-3 hover:text-ink hover:bg-bg-sunk disabled:opacity-40'
 
@@ -151,9 +168,11 @@ const QueueRow: React.FC<{
 
   return (
     <div
-      className={`group px-4 py-3 transition-colors duration-[150ms] ${
-        checked ? 'bg-accent-softer' : 'hover:bg-bg-sunk/40'
-      }`}
+      className={`group transition-colors duration-[150ms] ${
+        isChild
+          ? 'my-1 rounded-[var(--radius-mark)] border border-line/60 bg-surface/80 px-3 py-2'
+          : 'px-4 py-3'
+      } ${checked ? 'bg-accent-softer' : 'hover:bg-bg-sunk/40'}`}
     >
       <div className="flex flex-wrap items-start gap-3">
         {canSelect ? (
@@ -185,8 +204,25 @@ const QueueRow: React.FC<{
           </div>
 
           <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+            {wsShort && (
+              <Badge title={`工作区完整路径：${item.workspace}`}>
+                {wsShort}
+              </Badge>
+            )}
             <Badge title="来源工具">{clientLabel}</Badge>
             <Badge title="入队方式">{channelLabel}</Badge>
+            {item.is_subagent && (
+              <Badge
+                className="border-accent/40 bg-accent-soft text-accent-ink"
+                title="子代理会话（默认不进入常规自动批次）"
+              >
+                子代理{subagentInfo?.nickname ? ` · ${subagentInfo.nickname}` : ''}
+                {subagentInfo?.role ? ` (${subagentInfo.role})` : ''}
+              </Badge>
+            )}
+            {item.is_subagent && (
+              <span className="text-[11px] text-ink-4">默认不进自动批次</span>
+            )}
             {priorityLabel && (
               <Badge className={priorityTone(item.priority)} title="优先级">
                 {priorityLabel}
@@ -351,6 +387,240 @@ const QueueRow: React.FC<{
   )
 }
 
+interface QueueGroup {
+  rootKey: string
+  primaryItem: DistillQueueItem
+  items: DistillQueueItem[]
+  chunks: DistillQueueItem[]
+  subagents: DistillQueueItem[]
+}
+
+const QueueGroupRow: React.FC<{
+  group: QueueGroup
+  expanded: boolean
+  statusToneClass: (status: string) => string
+  statusLabels: Record<string, string>
+  clientLabels: Record<string, string>
+  channelLabels: Record<string, string>
+  priorityLabels: Record<string, string>
+  excludeReasonLabels: Record<string, string>
+  selected: Set<string>
+  expandedTrailId: string | null
+  eventsByItem: Record<string, AuditEventRecord[]>
+  loadingTrailId: string | null
+  actingId: string | null
+  triggerBusy: boolean
+  bulkBusy: boolean
+  onToggleGroupExpand: () => void
+  onToggleChecked: (queueId: string) => void
+  onToggleTrail: (item: DistillQueueItem) => void
+  onAction: (item: DistillQueueItem, action: QueueAction) => void
+  onTriggerQueueIds: (queueIds: string[]) => void
+  onBulkAction: (action: QueueAction, ids: string[]) => void
+  onJumpToRun: (runId: string) => void
+}> = ({
+  group,
+  expanded,
+  statusToneClass,
+  statusLabels,
+  clientLabels,
+  channelLabels,
+  priorityLabels,
+  excludeReasonLabels,
+  selected,
+  expandedTrailId,
+  eventsByItem,
+  loadingTrailId,
+  actingId,
+  triggerBusy,
+  bulkBusy,
+  onToggleGroupExpand,
+  onToggleChecked,
+  onToggleTrail,
+  onAction,
+  onTriggerQueueIds,
+  onBulkAction,
+  onJumpToRun,
+}) => {
+  const { primaryItem, items, chunks, subagents } = group
+  const selectableItems = items.filter(
+    (i) => i.status !== 'processed' && i.status !== 'processing'
+  )
+  const allChecked =
+    selectableItems.length > 0 && selectableItems.every((i) => selected.has(i.queue_id))
+  const someChecked =
+    selectableItems.some((i) => selected.has(i.queue_id)) && !allChecked
+
+  const toggleAllInGroup = () => {
+    for (const item of selectableItems) {
+      if (allChecked) {
+        if (selected.has(item.queue_id)) onToggleChecked(item.queue_id)
+      } else {
+        if (!selected.has(item.queue_id)) onToggleChecked(item.queue_id)
+      }
+    }
+  }
+
+  const queuedIds = items.filter((i) => i.status === 'queued').map((i) => i.queue_id)
+  const canTriggerGroup = queuedIds.length > 0
+  const canExcludeGroup = queuedIds.length > 0
+
+  const wsShort = useMemo(() => {
+    const ws = primaryItem.workspace || items.find((i) => i.workspace)?.workspace
+    if (!ws) return ''
+    const norm = ws.replace(/\\/g, '/').replace(/\/+$/, '')
+    const parts = norm.split('/')
+    return parts[parts.length - 1] || ws
+  }, [primaryItem.workspace, items])
+
+  const fullWs = primaryItem.workspace || items.find((i) => i.workspace)?.workspace || ''
+  const groupTitle = primaryItem.title || primaryItem.session_key
+
+  return (
+    <div
+      className={`group transition-colors duration-[150ms] ${
+        allChecked ? 'bg-accent-softer' : 'hover:bg-bg-sunk/30'
+      }`}
+    >
+      <div className="px-4 py-3">
+        <div className="flex flex-wrap items-start gap-3">
+          {selectableItems.length > 0 ? (
+            <input
+              type="checkbox"
+              aria-label={`选择整组 ${groupTitle}`}
+              checked={allChecked}
+              ref={(el) => {
+                if (el) el.indeterminate = someChecked
+              }}
+              onChange={toggleAllInGroup}
+              className="mt-1 size-3.5 shrink-0 accent-accent cursor-pointer"
+            />
+          ) : (
+            <span aria-hidden="true" className="mt-1 size-3.5 shrink-0" />
+          )}
+
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              <span
+                className={`inline-flex h-[20px] items-center gap-1 rounded-full border px-2 text-[11px] font-semibold ${statusToneClass(
+                  primaryItem.status
+                )}`}
+              >
+                {labelOf(statusLabels, primaryItem.status, primaryItem.status)}
+              </span>
+              <span
+                className="min-w-0 truncate text-[13px] font-medium text-ink cursor-pointer hover:text-accent"
+                title={`${groupTitle} (${primaryItem.session_key})`}
+                onClick={onToggleGroupExpand}
+              >
+                {groupTitle}
+              </span>
+            </div>
+
+            <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+              {wsShort && (
+                <Badge title={`工作区完整路径：${fullWs}`}>{wsShort}</Badge>
+              )}
+              <Badge title="来源工具">
+                {labelOf(clientLabels, primaryItem.client, primaryItem.client)}
+              </Badge>
+              {chunks.length > 1 && (
+                <Badge mono className="border-accent/35 bg-accent-soft text-accent-ink">
+                  {chunks.length} 个分片
+                </Badge>
+              )}
+              {subagents.length > 0 && (
+                <Badge mono className="border-amber/40 bg-amber-soft text-amber-ink">
+                  {subagents.length} 个子代理
+                </Badge>
+              )}
+            </div>
+          </div>
+
+          <div className="ml-auto flex max-w-full shrink-0 flex-wrap items-center justify-end gap-1">
+            {canTriggerGroup && (
+              <button
+                type="button"
+                onClick={() => onTriggerQueueIds(queuedIds)}
+                disabled={triggerBusy}
+                className="pressable inline-flex items-center gap-1 h-7 px-2.5 rounded-[var(--radius-mark)] bg-accent-soft text-accent-ink text-[11.5px] font-medium hover:bg-accent/18 disabled:opacity-40"
+                title="将整组对话（含分片与子代理）送入整理"
+              >
+                <Zap className="w-3.5 h-3.5" />
+                整组插队 ({queuedIds.length})
+              </button>
+            )}
+            {canExcludeGroup && (
+              <button
+                type="button"
+                onClick={() => onBulkAction('exclude', queuedIds)}
+                disabled={bulkBusy}
+                className="pressable inline-flex items-center gap-1 h-7 px-2 rounded-[var(--radius-mark)] text-[11.5px] text-ink-3 hover:text-ink hover:bg-bg-sunk disabled:opacity-40"
+                title="移出整组排队项"
+              >
+                <Ban className="w-3.5 h-3.5" />
+                整组移出
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onToggleGroupExpand}
+              aria-expanded={expanded}
+              className="pressable inline-flex items-center gap-1 h-7 px-2.5 rounded-[var(--radius-mark)] border border-line bg-surface text-[11.5px] text-ink-2 hover:border-line-strong hover:text-ink"
+            >
+              <ChevronDown
+                className={`w-3.5 h-3.5 transition-transform duration-200 ease-[var(--ease-out-quint)] ${
+                  expanded ? 'rotate-180 text-accent' : ''
+                }`}
+              />
+              <span>{expanded ? '收起明细' : `展开明细 (${items.length})`}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <Collapse open={expanded}>
+        <div className="ml-6 border-l-2 border-line pl-3 pb-2 space-y-1">
+          {items.map((childItem) => (
+            <QueueRow
+              key={childItem.queue_id}
+              item={childItem}
+              statusLabel={labelOf(statusLabels, childItem.status, childItem.status)}
+              statusTone={statusToneClass(childItem.status)}
+              clientLabel={labelOf(clientLabels, childItem.client, childItem.client)}
+              channelLabel={labelOf(
+                channelLabels,
+                childItem.ingress_channel,
+                childItem.ingress_channel
+              )}
+              priorityLabel={labelOf(priorityLabels, childItem.priority, '')}
+              excludeReasonLabel={labelOf(
+                excludeReasonLabels,
+                childItem.exclude_reason_code,
+                childItem.exclude_reason_code || '规则筛选'
+              )}
+              statusLabels={statusLabels}
+              excludeReasonLabels={excludeReasonLabels}
+              checked={selected.has(childItem.queue_id)}
+              expanded={expandedTrailId === childItem.queue_id}
+              events={eventsByItem[childItem.queue_id] ?? []}
+              trailLoading={loadingTrailId === childItem.queue_id}
+              acting={actingId === childItem.queue_id}
+              triggerBusy={triggerBusy}
+              isChild={true}
+              onToggleChecked={() => onToggleChecked(childItem.queue_id)}
+              onToggleTrail={() => onToggleTrail(childItem)}
+              onAction={(action) => onAction(childItem, action)}
+              onTrigger={() => onTriggerQueueIds([childItem.queue_id])}
+              onJumpToRun={onJumpToRun}
+            />
+          ))}
+        </div>
+      </Collapse>
+    </div>
+  )
+}
+
 export const QueueInventoryPanel: React.FC<{
   items: DistillQueueItem[]
   dicts: Record<string, DictItem[]>
@@ -443,7 +713,47 @@ export const QueueInventoryPanel: React.FC<{
     [items]
   )
 
-  const pager = usePagination(filtered, 10)
+  const [expandedGroupKeys, setExpandedGroupKeys] = useState<Set<string>>(new Set())
+
+  const toggleGroupExpand = (rootKey: string) => {
+    setExpandedGroupKeys((prev) => {
+      const next = new Set(prev)
+      if (next.has(rootKey)) next.delete(rootKey)
+      else next.add(rootKey)
+      return next
+    })
+  }
+
+  const groups = useMemo(() => {
+    const map = new Map<string, DistillQueueItem[]>()
+    for (const item of filtered) {
+      const rootKey = item.parent_session_key || item.session_key
+      const existing = map.get(rootKey)
+      if (existing) {
+        existing.push(item)
+      } else {
+        map.set(rootKey, [item])
+      }
+    }
+    const result: QueueGroup[] = []
+    for (const [rootKey, groupItems] of map.entries()) {
+      const chunks = groupItems
+        .filter((i) => !i.is_subagent)
+        .sort((a, b) => a.chunk_index - b.chunk_index)
+      const subagents = groupItems.filter((i) => i.is_subagent)
+      const primaryItem = chunks[0] || groupItems[0]
+      result.push({
+        rootKey,
+        primaryItem,
+        items: groupItems,
+        chunks,
+        subagents,
+      })
+    }
+    return result
+  }, [filtered])
+
+  const pager = usePagination(groups, 10)
   const hasFilters =
     Boolean(query.trim()) ||
     Boolean(statusFilter) ||
@@ -722,7 +1032,11 @@ export const QueueInventoryPanel: React.FC<{
                 <span className="num">{reTriage.changed_count}</span> 段
                 <span className="ml-2 font-normal text-ink-3">
                   （移出 <span className="num">{reTriage.would_exclude.length}</span> / 重新加入{' '}
-                  <span className="num">{reTriage.would_admit.length}</span>）
+                  <span className="num">{reTriage.would_admit.length}</span>
+                  {typeof reTriage.metadata_refresh_count === 'number' && reTriage.metadata_refresh_count > 0 && (
+                    <> · 刷新标题/工作区 <span className="num">{reTriage.metadata_refresh_count}</span> 项</>
+                  )}
+                  ）
                 </span>
               </span>
               <div className="flex items-center gap-1.5">
@@ -796,35 +1110,71 @@ export const QueueInventoryPanel: React.FC<{
       ) : (
         <div className="card overflow-hidden">
           <div className="divide-y divide-line">
-            {pager.pageItems.map((item) => (
-              <QueueRow
-                key={item.queue_id}
-                item={item}
-                statusLabel={labelOf(statusLabels, item.status, item.status)}
-                statusTone={statusToneClass(item.status)}
-                clientLabel={labelOf(clientLabels, item.client, item.client)}
-                channelLabel={labelOf(channelLabels, item.ingress_channel, item.ingress_channel)}
-                priorityLabel={labelOf(priorityLabels, item.priority, '')}
-                excludeReasonLabel={labelOf(
-                  excludeReasonLabels,
-                  item.exclude_reason_code,
-                  item.exclude_reason_code || '规则筛选'
-                )}
-                statusLabels={statusLabels}
-                excludeReasonLabels={excludeReasonLabels}
-                checked={selected.has(item.queue_id)}
-                expanded={expandedId === item.queue_id}
-                events={eventsByItem[item.queue_id] ?? []}
-                trailLoading={loadingTrailId === item.queue_id}
-                acting={actingId === item.queue_id}
-                triggerBusy={busy}
-                onToggleChecked={() => toggleChecked(item.queue_id)}
-                onToggleTrail={() => toggleTrail(item)}
-                onAction={(action) => runItemAction(item, action)}
-                onTrigger={() => onTriggerQueueIds([item.queue_id])}
-                onJumpToRun={onJumpToRun}
-              />
-            ))}
+            {pager.pageItems.map((group) => {
+              const isGroup =
+                group.items.length > 1 ||
+                group.subagents.length > 0 ||
+                group.chunks.length > 1
+              if (isGroup) {
+                return (
+                  <QueueGroupRow
+                    key={group.rootKey}
+                    group={group}
+                    expanded={expandedGroupKeys.has(group.rootKey)}
+                    statusToneClass={statusToneClass}
+                    statusLabels={statusLabels}
+                    clientLabels={clientLabels}
+                    channelLabels={channelLabels}
+                    priorityLabels={priorityLabels}
+                    excludeReasonLabels={excludeReasonLabels}
+                    selected={selected}
+                    expandedTrailId={expandedId}
+                    eventsByItem={eventsByItem}
+                    loadingTrailId={loadingTrailId}
+                    actingId={actingId}
+                    triggerBusy={busy}
+                    bulkBusy={bulkBusy}
+                    onToggleGroupExpand={() => toggleGroupExpand(group.rootKey)}
+                    onToggleChecked={toggleChecked}
+                    onToggleTrail={toggleTrail}
+                    onAction={runItemAction}
+                    onTriggerQueueIds={onTriggerQueueIds}
+                    onBulkAction={runBulkAction}
+                    onJumpToRun={onJumpToRun}
+                  />
+                )
+              }
+              const item = group.primaryItem
+              return (
+                <QueueRow
+                  key={item.queue_id}
+                  item={item}
+                  statusLabel={labelOf(statusLabels, item.status, item.status)}
+                  statusTone={statusToneClass(item.status)}
+                  clientLabel={labelOf(clientLabels, item.client, item.client)}
+                  channelLabel={labelOf(channelLabels, item.ingress_channel, item.ingress_channel)}
+                  priorityLabel={labelOf(priorityLabels, item.priority, '')}
+                  excludeReasonLabel={labelOf(
+                    excludeReasonLabels,
+                    item.exclude_reason_code,
+                    item.exclude_reason_code || '规则筛选'
+                  )}
+                  statusLabels={statusLabels}
+                  excludeReasonLabels={excludeReasonLabels}
+                  checked={selected.has(item.queue_id)}
+                  expanded={expandedId === item.queue_id}
+                  events={eventsByItem[item.queue_id] ?? []}
+                  trailLoading={loadingTrailId === item.queue_id}
+                  acting={actingId === item.queue_id}
+                  triggerBusy={busy}
+                  onToggleChecked={() => toggleChecked(item.queue_id)}
+                  onToggleTrail={() => toggleTrail(item)}
+                  onAction={(action) => runItemAction(item, action)}
+                  onTrigger={() => onTriggerQueueIds([item.queue_id])}
+                  onJumpToRun={onJumpToRun}
+                />
+              )
+            })}
           </div>
           <div className="px-4 pb-3">
             <PaginationBar

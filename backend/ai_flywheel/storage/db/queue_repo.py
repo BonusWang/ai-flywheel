@@ -44,9 +44,12 @@ class QueueRepoMixin:
 
     @staticmethod
     def _row_to_queue_item(row: sqlite3.Row) -> DistillQueueItem:
+        keys = row.keys() if hasattr(row, "keys") else ()
         return DistillQueueItem(
             queue_id=row["queue_id"],
             session_key=row["session_key"],
+            parent_session_key=str(row["parent_session_key"] or "") if "parent_session_key" in keys else "",
+            is_subagent=bool(row["is_subagent"]) if "is_subagent" in keys else False,
             client=row["client"],
             project=row["project"],
             workspace=row["workspace"],
@@ -91,16 +94,19 @@ class QueueRepoMixin:
             conn.execute(
                 """
                 INSERT INTO distill_queue (
-                    queue_id, session_key, client, project, workspace, title,
+                    queue_id, session_key, parent_session_key, is_subagent,
+                    client, project, workspace, title,
                     revision, chunk_index, chunk_total, ingress_channel, status,
                     priority, exclude_reason_code, exclude_reason_detail, focus_note,
                     content_hash, total_chars, compacted_chars, is_oversized,
                     consumed_from_turn, consumed_to_turn, retry_count, max_retries,
                     last_error, run_id, source_path, payload_json, enqueued_at,
                     claimed_at, completed_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(queue_id) DO UPDATE SET
                     session_key = excluded.session_key,
+                    parent_session_key = excluded.parent_session_key,
+                    is_subagent = excluded.is_subagent,
                     client = excluded.client,
                     project = excluded.project,
                     workspace = excluded.workspace,
@@ -134,6 +140,8 @@ class QueueRepoMixin:
                 (
                     item.queue_id,
                     item.session_key,
+                    item.parent_session_key or "",
+                    1 if item.is_subagent else 0,
                     item.client,
                     item.project,
                     item.workspace,
@@ -255,17 +263,21 @@ class QueueRepoMixin:
             row = conn.execute(sql, params).fetchone()
             return int(row["cnt"]) if row else 0
 
-    def list_queued_items_prioritized(self, limit: int = 50) -> list[DistillQueueItem]:
+    def list_queued_items_prioritized(
+        self, limit: int = 50, *, include_subagents: bool = False
+    ) -> list[DistillQueueItem]:
         """Queued items ordered by triage priority, then oldest first.
 
         The ordering lives in SQL, not in Python: sorting a recency-limited page
         in memory would starve the high-priority items outside it.
+        By default, subagents are excluded from automatic batch claims.
         """
+        subagent_filter = "" if include_subagents else " AND is_subagent = 0"
         with self.connect() as conn:
             rows = conn.execute(
                 f"""
                 SELECT * FROM distill_queue
-                WHERE status = ?
+                WHERE status = ?{subagent_filter}
                 ORDER BY {self.QUEUE_PRIORITY_ORDER_SQL} ASC, enqueued_at ASC
                 LIMIT ?
                 """,
@@ -392,6 +404,46 @@ class QueueRepoMixin:
                 "SELECT * FROM distill_queue WHERE queue_id = ?", (queue_id,)
             ).fetchone()
             return self._row_to_queue_item(updated)
+
+    def update_queue_item_metadata(
+        self,
+        queue_id: str,
+        *,
+        title: str | None = None,
+        workspace: str | None = None,
+        parent_session_key: str | None = None,
+        is_subagent: bool | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> DistillQueueItem | None:
+        """Update mutable display/hierarchy metadata on a queue item in place."""
+        now = self._now_iso()
+        fields: list[str] = ["updated_at = ?"]
+        params: list[Any] = [now]
+        if title is not None:
+            fields.append("title = ?")
+            params.append(title)
+        if workspace is not None:
+            fields.append("workspace = ?")
+            params.append(workspace)
+        if parent_session_key is not None:
+            fields.append("parent_session_key = ?")
+            params.append(parent_session_key)
+        if is_subagent is not None:
+            fields.append("is_subagent = ?")
+            params.append(1 if is_subagent else 0)
+        if payload is not None:
+            fields.append("payload_json = ?")
+            params.append(json.dumps(payload, ensure_ascii=False))
+        params.append(queue_id)
+        with self.connect() as conn:
+            conn.execute(
+                f"UPDATE distill_queue SET {', '.join(fields)} WHERE queue_id = ?",
+                params,
+            )
+            row = conn.execute(
+                "SELECT * FROM distill_queue WHERE queue_id = ?", (queue_id,)
+            ).fetchone()
+            return self._row_to_queue_item(row) if row else None
 
     def summarize_queue(self, max_sessions_per_run: int = 10) -> dict[str, Any]:
         """Inventory totals: per status, per client (by status) and per channel.

@@ -156,6 +156,12 @@ def test_a_fresh_database_has_the_v4_tables_columns_and_builtin_dicts(tmp_path: 
         assert {"sys_dict_items", "distill_queue"}.issubset(tables)
         assert SESSION_PROFILE_COLUMNS.issubset(_columns(conn, "sessions"))
         assert AUDIT_TRANSITION_COLUMNS.issubset(_columns(conn, "audit_events"))
+        assert {"parent_session_key", "is_subagent"}.issubset(_columns(conn, "distill_queue"))
+        indexes = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+        }
+        assert "idx_distill_queue_parent" in indexes
         migration = conn.execute(
             "SELECT name FROM schema_migrations WHERE version = 4"
         ).fetchone()
@@ -505,4 +511,65 @@ def test_the_dicts_api_returns_grouped_and_flat_payloads(tmp_path: Path):
     # The payload is JSON-serializable and carries the dictionary metadata.
     first = payload["items"][0]
     assert json.loads(json.dumps(first))["meta"] == first["meta"]
+
+
+def test_existing_v4_database_gains_queue_hierarchy_columns_on_startup(tmp_path: Path):
+    """An existing v4 DB (without parent_session_key/is_subagent) upgrades cleanly on open."""
+    db_path = tmp_path / "legacy-v4.db"
+    FlywheelDB(db_path)
+    # Simulate a pre-hierarchy v4 database by recreating distill_queue without the new columns
+    # while leaving schema_migrations version=4 intact.
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("DROP TABLE distill_queue")
+        conn.execute(
+            """
+            CREATE TABLE distill_queue (
+                queue_id TEXT PRIMARY KEY,
+                session_key TEXT NOT NULL,
+                client TEXT NOT NULL,
+                project TEXT NOT NULL DEFAULT 'generic',
+                workspace TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                revision INTEGER NOT NULL DEFAULT 1,
+                chunk_index INTEGER NOT NULL DEFAULT 1,
+                chunk_total INTEGER NOT NULL DEFAULT 1,
+                ingress_channel TEXT NOT NULL DEFAULT 'codex_archive',
+                status TEXT NOT NULL DEFAULT 'queued',
+                priority TEXT NOT NULL DEFAULT 'P1_GENERAL',
+                exclude_reason_code TEXT NOT NULL DEFAULT '',
+                exclude_reason_detail TEXT NOT NULL DEFAULT '',
+                focus_note TEXT NOT NULL DEFAULT '',
+                content_hash TEXT NOT NULL DEFAULT '',
+                total_chars INTEGER NOT NULL DEFAULT 0,
+                compacted_chars INTEGER NOT NULL DEFAULT 0,
+                is_oversized INTEGER NOT NULL DEFAULT 0,
+                consumed_from_turn INTEGER NOT NULL DEFAULT 0,
+                consumed_to_turn INTEGER NOT NULL DEFAULT 0,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                max_retries INTEGER NOT NULL DEFAULT 3,
+                last_error TEXT NOT NULL DEFAULT '',
+                run_id TEXT,
+                source_path TEXT,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                enqueued_at TEXT NOT NULL,
+                claimed_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    reopened = FlywheelDB(db_path)
+    cols = {
+        row[1]
+        for row in sqlite3.connect(str(db_path)).execute("PRAGMA table_info(distill_queue)").fetchall()
+    }
+    assert {"parent_session_key", "is_subagent"}.issubset(cols)
+    assert reopened.list_queued_items_prioritized() == []
+
 

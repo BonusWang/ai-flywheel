@@ -53,6 +53,11 @@ sessions:
   queue_max_retries: 3
   codex_archive_sync_interval_seconds: 60
 
+  # Session triage:
+  #   exclude_content_prefixes - session content prefixes to exclude (e.g. headless batch scripts)
+  triage:
+    exclude_content_prefixes: []
+
 # Pluggable knowledge sink (decoupled from flywheel policies)
 knowledge_sink:
   # "builtin_kb" writes to ./data/knowledge (zero config)

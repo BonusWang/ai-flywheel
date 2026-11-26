@@ -178,6 +178,8 @@ class DistillQueueItem(BaseModel):
 
     queue_id: str
     session_key: str
+    parent_session_key: str = ""
+    is_subagent: bool = False
     client: str
     project: str = "generic"
     workspace: str = ""

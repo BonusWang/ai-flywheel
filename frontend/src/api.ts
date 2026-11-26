@@ -166,6 +166,7 @@ export const api = {
       checked?: number
       change_count?: number
       changed_count?: number
+      metadata_refresh_count?: number
       changes?: QueueReTriageChange[]
       would_exclude?: QueueReTriageChange[]
       would_admit?: QueueReTriageChange[]
@@ -179,6 +180,7 @@ export const api = {
       dry_run: raw.dry_run ?? dryRun,
       checked: raw.checked ?? raw.evaluated ?? 0,
       changed_count: raw.changed_count ?? raw.change_count ?? changes.length,
+      metadata_refresh_count: raw.metadata_refresh_count ?? 0,
       would_exclude:
         raw.would_exclude ?? changes.filter((c) => c.to_status === 'excluded'),
       would_admit: raw.would_admit ?? changes.filter((c) => c.to_status === 'queued'),

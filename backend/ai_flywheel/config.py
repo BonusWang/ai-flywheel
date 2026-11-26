@@ -50,6 +50,7 @@ class SessionTriageConfig(BaseModel):
     exclude_filename_prefixes: list[str] = Field(
         default_factory=lambda: ["agent-", "subagent-", "warmup-"]
     )
+    exclude_content_prefixes: list[str] = Field(default_factory=list)
     project_workspace_patterns: list[str] = Field(
         default_factory=lambda: ["projects", "github", "repos", "workspace", "wiki", "src", "ideaprojects"]
     )

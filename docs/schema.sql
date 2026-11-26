@@ -416,6 +416,8 @@ CREATE TABLE IF NOT EXISTS sys_dict_items (
 CREATE TABLE IF NOT EXISTS distill_queue (
     queue_id TEXT PRIMARY KEY,
     session_key TEXT NOT NULL REFERENCES sessions(session_key) ON DELETE CASCADE,
+    parent_session_key TEXT NOT NULL DEFAULT '',
+    is_subagent INTEGER NOT NULL DEFAULT 0,
     client TEXT NOT NULL,
     project TEXT NOT NULL DEFAULT 'generic',
     workspace TEXT NOT NULL DEFAULT '',
@@ -478,4 +480,5 @@ CREATE INDEX IF NOT EXISTS idx_distill_queue_status_priority ON distill_queue(st
 CREATE INDEX IF NOT EXISTS idx_distill_queue_client_status ON distill_queue(client, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_distill_queue_session_rev ON distill_queue(session_key, revision DESC, chunk_index ASC);
 CREATE INDEX IF NOT EXISTS idx_distill_queue_run ON distill_queue(run_id);
+CREATE INDEX IF NOT EXISTS idx_distill_queue_parent ON distill_queue(parent_session_key, status);
 

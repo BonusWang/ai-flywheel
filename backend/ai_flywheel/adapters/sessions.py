@@ -5,7 +5,13 @@ from pathlib import Path
 from typing import Any
 
 from ai_flywheel.config import FlywheelConfig
-from ai_flywheel.core.triage import extract_jsonl_workspace, is_subagent_filename, triage_session
+from ai_flywheel.core.triage import (
+    derive_readable_title,
+    extract_jsonl_metadata,
+    extract_jsonl_workspace,
+    is_subagent_filename,
+    triage_session,
+)
 from ai_flywheel.models import RegisterSessionRequest, SessionRecord, SessionStatus
 from ai_flywheel.storage.db import FlywheelDB
 from ai_flywheel.storage.fs_store import redact_text
@@ -62,16 +68,31 @@ def _is_system_boilerplate(text: str) -> bool:
     return any(stripped.startswith(p) for p in _BOILERPLATE_PREFIXES)
 
 
+_SKIPPED_RECORD_TYPES = frozenset(
+    {
+        "system",
+        "developer",
+        "tool_result",
+        "tool_use",
+        "function_call",
+        "function_call_output",
+        "reasoning",
+        "thinking",
+    }
+)
+
+
 def _extract_jsonl_text(obj: dict[str, Any]) -> str:
     # Support common Codex rollout / Claude Code transcript JSONL shapes,
-    # strictly skipping developer/system prompt boilerplate so triage and P02 see real dialogue.
+    # strictly skipping developer/system prompt boilerplate and raw tool outputs
+    # so triage, compaction and P02 see real human/assistant dialogue.
     role = str(obj.get("role") or obj.get("type") or "").strip().lower()
-    if role in {"system", "developer"}:
+    if role in _SKIPPED_RECORD_TYPES:
         return ""
     if isinstance(obj.get("message"), dict):
         msg = obj["message"]
         mrole = str(msg.get("role") or role).strip().lower()
-        if mrole in {"system", "developer"}:
+        if mrole in _SKIPPED_RECORD_TYPES:
             return ""
         content = msg.get("content")
         extracted = _flatten_content(content)
@@ -85,8 +106,11 @@ def _extract_jsonl_text(obj: dict[str, Any]) -> str:
         return ""
     if isinstance(obj.get("payload"), dict):
         payload = obj["payload"]
+        ptype = str(payload.get("type") or "").strip().lower()
+        if ptype in _SKIPPED_RECORD_TYPES:
+            return ""
         prole = str(payload.get("role") or "").strip().lower()
-        if prole in {"system", "developer"}:
+        if prole in _SKIPPED_RECORD_TYPES:
             return ""
         extracted = _flatten_content(payload.get("content") or payload.get("text"))
         if extracted and not _is_system_boilerplate(extracted):
@@ -103,6 +127,9 @@ def _flatten_content(content: Any) -> str:
             if isinstance(item, str):
                 parts.append(item.strip())
             elif isinstance(item, dict):
+                btype = str(item.get("type") or "").strip().lower()
+                if btype in {"tool_result", "tool_use", "thinking", "reasoning", "image", "input_image"}:
+                    continue
                 txt = item.get("text") or item.get("content")
                 if isinstance(txt, str) and txt.strip():
                     parts.append(txt.strip())
@@ -133,24 +160,46 @@ class SessionAdapter:
                 if not fp.is_file():
                     continue
                 scanned += 1
-                if triage_cfg.enabled and is_subagent_filename(fp.name, triage_cfg):
+                meta = extract_jsonl_metadata(fp) if fp.suffix.lower() == ".jsonl" else {}
+                is_sub = bool(meta.get("is_subagent"))
+                parent_sid = meta.get("parent_session_id", "")
+                parent_skey = f"{src.client}:{parent_sid}" if parent_sid else ""
+
+                if triage_cfg.enabled and is_subagent_filename(fp.name, triage_cfg) and not parent_skey:
                     filtered_out += 1
                     continue
-                sid = fp.stem
+
+                sid = meta.get("canonical_session_id") or fp.stem
                 skey = f"{src.client}:{sid}"
                 if self.db.get_session(skey):
                     continue
-                ws = extract_jsonl_workspace(fp)
+                ws = meta.get("workspace") or extract_jsonl_workspace(fp)
+                title = derive_readable_title(
+                    src.client,
+                    sid,
+                    custom_title=meta.get("custom_title", ""),
+                    text=meta.get("first_user_message", ""),
+                    workspace=ws,
+                )
+                rec_meta: dict[str, Any] = {"discovered_by": "p00_reconcile_scan"}
+                if parent_skey:
+                    rec_meta["parent_session_key"] = parent_skey
+                if is_sub:
+                    rec_meta["is_subagent"] = True
+                if meta.get("subagent_nickname"):
+                    rec_meta["subagent_nickname"] = meta["subagent_nickname"]
+                if meta.get("subagent_role"):
+                    rec_meta["subagent_role"] = meta["subagent_role"]
                 rec = SessionRecord(
                     session_key=skey,
                     client=src.client,
                     session_id=sid,
-                    title=f"{src.client} session {sid[:16]}",
+                    title=title,
                     workspace=ws,
                     transcript_path=str(fp),
                     priority="P1_GENERAL",
                     status=SessionStatus.PENDING,
-                    metadata={"discovered_by": "p00_reconcile_scan"},
+                    metadata=rec_meta,
                 )
                 self.db.upsert_session(rec)
                 registered += 1

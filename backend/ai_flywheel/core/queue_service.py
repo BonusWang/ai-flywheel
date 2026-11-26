@@ -25,6 +25,9 @@ from typing import TYPE_CHECKING, Any
 
 from ai_flywheel.adapters.sessions import _extract_jsonl_text
 from ai_flywheel.core.triage import (
+    _UUID_RE,
+    derive_readable_title,
+    extract_jsonl_metadata,
     has_explicit_opt_out,
     map_triage_reason_code,
     triage_session,
@@ -55,6 +58,12 @@ MAX_FULL_TRANSCRIPT_CHARS = 500_000
 MAX_COMPACT_TURN_CHARS = 2500
 COMPACT_HEAD_CHARS = 1200
 COMPACT_TAIL_CHARS = 800
+#: User turns are preserved generously, but huge pasted logs still fold in the middle.
+MAX_USER_TURN_CHARS = 6000
+USER_COMPACT_HEAD_CHARS = 2500
+USER_COMPACT_TAIL_CHARS = 1500
+#: Hard upper bound on chunks per single session so one giant log never floods the queue.
+MAX_CHUNKS_PER_SESSION = 4
 
 #: One reconciliation pass looks at the newest files of a source; the scan is a
 #: lightweight poll, not a full-history import.
@@ -153,22 +162,52 @@ def split_dialogue_turns(text: str) -> list[str]:
 def compact_turn_text(turn: str, max_turn_chars: int = MAX_COMPACT_TURN_CHARS) -> str:
     """Deterministically shrink one long turn without losing its conclusion.
 
-    A ``[user]`` turn is kept verbatim — the user's own words are the highest
-    signal in the transcript — and so is untyped prose (it cannot be classified
-    safely). A long assistant/tool turn keeps its head, a compact marker, and
-    its tail, so the root cause and the final answer at the end are never lost.
+    Ordinary ``[user]`` turns are kept verbatim up to ``MAX_USER_TURN_CHARS``;
+    massive pasted logs inside a user turn still fold in the middle while
+    keeping head and tail intact. Long assistant/tool turns fold above
+    ``max_turn_chars``.
     """
     text = (turn or "").strip()
     if len(text) <= max_turn_chars:
         return text
     role = _role_of(text)
     if role in {"user", "human", ""}:
-        return text
+        if len(text) <= MAX_USER_TURN_CHARS:
+            return text
+        head = text[:USER_COMPACT_HEAD_CHARS]
+        tail = text[-USER_COMPACT_TAIL_CHARS:]
+        omitted = len(text) - USER_COMPACT_HEAD_CHARS - USER_COMPACT_TAIL_CHARS
+        label = role or "text"
+        marker = f"[flywheel: {omitted} chars compacted from the middle of this {label} turn]"
+        return f"{head}\n\n{marker}\n\n{tail}"
     head = text[:COMPACT_HEAD_CHARS]
     tail = text[-COMPACT_TAIL_CHARS:]
     omitted = len(text) - COMPACT_HEAD_CHARS - COMPACT_TAIL_CHARS
     marker = f"[flywheel: {omitted} chars compacted from the middle of this {role} turn]"
     return f"{head}\n\n{marker}\n\n{tail}"
+
+
+def _cap_chunks_preserving_head_and_tail(
+    chunks: list[dict[str, Any]], max_chunks: int
+) -> list[dict[str, Any]]:
+    """Bound chunks per session while always retaining opening context and final conclusions."""
+    cap = max(1, int(max_chunks))
+    if len(chunks) <= cap:
+        return chunks
+    if cap == 1:
+        return [chunks[-1]]
+    if cap == 2:
+        return [chunks[0], chunks[-1]]
+    # Always keep index 0 (opening) and index -1 (tail conclusion), plus evenly spaced middle chunks.
+    middle_slots = cap - 2
+    span = len(chunks) - 2
+    picked_middle: list[dict[str, Any]] = []
+    for slot in range(middle_slots):
+        idx = 1 + int(round((slot + 1) * span / (middle_slots + 1))) - 1
+        idx = max(1, min(len(chunks) - 2, idx))
+        if chunks[idx] not in picked_middle:
+            picked_middle.append(chunks[idx])
+    return [chunks[0], *picked_middle, chunks[-1]]
 
 
 def _split_piece(text: str, limit: int) -> list[str]:
@@ -183,6 +222,7 @@ def prepare_queue_chunks(
     *,
     from_turn: int = 0,
     max_item_chars: int = 24000,
+    max_chunks: int = MAX_CHUNKS_PER_SESSION,
 ) -> dict[str, Any]:
     """Compact, then pack the dialogue into one or more ordered queue chunks.
 
@@ -245,6 +285,10 @@ def prepare_queue_chunks(
     if not chunks:
         chunks.append({"chunk_text": "", "turn_start": start, "turn_end": start})
 
+    raw_chunk_count = len(chunks)
+    if raw_chunk_count > max_chunks:
+        chunks = _cap_chunks_preserving_head_and_tail(chunks, max_chunks)
+
     total = len(chunks)
     return {
         "chunks": [
@@ -254,7 +298,8 @@ def prepare_queue_chunks(
         "total_turns": total_turns,
         "total_chars": len(raw),
         "compacted_chars": compacted_chars,
-        "is_oversized": total > 1,
+        "is_oversized": total > 1 or raw_chunk_count > total,
+        "omitted_middle_chunks": max(0, raw_chunk_count - total),
         "from_turn": start,
     }
 
@@ -500,9 +545,22 @@ class DistillQueueService:
         }
         if reason_code:
             payload["exclude_reason_code"] = reason_code
+        rec_meta = record.metadata if isinstance(record.metadata, dict) else {}
+        parent_session_key = str(rec_meta.get("parent_session_key") or "")
+        is_subagent = bool(rec_meta.get("is_subagent", False))
+        if parent_session_key:
+            payload["parent_session_key"] = parent_session_key
+        if is_subagent:
+            payload["is_subagent"] = True
+        if rec_meta.get("subagent_nickname"):
+            payload["subagent_nickname"] = rec_meta["subagent_nickname"]
+        if rec_meta.get("subagent_role"):
+            payload["subagent_role"] = rec_meta["subagent_role"]
         return DistillQueueItem(
             queue_id=uuid.uuid4().hex,
             session_key=record.session_key,
+            parent_session_key=parent_session_key,
+            is_subagent=is_subagent,
             client=record.client,
             project=record.project or "generic",
             workspace=record.workspace or "",
@@ -714,19 +772,61 @@ class DistillQueueService:
         channel: IngressChannel = IngressChannel.CODEX_ARCHIVE,
         actor: str = "hook",
         source_path: str | None = None,
+        parent_session_key: str = "",
+        is_subagent: bool = False,
     ) -> dict[str, Any]:
         """An archived conversation: opt-out veto, delta check, triage, then queue."""
         client_name = (client or "generic").strip() or "generic"
         sid = (session_id or "").strip()
+        t_path = Path(transcript_path) if transcript_path else (Path(source_path) if source_path else None)
+        meta: dict[str, Any] = {}
+        if t_path and t_path.exists() and t_path.suffix.lower() == ".jsonl":
+            meta = extract_jsonl_metadata(t_path)
+            canonical_id = meta.get("canonical_session_id")
+            if canonical_id:
+                sid = canonical_id
+            if not workspace and meta.get("workspace"):
+                workspace = meta["workspace"]
+            if not parent_session_key and meta.get("parent_session_id"):
+                parent_session_key = f"{client_name}:{meta['parent_session_id']}"
+            if meta.get("is_subagent"):
+                is_subagent = True
+
+        if client_name == "codex" and sid:
+            uuid_matches = _UUID_RE.findall(sid)
+            if uuid_matches:
+                sid = uuid_matches[-1]
+
         if not sid:
             return {"action": "skipped", "reason_code": "MISSING_SESSION_ID", "items": []}
         skey = f"{client_name}:{sid}"
         existing = self.db.get_session(skey)
+        resolved_title = derive_readable_title(
+            client_name,
+            sid,
+            explicit_title=title or (existing.title if existing else ""),
+            custom_title=meta.get("custom_title", ""),
+            text=meta.get("first_user_message", "") or (content or ""),
+            workspace=workspace or (existing.workspace if existing else ""),
+        )
+        existing_meta = dict(existing.metadata) if existing is not None and isinstance(existing.metadata, dict) else {}
+        merged_meta = {**existing_meta}
+        if "discovered_by" not in merged_meta:
+            merged_meta["discovered_by"] = "on_archive"
+        if parent_session_key:
+            merged_meta["parent_session_key"] = parent_session_key
+        if is_subagent:
+            merged_meta["is_subagent"] = True
+        if meta.get("subagent_nickname"):
+            merged_meta["subagent_nickname"] = meta["subagent_nickname"]
+        if meta.get("subagent_role"):
+            merged_meta["subagent_role"] = meta["subagent_role"]
+
         record = SessionRecord(
             session_key=skey,
             client=client_name,
             session_id=sid,
-            title=(title or (existing.title if existing else "")) or f"{client_name} · {sid[:16]}",
+            title=resolved_title,
             project=(
                 project
                 if project and project.strip().lower() not in {"", "generic"}
@@ -739,11 +839,7 @@ class DistillQueueService:
             tags=list(dict.fromkeys([*(tags or []), *((existing.tags if existing else []) or [])])),
             priority=(existing.priority if existing else "") or "P1_GENERAL",
             status=(existing.status if existing else SessionStatus.PENDING),
-            metadata=(
-                dict(existing.metadata)
-                if existing is not None and isinstance(existing.metadata, dict)
-                else {}
-            ),
+            metadata=merged_meta,
         )
         session = self.db.upsert_session(record, preserve_existing_lifecycle=True)
 
@@ -1094,7 +1190,9 @@ class DistillQueueService:
     ) -> dict[str, Any]:
         """Re-evaluate the current triage rules over queued and rule-excluded items.
 
-        ``dry_run=True`` computes the same change list with zero DB mutations.
+        ``dry_run=True`` computes the same change list and metadata refresh count with zero DB mutations.
+        ``dry_run=False`` updates item metadata (title, workspace, parentage), marks superseded items
+        as EXCLUDED (SUPERSEDED), and applies state transitions.
         """
         candidates = [
             *self.db.list_queue_items(status=QueueStatus.QUEUED, limit=1000),
@@ -1105,6 +1203,8 @@ class DistillQueueService:
             for retro in self.db.list_retro_items(status=RetroStatus.OPEN.value, limit=200)
         }
         changes: list[dict[str, Any]] = []
+        metadata_refresh_count = 0
+
         for item in candidates:
             if (
                 item.status is QueueStatus.EXCLUDED
@@ -1114,9 +1214,125 @@ class DistillQueueService:
             session = self.db.get_session(item.session_key)
             if session is None or session.opt_out:
                 continue
+
+            # Read source transcript if available to refresh metadata and identity
+            source_file: Path | None = None
+            if item.source_path and Path(item.source_path).exists():
+                source_file = Path(item.source_path)
+            elif session.transcript_path and Path(session.transcript_path).exists():
+                source_file = Path(session.transcript_path)
+
+            meta: dict[str, Any] = {}
+            if source_file and source_file.suffix.lower() == ".jsonl":
+                meta = extract_jsonl_metadata(source_file)
+
+            canonical_id = meta.get("canonical_session_id")
+            if not canonical_id and item.client == "codex":
+                matches = _UUID_RE.findall(item.session_key)
+                if matches:
+                    canonical_id = matches[0]
+            canonical_key = f"{item.client}:{canonical_id}" if canonical_id else item.session_key
+
+            parent_sid = meta.get("parent_session_id", "")
+            parent_key = f"{item.client}:{parent_sid}" if parent_sid else (item.parent_session_key or "")
+            is_sub = bool(meta.get("is_subagent") or item.is_subagent or parent_key)
+            ws = meta.get("workspace") or item.workspace
+            item_text = self.load_queue_item_text(item)
+            new_title = derive_readable_title(
+                item.client,
+                canonical_id or item.session_key,
+                explicit_title=item.title,
+                custom_title=meta.get("custom_title", ""),
+                text=meta.get("first_user_message") or item_text,
+                workspace=ws,
+            )
+
+            title_changed = bool(new_title and new_title != item.title)
+            ws_changed = bool(ws and ws != item.workspace)
+            parent_changed = bool(parent_key != item.parent_session_key)
+            sub_changed = bool(is_sub != item.is_subagent)
+
+            if title_changed or ws_changed or parent_changed or sub_changed:
+                metadata_refresh_count += 1
+                if not dry_run:
+                    payload = dict(item.payload) if isinstance(item.payload, dict) else {}
+                    if meta.get("subagent_nickname"):
+                        payload["subagent_nickname"] = meta["subagent_nickname"]
+                    if meta.get("subagent_role"):
+                        payload["subagent_role"] = meta["subagent_role"]
+                    if parent_key:
+                        payload["parent_session_key"] = parent_key
+                    if is_sub:
+                        payload["is_subagent"] = True
+                    self.db.update_queue_item_metadata(
+                        item.queue_id,
+                        title=new_title or None,
+                        workspace=ws or None,
+                        parent_session_key=parent_key,
+                        is_subagent=is_sub,
+                        payload=payload,
+                    )
+                    sess_meta = dict(session.metadata) if isinstance(session.metadata, dict) else {}
+                    sess_changed = False
+                    if title_changed and new_title:
+                        session.title = new_title
+                        sess_changed = True
+                    if ws_changed and ws:
+                        session.workspace = ws
+                        sess_changed = True
+                    if parent_key and sess_meta.get("parent_session_key") != parent_key:
+                        sess_meta["parent_session_key"] = parent_key
+                        sess_changed = True
+                    if is_sub and not sess_meta.get("is_subagent"):
+                        sess_meta["is_subagent"] = True
+                        sess_changed = True
+                    if meta.get("subagent_nickname") and sess_meta.get("subagent_nickname") != meta["subagent_nickname"]:
+                        sess_meta["subagent_nickname"] = meta["subagent_nickname"]
+                        sess_changed = True
+                    if meta.get("subagent_role") and sess_meta.get("subagent_role") != meta["subagent_role"]:
+                        sess_meta["subagent_role"] = meta["subagent_role"]
+                        sess_changed = True
+                    if sess_changed:
+                        session.metadata = sess_meta
+                        self.db.upsert_session(session)
+
+            # Check if this queued item is superseded by a canonical queue item
+            if item.status is QueueStatus.QUEUED and item.session_key != canonical_key:
+                active_canonical = [
+                    ci
+                    for ci in self.db.list_session_queue_items(canonical_key)
+                    if ci.status in {QueueStatus.QUEUED, QueueStatus.PROCESSING, QueueStatus.PROCESSED}
+                ]
+                if active_canonical:
+                    changes.append(
+                        {
+                            "queue_id": item.queue_id,
+                            "session_key": item.session_key,
+                            "from_status": QueueStatus.QUEUED.value,
+                            "to_status": QueueStatus.EXCLUDED.value,
+                            "reason_code": "SUPERSEDED",
+                            "detail": f"superseded by canonical {canonical_key}",
+                        }
+                    )
+                    if not dry_run:
+                        self._transition(
+                            item,
+                            QueueStatus.EXCLUDED,
+                            reason_code="SUPERSEDED",
+                            detail=f"superseded by canonical {canonical_key}",
+                            actor=actor,
+                            summary=f"re-triage excluded: superseded by {canonical_key}",
+                        )
+                    continue
+
+            session_for_triage = session
+            if parent_key and not (isinstance(session.metadata, dict) and session.metadata.get("parent_session_key")):
+                meta_copy = dict(session.metadata) if isinstance(session.metadata, dict) else {}
+                meta_copy["parent_session_key"] = parent_key
+                session_for_triage = session.model_copy(update={"metadata": meta_copy})
             result = triage_session(
-                session,
-                self.load_queue_item_text(item),
+                session_for_triage,
+                item_text,
                 self.cfg.sessions.triage,
                 has_open_retro=item.session_key in open_retro_keys,
             )
@@ -1163,11 +1379,19 @@ class DistillQueueService:
                         actor=actor,
                         summary="re-triage excluded the item",
                     )
+        would_exclude = [c for c in changes if c["to_status"] == QueueStatus.EXCLUDED.value]
+        would_admit = [c for c in changes if c["to_status"] == QueueStatus.QUEUED.value]
         return {
             "dry_run": bool(dry_run),
             "evaluated": len(candidates),
+            "checked": len(candidates),
             "change_count": len(changes),
+            "changed_count": len(changes),
             "changes": changes,
+            "metadata_refresh_count": metadata_refresh_count,
+            "would_exclude": would_exclude,
+            "would_admit": would_admit,
+            "summary": self.db.summarize_queue(),
         }
 
     def reconcile_codex_archives(self) -> dict[str, Any]:
@@ -1209,15 +1433,30 @@ class DistillQueueService:
             for path in files[:MAX_ARCHIVE_FILES_PER_SOURCE]:
                 source_report["scanned"] += 1
                 try:
+                    meta = extract_jsonl_metadata(path)
+                    canonical_id = meta.get("canonical_session_id") or path.stem
+                    ws = meta.get("workspace") or ""
+                    title = derive_readable_title(
+                        src_client,
+                        canonical_id,
+                        custom_title=meta.get("custom_title", ""),
+                        text=meta.get("first_user_message", ""),
+                        workspace=ws,
+                    )
+                    parent_sid = meta.get("parent_session_id", "")
+                    parent_skey = f"{src_client}:{parent_sid}" if parent_sid else ""
                     result = self.on_archive(
                         src_client,
-                        path.stem,
-                        title=f"{src_client} archived session {path.stem[:16]}",
+                        canonical_id,
+                        title=title,
                         project="generic",
+                        workspace=ws,
                         transcript_path=str(path),
                         channel=IngressChannel.CODEX_ARCHIVE,
                         actor="archive_sync",
                         source_path=str(path),
+                        parent_session_key=parent_skey,
+                        is_subagent=bool(meta.get("is_subagent")),
                     )
                 except Exception as exc:  # one bad file never stops the pass
                     report["errors"].append(
@@ -1262,20 +1501,44 @@ class DistillQueueService:
     def bridge_pending_sessions_to_queue(
         self, *, limit: int = 500, actor: str = "p00_bridge"
     ) -> int:
-        """Idempotently give legacy ``pending`` sessions a queue row (returns how many)."""
+        """Idempotently give legacy ``pending`` sessions a queue row (returns how many).
+
+        Explicit user submissions (inline content / ``manual`` tag) bypass triage;
+        disk-scanned or legacy hook sessions pass through the 3-tier archive gate
+        so empty stubs and low-signal fragments never flood ``queued``.
+        """
+        from ai_flywheel.core.triage import _is_explicit_submission
+
         created = 0
         for session in self.db.list_pending_sessions_prioritized(limit=max(1, int(limit))):
             if self.db.get_latest_queue_revision(session.session_key) > 0:
                 continue
-            items = self.on_explicit_enqueue(
-                session,
-                channel=IngressChannel.LEGACY_SCAN,
-                actor=actor,
-                force=False,
-                priority=session.priority or "P1_GENERAL",
-                focus_note="legacy pending session bridge",
-            )
-            created += len(items)
+            if _is_explicit_submission(session):
+                items = self.on_explicit_enqueue(
+                    session,
+                    channel=IngressChannel.LEGACY_SCAN,
+                    actor=actor,
+                    force=False,
+                    priority=session.priority or "P1_GENERAL",
+                    focus_note="legacy pending session bridge",
+                )
+                created += len(items)
+            else:
+                res = self.on_archive(
+                    client=session.client,
+                    session_id=session.session_id,
+                    title=session.title,
+                    project=session.project,
+                    workspace=session.workspace,
+                    transcript_path=session.transcript_path,
+                    summary=session.summary,
+                    content=session.content,
+                    tags=session.tags,
+                    channel=IngressChannel.LEGACY_SCAN,
+                    actor=actor,
+                )
+                if res.get("action") == "enqueued":
+                    created += len(res.get("items") or [])
         return created
 
     # ---------------- read helpers ----------------

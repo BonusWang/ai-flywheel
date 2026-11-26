@@ -145,9 +145,13 @@ def build_runs_router(rt: FlywheelRuntime) -> APIRouter:
         }
 
     @router.post("/api/site/queue/sync")
-    def site_queue_sync() -> dict[str, Any]:
+    def site_queue_sync(include_legacy: bool = False) -> dict[str, Any]:
         report = rt.queue.reconcile_codex_archives()
-        bridged = rt.queue.bridge_pending_sessions_to_queue()
+        bridged = (
+            rt.queue.bridge_pending_sessions_to_queue()
+            if include_legacy
+            else 0
+        )
         return {"sync": report, "bridged": bridged, "summary": _queue_summary()}
 
     @router.post("/api/site/queue/re-triage")

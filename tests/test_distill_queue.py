@@ -947,3 +947,487 @@ def test_an_automatic_batch_never_admits_an_opted_out_session(tmp_path: Path):
     assert rt.db.list_session_queue_items(
         "claude-code:vetoed-1", statuses=[QueueStatus.QUEUED]
     ) == []
+
+
+def test_jsonl_extractor_strips_claude_code_user_tool_result_blocks(tmp_path: Path):
+    from ai_flywheel.core.queue_service import read_full_transcript
+
+    jsonl = tmp_path / "claude-tool-heavy.jsonl"
+    records = [
+        {
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "HUMAN_GOAL_MARKER: 排查数据库慢查询根因"},
+                    {"type": "tool_result", "content": "HUGE_TOOL_DUMP " * 8000},
+                ],
+            }
+        },
+        {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "text": "INTERNAL_THINKING_BLOCK"},
+                    {"type": "tool_use", "name": "Bash", "content": "ls -la"},
+                    {"type": "text", "text": "ASSISTANT_CONCLUSION_MARKER: 补齐复合索引后恢复正常"},
+                ],
+            }
+        },
+    ]
+    jsonl.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n", encoding="utf-8")
+    extracted = read_full_transcript(jsonl)
+    assert "HUMAN_GOAL_MARKER" in extracted
+    assert "ASSISTANT_CONCLUSION_MARKER" in extracted
+    assert "HUGE_TOOL_DUMP" not in extracted
+    assert "INTERNAL_THINKING_BLOCK" not in extracted
+
+
+def test_oversized_session_chunks_are_capped_preserving_head_and_tail():
+    from ai_flywheel.core.queue_service import MAX_CHUNKS_PER_SESSION, prepare_queue_chunks
+
+    turns = ["[user] OPENING_GOAL_MARKER: 启动架构重构排查"]
+    for i in range(90):
+        turns.append(f"[user] 第 {i + 1} 轮跟进：" + ("排查数据库与接口边界细节。" * 45))
+        turns.append(f"[assistant] 第 {i + 1} 轮回复：" + ("整理日志与回归测试结果。" * 60))
+    turns.append("[assistant] FINAL_TAIL_CONCLUSION_MARKER: 根因确认并完成回归验收。")
+    prepared = prepare_queue_chunks("\n\n".join(turns), max_item_chars=8000)
+    chunks = prepared["chunks"]
+    assert len(chunks) <= MAX_CHUNKS_PER_SESSION
+    assert chunks[0]["chunk_index"] == 1
+    assert chunks[-1]["chunk_index"] == len(chunks)
+    assert "OPENING_GOAL_MARKER" in chunks[0]["chunk_text"]
+    assert "FINAL_TAIL_CONCLUSION_MARKER" in chunks[-1]["chunk_text"]
+
+
+def test_queue_sync_endpoint_does_not_flood_with_legacy_pending_sessions(tmp_path: Path):
+    rt = _runtime(tmp_path)
+    rt.db.upsert_session(
+        SessionRecord(
+            session_key="codex:tiny-stub-1",
+            client="codex",
+            session_id="tiny-stub-1",
+            title="tiny",
+            project="generic",
+            content="",
+            status=SessionStatus.PENDING,
+            metadata={"discovered_by": "p00_reconcile_scan"},
+        )
+    )
+    app = create_app(runtime=rt, process_role="cli")
+    with TestClient(app) as client:
+        res = client.post("/api/site/queue/sync")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["bridged"] == 0
+        assert body["summary"]["by_status"]["queued"] == 0
+
+    # Even if bridge_pending_sessions_to_queue is called explicitly, a tiny stub is excluded by triage.
+    bridged = rt.queue.bridge_pending_sessions_to_queue()
+    assert bridged == 0
+    excluded = rt.db.list_queue_items(status=QueueStatus.EXCLUDED)
+    assert len(excluded) == 1
+    assert excluded[0].session_key == "codex:tiny-stub-1"
+
+
+def test_codex_identity_normalization_and_deduplication(tmp_path: Path):
+    from ai_flywheel.config import ScanSourceConfig
+
+    archive_dir = tmp_path / "codex_archives"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    rt = _runtime(tmp_path)
+    rt.cfg.sessions.codex_archive_sources = [
+        ScanSourceConfig(client="codex", path=str(archive_dir), glob="*.jsonl")
+    ]
+
+    canonical_uuid = "01934e8f-724d-7a63-b295-886ec55c6ce0"
+    canonical_key = f"codex:{canonical_uuid}"
+
+    # 1. MCP enqueues with canonical UUID key first
+    mcp_items = rt.queue.on_explicit_enqueue(
+        client="codex",
+        session_id=canonical_uuid,
+        title="初始架构设计与选型",
+        project="demo-repo",
+        workspace=str(tmp_path / "demo-repo"),
+        content="用户目标：确认分布式缓存与数据库选型方案。\n助手建议：采用标准两级缓存架构。",
+    )
+    assert len(mcp_items) == 1
+    assert mcp_items[0].session_key == canonical_key
+
+    # 2. Codex archive sync discovers rollout file for the same UUID
+    jsonl_file = archive_dir / f"rollout-2026-11-20T08-00-00-{canonical_uuid}.jsonl"
+    records = [
+        {
+            "type": "session_meta",
+            "payload": {
+                "id": canonical_uuid,
+                "cwd": str(tmp_path / "demo-repo"),
+            },
+        },
+        {
+            "role": "user",
+            "content": "用户目标：确认分布式缓存与数据库选型方案。",
+        },
+        {
+            "role": "assistant",
+            "content": "助手建议：采用标准两级缓存架构并完成压测验证。",
+        },
+    ]
+    jsonl_file.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n", encoding="utf-8")
+
+    report = rt.queue.reconcile_codex_archives()
+    assert report["scanned"] == 1
+    # Should update existing session without manufacturing a duplicate rollout session
+    assert rt.db.get_session(f"codex:{jsonl_file.stem}") is None
+    canonical_session = rt.db.get_session(canonical_key)
+    assert canonical_session is not None
+    assert canonical_session.session_key == canonical_key
+
+
+def test_subagent_parent_hierarchy_and_automatic_claim_isolation(tmp_path: Path):
+    rt = _runtime(tmp_path)
+    parent_uuid = "01934e8f-0000-0000-0000-000000000001"
+    child_uuid = "01934e8f-0000-0000-0000-000000000002"
+    parent_key = f"codex:{parent_uuid}"
+    child_key = f"codex:{child_uuid}"
+
+    parent_item = rt.queue.on_explicit_enqueue(
+        client="codex",
+        session_id=parent_uuid,
+        title="主会话：系统重构协调",
+        project="demo-project",
+        content="[user] 协调主任务目标设计。\n[assistant] 已启动任务拆解并派发子代理。",
+    )[0]
+
+    # Enqueue subagent session with parent linkage
+    child_records = rt.queue.on_archive(
+        client="codex",
+        session_id=child_uuid,
+        title="子任务：数据持久层迁移",
+        project="demo-project",
+        content="[user] 执行持久层迁移脚本编写。\n[assistant] 数据库迁移脚本已完成测试验证。",
+        parent_session_key=parent_key,
+        is_subagent=True,
+    )
+    assert child_records["action"] == "enqueued"
+    child_item = child_records["items"][0]
+    assert child_item.parent_session_key == parent_key
+    assert child_item.is_subagent is True
+
+    # 1. Verify prioritized list defaults to excluding subagents
+    auto_candidates = rt.db.list_queued_items_prioritized(limit=10, include_subagents=False)
+    assert any(i.queue_id == parent_item.queue_id for i in auto_candidates)
+    assert not any(i.queue_id == child_item.queue_id for i in auto_candidates)
+
+    # 2. Including subagents returns both
+    all_candidates = rt.db.list_queued_items_prioritized(limit=10, include_subagents=True)
+    assert any(i.queue_id == parent_item.queue_id for i in all_candidates)
+    assert any(i.queue_id == child_item.queue_id for i in all_candidates)
+
+    # 3. Explicit queue_ids run claims the subagent item
+    app = create_app(runtime=rt, process_role="cli")
+    with TestClient(app) as client:
+        res = client.post(
+            "/api/site/runs",
+            json={"trigger_source": "manual_portal", "queue_ids": [child_item.queue_id]},
+        )
+        assert res.status_code == 200
+        run_data = res.json()["run"]
+        p01 = next(n for n in run_data["nodes"] if n["node_id"] == "P01_BEGIN")
+        assert child_item.queue_id in p01["payload"]["claimed_queue_ids"]
+
+
+def test_readable_title_precedence_and_no_rollout_prefix_collision(tmp_path: Path):
+    from ai_flywheel.core.triage import derive_readable_title
+
+    # Tier 1: Explicit valid title
+    t1 = derive_readable_title("codex", "uuid-123", explicit_title="自定义清晰任务标题")
+    assert t1 == "自定义清晰任务标题"
+
+    # Old placeholder titles are bypassed
+    t_ph = derive_readable_title(
+        "codex",
+        "01934e8f-724d-7a63-b295-886ec55c6ce0",
+        explicit_title="codex session rollout-2026-11-20T08",
+        custom_title="Claude设置的高优标题",
+    )
+    assert t_ph == "Claude设置的高优标题"
+
+    # Tier 3: First valid user message, stripping tags & skill brackets
+    noisy_dialogue = (
+        "[user] <system-reminder>系统注入提示</system-reminder>\n"
+        "<app-context>环境变量配置</app-context>\n"
+        "[$skill](file:///path/to/skill) 核心业务：排查交易订单分布式事务一致性\n"
+        "[assistant] 正在分析事务回滚日志。"
+    )
+    t3 = derive_readable_title(
+        "codex",
+        "01934e8f-724d-7a63-b295-886ec55c6ce0",
+        text=noisy_dialogue,
+        workspace="E:/repos/trade-service",
+    )
+    assert "核心业务：排查交易订单分布式事务一致性" in t3
+    assert "system-reminder" not in t3
+
+    # Tier 4: Fallback directory and tail-8 UUID
+    t4 = derive_readable_title(
+        "codex",
+        "01934e8f-724d-7a63-b295-886ec55c6ce0",
+        text="",
+        workspace="E:/repos/trade-service",
+    )
+    assert t4 == "[trade-service] codex · 55c6ce0" or t4 == "[trade-service] codex · 886ec55c6ce0" or t4.endswith("codex · 55c6ce0") or t4.startswith("[trade-service] codex · ")
+
+
+def test_headless_script_filtering_by_prefix_and_no_tools(tmp_path: Path):
+    rt = _runtime(tmp_path)
+    rt.cfg.sessions.triage.exclude_content_prefixes = ["[headless-batch]"]
+
+    # 1. Content prefix match -> excluded with SUBAGENT_FRAGMENT
+    res_prefix = rt.queue.on_archive(
+        client="codex",
+        session_id="script-prefix-001",
+        content="[user] [headless-batch] 执行定时对账脚本巡检任务",
+    )
+    assert res_prefix["action"] == "excluded"
+    assert res_prefix["reason_code"] == "SUBAGENT_FRAGMENT"
+
+    # 2. No-tool headless batch match (<= 2 turns and no tools)
+    res_notool = rt.queue.on_archive(
+        client="codex",
+        session_id="script-notool-002",
+        content="[user] 所有工具已关闭，仅回显状态代码。\n[assistant] OK 状态就绪。",
+    )
+    assert res_notool["action"] == "excluded"
+    assert res_notool["reason_code"] == "SUBAGENT_FRAGMENT"
+
+    # 3. Attached subagent with parent linkage is admitted to queued
+    res_attached = rt.queue.on_archive(
+        client="codex",
+        session_id="subagent-child-003",
+        content="[user] 派生子任务：处理本地数据切片缓存\n[assistant] 切片缓存已生成。",
+        parent_session_key="codex:parent-001",
+        is_subagent=True,
+    )
+    assert res_attached["action"] == "enqueued"
+    assert res_attached["items"][0].status == QueueStatus.QUEUED
+    assert res_attached["items"][0].is_subagent is True
+
+
+def test_re_triage_dry_run_zero_write_and_superseded_cleanup(tmp_path: Path):
+    rt = _runtime(tmp_path)
+    canonical_uuid = "01934e8f-1111-2222-3333-444444444444"
+    canonical_key = f"codex:{canonical_uuid}"
+
+    # 1. Enqueue canonical item
+    canonical_item = rt.queue.on_explicit_enqueue(
+        client="codex",
+        session_id=canonical_uuid,
+        title="标准主会话架构",
+        content="[user] 规范主会话核心内容。\n[assistant] 架构设计已完成。",
+    )[0]
+
+    # 2. Seed a legacy duplicate rollout item in QUEUED
+    rollout_key = f"codex:rollout-2026-11-20T08-00-00-{canonical_uuid}"
+    rollout_session = SessionRecord(
+        session_key=rollout_key,
+        client="codex",
+        session_id=f"rollout-2026-11-20T08-00-00-{canonical_uuid}",
+        title="codex session rollout-2026-11-",
+        project="generic",
+        content="[user] 规范主会话核心内容。\n[assistant] 架构设计已完成。",
+        status=SessionStatus.PENDING,
+    )
+    rt.db.upsert_session(rollout_session)
+    rollout_item = DistillQueueItem(
+        queue_id="queue-legacy-rollout-1",
+        session_key=rollout_key,
+        client="codex",
+        title="codex session rollout-2026-11-",
+        status=QueueStatus.QUEUED,
+        revision=1,
+        chunk_index=1,
+        chunk_total=1,
+    )
+    rt.db.upsert_queue_item(rollout_item)
+
+    # 3. Dry run test: zero write
+    preview = rt.queue.re_triage_queue(dry_run=True)
+    assert preview["dry_run"] is True
+    assert preview["metadata_refresh_count"] >= 1
+    assert any(
+        c["queue_id"] == "queue-legacy-rollout-1" and c["reason_code"] == "SUPERSEDED"
+        for c in preview["would_exclude"]
+    )
+    # Check that in DB it is still QUEUED and title unchanged
+    item_in_db = rt.db.get_queue_item("queue-legacy-rollout-1")
+    assert item_in_db is not None
+    assert item_in_db.status == QueueStatus.QUEUED
+    assert item_in_db.title == "codex session rollout-2026-11-"
+
+    # 4. Apply re-triage: applies cleanup
+    applied = rt.queue.re_triage_queue(dry_run=False)
+    assert applied["dry_run"] is False
+    item_after = rt.db.get_queue_item("queue-legacy-rollout-1")
+    assert item_after is not None
+    assert item_after.status == QueueStatus.EXCLUDED
+    assert item_after.exclude_reason_code == "SUPERSEDED"
+
+
+def test_end_to_end_real_jsonl_fastapi_client_playback(tmp_path: Path):
+    archive_dir = tmp_path / "codex_archives"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    rt = _runtime(tmp_path)
+    rt.cfg.sessions.triage.min_chars = 10
+    rt.cfg.sessions.triage.gray_workspace_min_chars = 10
+    rt.cfg.sessions.triage.temp_workspace_patterns = []
+    from ai_flywheel.config import ScanSourceConfig
+
+    rt.cfg.sessions.codex_archive_sources = [
+        ScanSourceConfig(client="codex", path=str(archive_dir), glob="*.jsonl")
+    ]
+
+    # Create real JSONL files for parent and child subagent
+    parent_uuid = "01934e8f-7777-8888-9999-000000000001"
+    child_uuid = "01934e8f-7777-8888-9999-000000000002"
+
+    parent_jsonl = archive_dir / f"rollout-2026-11-20T10-00-00-{parent_uuid}.jsonl"
+    parent_lines = [
+        {"type": "session_meta", "payload": {"id": parent_uuid, "cwd": str(tmp_path / "my-project")}},
+        {"role": "user", "content": "端到端目标：验证全流程重筛与批次调度"},
+        {"role": "assistant", "content": "主会话处理完成。"},
+    ]
+    parent_jsonl.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in parent_lines) + "\n", encoding="utf-8")
+
+    child_jsonl = archive_dir / f"rollout-2026-11-20T10-05-00-{child_uuid}.jsonl"
+    child_lines = [
+        {
+            "type": "session_meta",
+            "payload": {
+                "id": child_uuid,
+                "parent_thread_id": parent_uuid,
+                "thread_source": "subagent",
+                "agent_nickname": "worker-c1",
+                "agent_role": "tester",
+                "cwd": str(tmp_path / "my-project"),
+            },
+        },
+        {"role": "user", "content": "子代理目标：执行自动化验证套件"},
+        {"role": "assistant", "content": "验证套件全部执行通过。"},
+    ]
+    child_jsonl.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in child_lines) + "\n", encoding="utf-8")
+
+    app = create_app(runtime=rt, process_role="cli")
+    with TestClient(app) as client:
+        # 1. Sync queue
+        sync_res = client.post("/api/site/queue/sync")
+        assert sync_res.status_code == 200
+        sync_body = sync_res.json()
+        assert sync_body["sync"]["enqueued"] == 2
+
+        # 2. List queue
+        list_res = client.get("/api/site/queue")
+        assert list_res.status_code == 200
+        items = list_res.json()["items"]
+        assert len(items) == 2
+
+        parent_item = next(i for i in items if i["session_key"] == f"codex:{parent_uuid}")
+        child_item = next(i for i in items if i["session_key"] == f"codex:{child_uuid}")
+
+        assert parent_item["is_subagent"] is False
+        assert child_item["is_subagent"] is True
+        assert child_item["parent_session_key"] == f"codex:{parent_uuid}"
+        assert child_item["payload"]["subagent_nickname"] == "worker-c1"
+        assert child_item["payload"]["subagent_role"] == "tester"
+
+        # 3. Re-triage dry-run
+        dry_res = client.post("/api/site/queue/re-triage", json={"dry_run": True})
+        assert dry_res.status_code == 200
+        dry_body = dry_res.json()
+        assert dry_body["dry_run"] is True
+        assert "metadata_refresh_count" in dry_body
+
+        # 4. Trigger run explicitly claiming child subagent
+        run_res = client.post(
+            "/api/site/runs",
+            json={"trigger_source": "manual_portal", "queue_ids": [child_item["queue_id"]]},
+        )
+        assert run_res.status_code == 200
+        p01 = next(n for n in run_res.json()["run"]["nodes"] if n["node_id"] == "P01_BEGIN")
+        assert child_item["queue_id"] in p01["payload"]["claimed_queue_ids"]
+
+
+def test_codex_response_item_msg_id_and_agents_boilerplate_never_corrupt_metadata(tmp_path: Path):
+    """Codex response_item payload.id='msg_...' and '# AGENTS.md instructions' boilerplate must be ignored."""
+    from ai_flywheel.core.triage import extract_jsonl_metadata
+
+    sess_uuid = "11112222-3333-4444-5555-666677778888"
+    ckpt_uuid = "99998888-7777-6666-5555-444433332222"
+    rollout = tmp_path / f"rollout-2026-11-26T10-00-00-{sess_uuid}_{ckpt_uuid}.jsonl"
+    lines = [
+        {"type": "session_meta", "payload": {"id": sess_uuid, "session_id": sess_uuid, "cwd": "/projects/demo"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "msg_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "role": "user",
+                "content": "# AGENTS.md instructions for /projects/demo <INSTRUCTIONS> rules",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "msg_ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "role": "user",
+                "content": "排查分布式缓存雪崩的根因与限流方案",
+            },
+        },
+    ]
+    rollout.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in lines) + "\n", encoding="utf-8")
+
+    meta = extract_jsonl_metadata(rollout)
+    assert meta["canonical_session_id"] == sess_uuid
+    assert meta["first_user_message"] == "排查分布式缓存雪崩的根因与限流方案"
+
+    # Re-triage preserves an explicit human title on canonical item and marks the legacy rollout duplicate SUPERSEDED.
+    rt = _runtime(tmp_path)
+    rt.queue.on_explicit_enqueue(
+        client="codex",
+        session_id=sess_uuid,
+        title="人工确认的显式标题",
+        workspace="/projects/demo",
+        content="[user] 排查分布式缓存雪崩的根因与限流方案\n\n[assistant] 已通过布隆过滤器与互斥锁修复。",
+    )
+    legacy_sid = rollout.stem
+    rt.db.upsert_session(
+        SessionRecord(
+            session_key=f"codex:{legacy_sid}",
+            client="codex",
+            session_id=legacy_sid,
+            title="codex session rollout-2026-11-",
+            workspace="/projects/demo",
+            transcript_path=str(rollout),
+            status=SessionStatus.PENDING,
+        )
+    )
+    rt.db.upsert_queue_item(
+        DistillQueueItem(
+            queue_id="q-legacy-dup",
+            session_key=f"codex:{legacy_sid}",
+            client="codex",
+            workspace="/projects/demo",
+            title="codex session rollout-2026-11-",
+            ingress_channel=IngressChannel.LEGACY_SCAN,
+            status=QueueStatus.QUEUED,
+            source_path=str(rollout),
+        )
+    )
+
+    res = rt.queue.re_triage_queue(dry_run=False)
+    assert any(c["queue_id"] == "q-legacy-dup" and c["reason_code"] == "SUPERSEDED" for c in res["changes"])
+    canonical_items = rt.db.list_session_queue_items(f"codex:{sess_uuid}")
+    assert canonical_items[0].title == "人工确认的显式标题"
+
+

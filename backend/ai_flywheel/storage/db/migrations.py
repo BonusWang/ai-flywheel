@@ -44,6 +44,8 @@ class MigrationsMixin:
             # v4: the unified dictionary, the distill queue and the structured
             # state-transition columns of the one generic trail table.
             self._migrate_to_v4(conn, preexisting=preexisting)
+            # Additive queue hierarchy columns: must run even on preexisting v4 DBs.
+            self._ensure_queue_hierarchy_columns(conn)
             # The builtin dictionary is planted on every start, not only when the
             # migration first runs: a new builtin item reaches an existing database.
             self._seed_builtin_dicts(conn)
@@ -291,6 +293,12 @@ class MigrationsMixin:
         self._ensure_column(conn, "sessions", "latest_turn_count", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column(conn, "sessions", "last_consumed_turn", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column(conn, "sessions", "last_consumed_hash", "TEXT NOT NULL DEFAULT ''")
+        # distill_queue gains parent-child session hierarchy columns and index.
+        self._ensure_column(conn, "distill_queue", "parent_session_key", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "distill_queue", "is_subagent", "INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_distill_queue_parent ON distill_queue(parent_session_key, status)"
+        )
         # The one generic trail table gains structured state transitions.
         self._ensure_column(conn, "audit_events", "from_status", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "audit_events", "to_status", "TEXT NOT NULL DEFAULT ''")
@@ -318,6 +326,14 @@ class MigrationsMixin:
         conn.execute(
             "INSERT OR REPLACE INTO schema_migrations (version, name, applied_at) VALUES (4, 'v4_data_foundation_dicts_and_queue', ?)",
             (now,),
+        )
+
+    def _ensure_queue_hierarchy_columns(self, conn: sqlite3.Connection) -> None:
+        """Idempotently add parent-child queue columns and index to existing v4 DBs."""
+        self._ensure_column(conn, "distill_queue", "parent_session_key", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "distill_queue", "is_subagent", "INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_distill_queue_parent ON distill_queue(parent_session_key, status)"
         )
 
     def _migrate_knowledge_fts(self, conn: sqlite3.Connection) -> None:
