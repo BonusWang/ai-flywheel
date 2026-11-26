@@ -1,3 +1,3 @@
 """AI Flywheel: Evidence-driven AI collaboration operating system."""
 
-__version__ = "0.7.1"
+__version__ = "0.8.0"

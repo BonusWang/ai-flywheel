@@ -6,7 +6,7 @@ brand:
   subtitle: "正确执行 → 证实结果 → 提炼规律 → 改变下次行为"
   owner_display: "Personal Flywheel Portal"
   mcp_prefix: "flywheel"
-  version: "0.7.1"
+  version: "0.8.0"
 
 loop_steps:
   - step: 1

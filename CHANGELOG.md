@@ -3,6 +3,35 @@
 All notable changes to **AI Flywheel** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-11-26
+
+### Added
+- **Session identity normalization, parent-child subagent grouping & headless script filtering** (`core/triage.py`, `adapters/sessions.py`, `core/queue_service.py`, `storage/db/schema.py`, `storage/db/migrations.py`, `storage/db/queue_repo.py`, `config.py`, `flywheel.yaml.example`, `docs/schema.sql`, `docs/data-model.md`, `frontend/src/components/workflows/QueueInventoryPanel.tsx`):
+  - Added `distill_queue.parent_session_key` and `distill_queue.is_subagent` columns plus `idx_distill_queue_parent` (with unconditional idempotent upgrade for existing v4 databases and 1:1 authoritative DDL parity).
+  - Extracted structured JSONL metadata (`canonical_session_id`, `parent_session_id`, `is_subagent`, `subagent_nickname`, `subagent_role`, `workspace`, Claude Code `custom-title`, and first non-boilerplate user message) to derive human-readable titles and normalize Codex scans to `codex:<uuid>` for cross-channel deduplication with MCP/Hook sessions.
+  - Isolated subagent rows (`is_subagent = 1`) from automatic batch claims (`list_queued_items_prioritized(..., include_subagents=False)`) while still allowing explicit manual selection via `queue_ids`.
+  - Added configurable `sessions.triage.exclude_content_prefixes` plus generic single-turn no-tools batch detection (`SUBAGENT_FRAGMENT`), and grouped multi-chunk sessions and subagents into expandable root-session trees with workspace basename badges in the Workflows Queue Inventory console.
+- **Automated knowledge freshness retirement & ledger-only review controls** (`adapters/knowledge.py`, `storage/db/knowledge_repo.py`, `core/dream.py`, `routes/governance.py`, `frontend/src/components/ui/DocumentReaderModal.tsx`, `frontend/src/components/rules/AssetsFreshnessTab.tsx`, `frontend/src/pages/AutomationsPage.tsx`):
+  - Extended `sync_fts_index()` to synchronize Wiki frontmatter `status: archived` / `superseded` into `knowledge_card_metrics` while keeping archived documents excluded from FTS recall, and protecting archived ledger rows from re-activation unless `last_verified` strictly advances.
+  - Extended Friday Dream Tier 1 (`preview_dream_consolidation` & `run_dream_consolidation`) to automatically retire cards expired `>= 30` days with `helped_count == 0` in the flywheel SQLite ledger (`knowledge_freshness_auto_archived` audit trail, never touching source Markdown files).
+  - Exposed `POST /api/site/knowledge/freshness` (`verify` / `archive` / `restore` / `set_tier`) and added a compact ledger-only review toolbar to `DocumentReaderModal` plus an `已归档` filter in `AssetsFreshnessTab`.
+- **Retro signal promote-to-observation loop & settlement visibility** (`storage/db/queue_repo.py`, `storage/db/session_repo.py`, `routes/governance.py`, `core/retro_advisory.py`, `frontend/src/components/rules/CluesObservationsTab.tsx`):
+  - Exposed `POST /api/site/retro/promote` to convert single or grouped runtime clues into idempotent `mistake_observations` records, mark linked retro rows `resolved`, log `retro_promoted_to_observation`, and refresh the core card.
+  - Enriched `GET /api/site/retro` with `has_queued_session` and `settlement_mode` (`auto_next_batch` vs `manual_only`) so the console distinguishes clues that auto-settle on the next batch from orphan clues requiring manual disposition.
+
+### Changed
+- **JSONL extraction hygiene, bounded chunking & re-triage cleanup** (`adapters/sessions.py`, `core/queue_service.py`, `routes/runs.py`):
+  - Stripped `tool_result`, `tool_use`, `function_call`, `function_call_output`, `thinking`, and `reasoning` blocks during JSONL extraction, capped oversized sessions at `MAX_CHUNKS_PER_SESSION = 4` while preserving opening context and tail conclusions, and made `POST /api/site/queue/sync` opt-in for legacy pending session bridging (`include_legacy=false` by default).
+  - Extended `re_triage_queue` to keep `dry_run=true` strictly read-only while refreshing titles/workspaces/parentage and superseding duplicate legacy `codex:rollout-...` rows on apply (`metadata_refresh_count`).
+- **Version `0.8.0`** (`backend/ai_flywheel/__init__.py`, `pyproject.toml`, `frontend/package.json`, `frontend/package-lock.json`, `profile/site.yaml`, `README.md`):
+  - Bumped version across all parity layers and updated README for the queue grouping, freshness auto-retirement, and retro promotion loops.
+
+### Fixed
+- **Misleading retro clue advice vs button semantics** (`core/retro_advisory.py`, `frontend/src/components/rules/CluesObservationsTab.tsx`):
+  - Changed high-value `keep` retro clues from `recommended_action="resolved"` (which prematurely removed clues from the next P02 pass without creating an observation) to `recommended_action="promote"`, clearly separating **转入错题观察池**, **已人工处理（不再送入下次沉淀）**, and **忽略**, with per-group bulk promotion.
+- **Flaky Feishu check test synchronization** (`tests/test_feishu_group1.py`):
+  - Waited for persisted `message_id` before asserting check state in concurrent thread tests.
+
 ## [0.7.1] - 2026-11-26
 
 ### Added

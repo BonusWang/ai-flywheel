@@ -63,7 +63,7 @@ AI Flywheel 采用「**3+1**」通用生态定位：最外层是一个不持有�
 - **外部策略与装备仓（可选覆盖）**：通过 `profile.override_dir` 只读挂载 policies / triggers、`skills/` 与 `agents/`；P04 对 `SKILL.md` 只做追加式更新（旧文件逐字节为新文件前缀）。
 - **挂载知识库（本地 Markdown / Obsidian Wiki）**：人类可读、可进 Git 的知识资产；`.wiki-schema.md` 写入门禁、FTS5 回读索引与 P04 审批后受控写入。
 
-> **v0.7.1 补丁指引**：P04 写入项目实战重卡或轻记卡时，现在会把它与对应项目的 `实战笔记/笔记索引.md` 作为同一个受控事务处理。索引目标与新增条目在审批前可见，P04 在索引锁内复核批准范围；并发、重试和重复执行保持去重，任一侧写入或后检失败时两处文件一起回滚。v0.7.0 引入的显式沉淀队列、SQLite v4 数据底座与双端归档触发机制继续适用。
+> **v0.8.0 更新指引**：沉淀队列新增 **Codex UUID 身份归一化去重、JSONL 可读标题提取、工作区展示、主会话与分片/子代理树形折叠（子代理默认不进自动批次、按需手动勾入）以及可配置无头脚本过滤与重筛一键清洗**；知识保鲜期新增 **Wiki `status: archived` 同步、周五蒸馏对超期满 30 天且零助益卡片的纯台账自动退场与阅读弹窗兜底复核**；实时异常线索补齐 **「转入错题观察池」真实闭环与「随下次沉淀自动结算 / 无关联待审会话」状态透出**，彻底消除文案与按钮语义冲突。
 
 ---
 
@@ -97,27 +97,28 @@ AI 工具通过 `http://127.0.0.1:8765/mcp`（Streamable HTTP）或 `flywheel mc
 
 ---
 
-## 核心能力（v0.7.1）
+## 核心能力（v0.8.0）
 
 ### 1. 策略与知识解耦 + 执行期实证门禁
 - 反偷懒契约、循环保护阈值、证据分级（`real / test / static / unknown`）与个人协作偏好独立托管在 `profile/policies/`，无需绑定特定知识库。
 - 知识落点完全可插拔：默认内置 `./data/knowledge`（零配置开箱即用），也可无侵入挂载任意本地 Markdown / Obsidian Wiki。
 
-### 2. 显式沉淀队列、双端归档机制与统一数据底座（v0.7.1）
-- **可见的流水线库存（`distill_queue`）**：将客户端会话主档（`sessions`）与流水线沉淀任务解耦，提供 6 态库存（`queued` / `processing` / `processed` / `excluded` / `withdrawn` / `dead_letter`）、按工具分片统计与预计清仓批次数；同一会话支持撤回后再输入增量入队（`rev + 1` 水位线）与独立失败重试/死信隔离。
+### 2. 显式沉淀队列、父子归组与统一数据底座（v0.8.0）
+- **可见的流水线库存（`distill_queue`）**：将客户端会话主档（`sessions`）与流水线沉淀任务解耦，提供 6 态库存（`queued` / `processing` / `processed` / `excluded` / `withdrawn` / `dead_letter`）、工作区来源徽标、按工具分片统计与预计清仓批次数；同一会话支持撤回后再输入增量入队（`rev + 1` 水位线）与独立失败重试/死信隔离。
+- **身份归一化、可读标题与父子树形归组**：从 Codex `session_meta` 与 Claude Code JSONL 自动提取规范 UUID（跨通道统一 `codex:<uuid>` 去重）、`custom-title` / 首条有效用户消息可读标题与 `parent_session_key`；同会话多分片与派生子代理在队列看板折叠归组至主会话下，子代理默认隔离子批次自动认领（支持展开按需勾选插队）；支持配置 `sessions.triage.exclude_content_prefixes` 与单轮无工具脚本拦截，并在「按最新规则重筛」中一键刷新存量标题、父子关系与去重。
 - **双端精准触发 + MCP 显式声明**：
   - **Codex（严格归档制）**：仅同步 `archived_sessions/` 归档目录或 MCP 显式声明，移出自动撤回、续聊增大后重归档自动增量入队；
   - **Claude Code（exit 退出触发制）**：`SessionEnd` 过三级规则闸门入队，`SessionStart(resume)` 与续聊提示自动撤回，`Stop` 不再制造半成品噪音；
   - **对话内 MCP 控制**：`flywheel_session_intent` 支持一句话声明沉淀（`enqueue` 高优直通）、本会话永久不沉淀（`opt_out` 一票否决）与撤回（`withdraw`），并由 `UserPromptSubmit` 自动注入规范 `session_key` 实现 100% 对齐。
-- **超大上下文 0-Token 瘦身与分片**：入队前保留完整用户提问与尾部结论、折叠冗长工具日志，仍超预算时按轮次边界自动拆片（`chunk 1/N..N/N`），杜绝截尾丢根因。
+- **超大上下文 0-Token 瘦身与保头保尾分片**：JSONL 提取自动剥离 `tool_result`/`thinking`/`reasoning` 噪音块，保留完整用户提问与尾部结论，超预算时按轮次边界拆片（上限 4 片，强制保头保尾），杜绝截尾丢根因。
 - **统一字典表 + 通用状态轨迹 + 权威 DDL**：新增 `sys_dict_items` 统一托管 9 类 55 项内置码值与扩展元数据（`GET /api/site/dicts`）；复用 `audit_events` 承接全系统状态变迁轨迹；权威建模脚本 [`docs/schema.sql`](./docs/schema.sql) 与 [`docs/data-model.md`](./docs/data-model.md) 受架构不变量测试强守护。
 
 ### 3. 抗熵增进化引擎（防记忆投毒、敢做减法、规则可回溯）
-- **两级会话初筛**：一级 0-Token 规则硬筛自动过滤内部子代理碎片与空会话；二级 P02 语义价值闸门直接丢弃翻译、闲聊与一次性问答，绝不硬凑笔记。
-- **双轨错题观察池**：失误分 `red_silent`（🔴 沉默错误）/ `yellow_caught`（🟡 自查拦截）/ `green_minor`（🟢 轻微）；普通失误按 `root_cause_key` 聚类满 **3 次（事不过三）** 才晋升规则，高危沉默错误支持首次直通试运行。
+- **两级会话初筛**：一级 0-Token 规则硬筛自动过滤子代理碎片、无头批处理脚本与空会话；二级 P02 语义价值闸门直接丢弃翻译、闲聊与一次性问答，绝不硬凑笔记。
+- **双轨错题观察池 + 实时异常线索闭环**：失误分 `red_silent`（🔴 沉默错误）/ `yellow_caught`（🟡 自查拦截）/ `green_minor`（🟢 轻微）；普通失误按 `root_cause_key` 聚类满 **3 次（事不过三）** 才晋升规则，高危沉默错误支持首次直通试运行；实时异常线索透出「随下次沉淀自动结算 / 无关联待审会话」归属，支持高价值或孤立线索一键「转入错题观察池」（`POST /api/site/retro/promote`）直接沉淀并结案。
 - **分歧反例保留 + 轻量规则双时态沿革**：规则复测失败或出现例外时写入 `dissent_records` 绝不静默覆盖；规则替代与停用自动记录 `supersedes_rule_id`、`effective_from`、`effective_to`（纯 SQLite 幂等迁移，无需图库），完整保留规则演进时间线。
-- **经验卡新鲜度保鲜**：按 `volatile`（30 天）/ `evolving`（90 天）/ `evergreen`（180 天）管理有效期；超期自动降权并提示复核，在真实任务中通过 `real` 验证引用时自动续期。
-- **周五分层蒸馏 + 反 Skill 表演**：支持只读预览（`GET /api/site/dream` / 控制台一键预览）与自动/手动执行——将 14 天零命中试运行规则转入 `dormant`、标记超期经验、检测触发词重合规则及 21 天零调用或连续失败 Skill。
+- **经验卡新鲜度偏自动化保鲜**：按 `volatile`（30 天）/ `evolving`（90 天）/ `evergreen`（180 天）管理有效期；超期自动降权并提示复核，在真实任务中通过 `real` 验证引用时自动续期；同步识别 Wiki 原文 `status: archived`（同步退场且不进入 FTS 召回），每周蒸馏对超期满 30 天且零助益卡片在飞轮台账自动归档，并在阅读弹窗提供纯台账兜底操作（`POST /api/site/knowledge/freshness`，绝不改写 Wiki 源文件）。
+- **周五分层蒸馏 + 反 Skill 表演**：支持只读预览（`GET /api/site/dream` / 控制台一键预览）与自动/手动执行——将 14 天零命中试运行规则转入 `dormant`、自动归档 30 天低危单次错题与超期零助益经验卡台账、检测触发词重合规则及 21 天零调用或连续失败 Skill。
 
 ### 4. 人机可控的资产变更、Git 审计与多通道通知
 - **合同驱动的 Schema 写入门禁**：挂载含 `.wiki-schema.md` 的 Wiki 时，P03 由模型从现场候选集中声明路由并经证据交叉校验（归属不明或冲突绝不写入，记 `planned_doc_unrouted`）；支持中性 `postflight_hook_script` 写后校验钩子（向后兼容 `wiki_d2_postflight_script`）。
