@@ -263,6 +263,15 @@ class QueueRepoMixin:
             row = conn.execute(sql, params).fetchone()
             return int(row["cnt"]) if row else 0
 
+    def list_active_queue_session_keys(self) -> set[str]:
+        """Return the deduplicated set of session_keys currently in active queue states (queued/processing)."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT session_key FROM distill_queue WHERE status IN (?, ?)",
+                (QueueStatus.QUEUED.value, QueueStatus.PROCESSING.value),
+            ).fetchall()
+            return {str(row["session_key"]) for row in rows if row["session_key"]}
+
     def list_queued_items_prioritized(
         self, limit: int = 50, *, include_subagents: bool = False
     ) -> list[DistillQueueItem]:

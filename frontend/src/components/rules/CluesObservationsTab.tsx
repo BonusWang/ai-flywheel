@@ -41,6 +41,7 @@ interface RetroGroup {
   clients: string[]
   sessions: string[]
   advisory?: RetroAdvisory
+  hasQueuedSession: boolean
 }
 
 function canonicalRetroKey(item: RetroItem): string {
@@ -230,6 +231,7 @@ export const CluesObservationsTab: React.FC<{
           clients: [item.client],
           sessions: item.session_key ? [item.session_key] : [],
           advisory: item.advisory,
+          hasQueuedSession: Boolean(item.has_queued_session),
         })
       } else {
         existing.ids.push(item.retro_id)
@@ -244,6 +246,9 @@ export const CluesObservationsTab: React.FC<{
         }
         if (!existing.advisory && item.advisory) {
           existing.advisory = item.advisory
+        }
+        if (item.has_queued_session) {
+          existing.hasQueuedSession = true
         }
       }
     }
@@ -367,6 +372,29 @@ export const CluesObservationsTab: React.FC<{
           toast.push(`已撤销，恢复 ${ids.length} 条线索`)
         },
       })
+    })
+
+  const handlePromoteRetroGroup = (ids: string[]) =>
+    runAction(async () => {
+      if (ids.length === 0) return
+      const res = await api.promoteRetros(ids)
+      setSelectedRetroKeys([])
+      await onChanged()
+      toast.push(`已将 ${res.resolved_count} 条线索转入错题观察池并结案`)
+    })
+
+  const handleBulkPromoteRetroGroups = (groups: RetroGroup[]) =>
+    runAction(async () => {
+      const targets = groups.filter((g) => g.ids.length > 0)
+      if (targets.length === 0) return
+      let resolvedTotal = 0
+      for (const group of targets) {
+        const res = await api.promoteRetros(group.ids)
+        resolvedTotal += res.resolved_count
+      }
+      setSelectedRetroKeys([])
+      await onChanged()
+      toast.push(`已将 ${targets.length} 组（共 ${resolvedTotal} 条）线索转入错题观察池并结案`)
     })
 
   const totalActionCount = highPriorityObs.length + openDissents.length
@@ -973,7 +1001,7 @@ export const CluesObservationsTab: React.FC<{
             <Radar className="w-4 h-4 text-accent shrink-0" />
             <span>
               <strong className="text-ink">系统自动聚合的运行线索</strong>
-              ：由工具在执行期实时上报，每日定时整理时会自动结算；同类重复信号已合并展示，也可一键清理建议噪音。
+              ：由工具在执行期实时上报。若关联会话在待提炼队列中，随下次沉淀自动结算；无关联待审会话的线索需人工处置：高价值线索可「转入错题观察池」沉淀，无复用价值可标「已人工处理」或「忽略」。
             </span>
           </div>
 
@@ -998,6 +1026,21 @@ export const CluesObservationsTab: React.FC<{
                     <button
                       type="button"
                       disabled={busy}
+                      onClick={() => {
+                        const groups = groupedRetros.filter((g) =>
+                          selectedRetroKeys.includes(g.key)
+                        )
+                        handleBulkPromoteRetroGroups(groups)
+                      }}
+                      className="pressable inline-flex items-center gap-1 h-8 px-2.5 rounded-[var(--radius-control)] bg-accent text-accent-contrast text-[12px] font-medium hover:bg-accent-ink"
+                    >
+                      <ArrowUpRight className="w-3.5 h-3.5" />
+                      批量转入错题池
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      title="仅标记已处理并结案，不再送入下次沉淀"
                       onClick={() => {
                         const ids = groupedRetros
                           .filter((g) => selectedRetroKeys.includes(g.key))
@@ -1109,6 +1152,23 @@ export const CluesObservationsTab: React.FC<{
                           <div className="min-w-0 flex-1 space-y-1">
                             <div className="flex flex-wrap items-center gap-1.5">
                               <StatusBadge status={item.status} />
+                              {isOpen && (
+                                group.hasQueuedSession ? (
+                                  <span
+                                    className="px-1.5 py-0.5 rounded bg-ok-soft text-ok-ink text-[11px] font-medium cursor-help"
+                                    title="关联会话当前在待提炼队列中，下次批次 P05 结算时将自动结案"
+                                  >
+                                    随下次沉淀自动结算
+                                  </span>
+                                ) : (
+                                  <span
+                                    className="px-1.5 py-0.5 rounded bg-bg-sunk border border-line-soft text-ink-3 text-[11px] font-medium cursor-help"
+                                    title="关联会话不在待提炼队列中（如未归档或独立上报），不会自动结算，需人工确认处理、转错题或忽略"
+                                  >
+                                    无关联待审会话
+                                  </span>
+                                )
+                              )}
                               <span className="chip">{labelOf(RETRO_KIND_LABELS, item.kind)}</span>
                               {group.clients.map((c) => (
                                 <span key={c} className="chip">
@@ -1153,7 +1213,36 @@ export const CluesObservationsTab: React.FC<{
                       </div>
                       {isOpen && (
                         <div className="flex items-center gap-1.5 shrink-0">
-                          {group.advisory?.verdict === 'ignore' ? (
+                          {group.advisory?.verdict === 'keep' ? (
+                            <>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => handlePromoteRetroGroup(group.ids)}
+                                className="pressable inline-flex items-center gap-1 h-7 px-2.5 rounded-[var(--radius-mark)] bg-accent text-accent-contrast text-[12px] font-medium hover:bg-accent-ink disabled:opacity-50"
+                              >
+                                <ArrowUpRight className="w-3 h-3" />
+                                {group.count > 1 ? `整组转入错题池 (${group.count})` : '转入错题观察池'}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                title="仅标记已处理并结案，不再送入下次沉淀"
+                                onClick={() => handleRetroGroupStatus(group.ids, 'resolved')}
+                                className="pressable h-7 px-2.5 rounded-[var(--radius-mark)] border border-line text-ink-3 text-[12px] hover:text-ink disabled:opacity-50"
+                              >
+                                {group.count > 1 ? `整组已处理 (${group.count})` : '已人工处理'}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => handleRetroGroupStatus(group.ids, 'dismissed')}
+                                className="pressable h-7 px-2.5 rounded-[var(--radius-mark)] border border-line text-ink-3 text-[12px] hover:text-ink disabled:opacity-50"
+                              >
+                                忽略
+                              </button>
+                            </>
+                          ) : group.advisory?.verdict === 'ignore' ? (
                             <>
                               <button
                                 type="button"
@@ -1166,10 +1255,11 @@ export const CluesObservationsTab: React.FC<{
                               <button
                                 type="button"
                                 disabled={busy}
+                                title="仅标记已处理并结案，不再送入下次沉淀"
                                 onClick={() => handleRetroGroupStatus(group.ids, 'resolved')}
                                 className="pressable h-7 px-2.5 rounded-[var(--radius-mark)] border border-line text-ink-3 text-[12px] hover:text-ink disabled:opacity-50"
                               >
-                                已处理
+                                已人工处理
                               </button>
                             </>
                           ) : (
@@ -1177,10 +1267,20 @@ export const CluesObservationsTab: React.FC<{
                               <button
                                 type="button"
                                 disabled={busy}
+                                onClick={() => handlePromoteRetroGroup(group.ids)}
+                                className="pressable inline-flex items-center gap-1 h-7 px-2.5 rounded-[var(--radius-mark)] border border-line bg-surface text-ink text-[12px] font-medium hover:border-accent hover:text-accent disabled:opacity-50"
+                              >
+                                <ArrowUpRight className="w-3 h-3" />
+                                转入错题观察池
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                title="仅标记已处理并结案，不再送入下次沉淀"
                                 onClick={() => handleRetroGroupStatus(group.ids, 'resolved')}
                                 className="pressable h-7 px-2.5 rounded-[var(--radius-mark)] bg-ok-soft text-ok-ink text-[12px] font-medium disabled:opacity-50"
                               >
-                                {group.count > 1 ? `整组已处理 (${group.count})` : '已处理'}
+                                {group.count > 1 ? `整组已处理 (${group.count})` : '已人工处理'}
                               </button>
                               <button
                                 type="button"

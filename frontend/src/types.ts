@@ -97,7 +97,7 @@ export interface RetroAdvisory {
   attempt: number
   verdict: 'ignore' | 'review' | 'keep'
   verdict_label: string
-  recommended_action: 'dismissed' | 'resolved'
+  recommended_action: 'dismissed' | 'resolved' | 'promote'
   reason: string
   matched_preference?: string
 }
@@ -114,6 +114,8 @@ export interface RetroItem {
   detail: Record<string, unknown>
   status: 'open' | 'in_review' | 'resolved' | 'dismissed'
   advisory?: RetroAdvisory
+  has_queued_session?: boolean
+  settlement_mode?: 'auto_next_batch' | 'manual_only'
   created_at: string
   updated_at: string
 }

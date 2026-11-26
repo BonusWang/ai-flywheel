@@ -1,6 +1,7 @@
 """Governance: policies, rules, mistake observations, dissents, knowledge and skills."""
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from ai_flywheel.core.receipts import OutcomeGateError
-from ai_flywheel.core.retro_advisory import advise_retro_item
+from ai_flywheel.core.retro_advisory import (
+    advise_retro_item,
+    build_retro_group_key,
+    normalize_retro_summary,
+)
 from ai_flywheel.core.time_utils import shanghai_today_ymd
 from ai_flywheel.models import (
     CreateRuleRequest,
@@ -18,6 +23,7 @@ from ai_flywheel.models import (
     ReportSignalRequest,
     RetroStatus,
     RuleStatus,
+    SignalKind,
 )
 from ai_flywheel.runtime import FlywheelRuntime
 
@@ -34,6 +40,11 @@ class RetroStatusBody(BaseModel):
 class RetroBulkStatusBody(BaseModel):
     retro_ids: list[str]
     status: RetroStatus
+
+
+class RetroPromoteBody(BaseModel):
+    retro_ids: list[str]
+    severity_grade: str | None = None
 
 
 class ObservationBulkArchiveBody(BaseModel):
@@ -323,11 +334,16 @@ def build_governance_router(rt: FlywheelRuntime) -> APIRouter:
     def site_list_retro(status: str | None = None, limit: int = 300) -> dict[str, Any]:
         safe_limit = max(1, min(int(limit), 500))
         items = rt.db.list_retro_items(status=status, limit=safe_limit)
+        active_queue_keys = rt.db.list_active_queue_session_keys()
         user_prefs = rt.policies.get_policy("user_preferences") or {}
         hard_gates = rt.policies.get_hard_gates()
         enriched = []
         for x in items:
+            has_queued_session = bool(x.session_key and x.session_key in active_queue_keys)
+            settlement_mode = "auto_next_batch" if has_queued_session else "manual_only"
             dumped = x.model_dump(mode="json")
+            dumped["has_queued_session"] = has_queued_session
+            dumped["settlement_mode"] = settlement_mode
             dumped["advisory"] = advise_retro_item(x, user_prefs=user_prefs, hard_gates=hard_gates)
             enriched.append(dumped)
         return {
@@ -344,6 +360,99 @@ def build_governance_router(rt: FlywheelRuntime) -> APIRouter:
     def site_bulk_update_retro(body: RetroBulkStatusBody) -> dict[str, Any]:
         updated = rt.db.bulk_update_retro_status(body.retro_ids, body.status)
         return {"updated": updated}
+
+    @router.post("/api/site/retro/promote")
+    def site_promote_retro(body: RetroPromoteBody) -> dict[str, Any]:
+        if not body.retro_ids:
+            raise HTTPException(status_code=400, detail="retro_ids cannot be empty")
+        items = rt.db.get_retro_items_by_ids(body.retro_ids)
+        if not items:
+            raise HTTPException(status_code=404, detail="No matching retro items found")
+
+        # Sort descending by created_at to use the latest item as primary
+        items.sort(key=lambda it: it.created_at, reverse=True)
+        primary = items[0]
+        found_ids = [it.retro_id for it in items]
+
+        kind_val = primary.kind.value if isinstance(primary.kind, SignalKind) else str(primary.kind)
+        if primary.rule_id:
+            root_cause_key = f"retro-rule-{primary.rule_id}"
+        else:
+            group_key = build_retro_group_key(primary)
+            sha = hashlib.sha256(group_key.encode("utf-8")).hexdigest()
+            kind_kebab = kind_val.replace("_", "-")
+            root_cause_key = f"retro-{kind_kebab}-{sha[:10]}"
+
+        title = normalize_retro_summary(primary.summary)[:80]
+        if body.severity_grade in {"red_silent", "yellow_caught", "green_minor"}:
+            grade = body.severity_grade
+        else:
+            is_high = (
+                primary.kind in {SignalKind.RULE_RECURRENCE, SignalKind.MISSING_EVIDENCE}
+                or kind_val in {"rule_recurrence", "missing_evidence"}
+                or primary.severity == "high"
+            )
+            grade = "red_silent" if is_high else "yellow_caught"
+
+        phenomenon = primary.summary
+        truth = f"来源实时异常线索（{kind_val}），需核查根因并固化验证/边界规则"
+
+        adv = advise_retro_item(
+            primary,
+            user_prefs=rt.policies.get_policy("user_preferences") or {},
+            hard_gates=rt.policies.get_hard_gates(),
+        )
+        thinking_root_cause = adv.get("reason", "")
+        caught_by = "tool"
+        session_key = primary.session_key or ""
+
+        obs, created = rt.db.upsert_mistake_observation(
+            root_cause_key=root_cause_key,
+            title=title,
+            severity_grade=grade,
+            phenomenon=phenomenon,
+            truth=truth,
+            thinking_root_cause=thinking_root_cause,
+            caught_by=caught_by,
+            session_key=session_key,
+        )
+
+        for other in items[1:]:
+            if other.session_key and other.session_key != primary.session_key:
+                obs, _ = rt.db.upsert_mistake_observation(
+                    root_cause_key=root_cause_key,
+                    title="",
+                    severity_grade=grade,
+                    phenomenon="",
+                    truth="",
+                    thinking_root_cause="",
+                    caught_by=caught_by,
+                    session_key=other.session_key,
+                )
+
+        updated = rt.db.bulk_update_retro_status(found_ids, RetroStatus.RESOLVED)
+
+        rt.db.append_audit_event(
+            entity_type="retro_queue",
+            entity_id=primary.retro_id,
+            event_type="retro_promoted_to_observation",
+            actor="portal",
+            summary=f"实时异常线索转入错题观察池：{obs.get('title', '')}",
+            payload={
+                "obs_id": obs.get("obs_id"),
+                "root_cause_key": root_cause_key,
+                "retro_ids": found_ids,
+                "resolved_count": updated,
+            },
+        )
+        rt.refresh_core_card()
+
+        return {
+            "observation": obs,
+            "created": created,
+            "resolved_count": updated,
+            "retro_ids": found_ids,
+        }
 
     @router.post("/api/site/retro/{retro_id}/status")
     def site_update_retro(retro_id: str, body: RetroStatusBody) -> dict[str, Any]:

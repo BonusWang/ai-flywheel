@@ -232,8 +232,8 @@ def advise_retro_item(
             "attempt": attempt,
             "verdict": "keep",
             "verdict_label": "高价值 · 建议留存",
-            "recommended_action": "resolved",
-            "reason": "命中实证/权威源纠偏信号，建议保留进入沉淀或提炼为避坑规则。",
+            "recommended_action": "promote",
+            "reason": "命中实证/权威源纠偏信号，可点击「转入错题观察池」直接沉淀，或保持待处理随下次批次自动带入。",
             "matched_preference": redline,
         }
 

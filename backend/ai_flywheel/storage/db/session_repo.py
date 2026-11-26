@@ -527,6 +527,18 @@ class SessionRepoMixin:
                 row = conn.execute("SELECT COUNT(*) AS cnt FROM retro_queue").fetchone()
             return int(row["cnt"]) if row else 0
 
+    def get_retro_items_by_ids(self, retro_ids: list[str]) -> list[RetroItem]:
+        ids = [rid for rid in dict.fromkeys(retro_ids) if rid]
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM retro_queue WHERE retro_id IN ({placeholders}) ORDER BY created_at DESC",
+                ids,
+            ).fetchall()
+            return [self._row_to_retro(r) for r in rows]
+
     def update_retro_status(self, retro_id: str, status: RetroStatus) -> RetroItem | None:
         with self.connect() as conn:
             conn.execute(

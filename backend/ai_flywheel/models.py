@@ -303,6 +303,8 @@ class RetroItem(BaseModel):
     rule_id: str | None = None
     detail: dict[str, Any] = Field(default_factory=dict)
     status: RetroStatus = RetroStatus.OPEN
+    has_queued_session: bool | None = None
+    settlement_mode: str | None = None
     created_at: str = Field(default_factory=utc_now_iso)
     updated_at: str = Field(default_factory=utc_now_iso)
 

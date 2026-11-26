@@ -9,7 +9,15 @@ from fastapi.testclient import TestClient
 from ai_flywheel.app import create_app
 from ai_flywheel.config import FlywheelConfig
 from ai_flywheel.core.dream import preview_dream_consolidation, run_dream_consolidation
-from ai_flywheel.models import CreateRuleRequest, ReportSignalRequest, SignalKind
+from ai_flywheel.models import (
+    CreateRuleRequest,
+    DistillQueueItem,
+    QueueStatus,
+    ReportSignalRequest,
+    RetroStatus,
+    SessionRecord,
+    SignalKind,
+)
 from ai_flywheel.runtime import FlywheelRuntime
 
 
@@ -377,4 +385,103 @@ def test_knowledge_freshness_actions_api_and_file_preservation(tmp_path: Path) -
     assert client.post("/api/site/knowledge/freshness", json={"doc_path": "", "action": "verify"}).status_code == 422
     assert client.post("/api/site/knowledge/freshness", json={"doc_path": doc_path, "action": "invalid_act"}).status_code == 422
     assert client.post("/api/site/knowledge/freshness", json={"doc_path": doc_path, "action": "set_tier", "freshness_tier": "invalid_tier"}).status_code == 422
+
+
+def test_retro_signal_closure_semantics_and_promote(tmp_path: Path) -> None:
+    rt = _make_runtime(tmp_path)
+    client = TestClient(create_app(runtime=rt, process_role="cli"))
+
+    # 1. Enqueue an active session in distill_queue
+    rt.db.upsert_session(
+        SessionRecord(
+            session_key="claude-code:s_queued",
+            client="claude-code",
+            session_id="s_queued",
+            title="Queued active session",
+        )
+    )
+    rt.db.upsert_queue_item(
+        DistillQueueItem(
+            queue_id="q_active_1",
+            session_key="claude-code:s_queued",
+            client="claude-code",
+            status=QueueStatus.QUEUED,
+        )
+    )
+
+    # 2. Report two retro clues: one with queued session, one without (orphan)
+    item_keep, _ = rt.receipts.report_signal(
+        ReportSignalRequest(
+            client="claude-code",
+            session_id="s_queued",
+            kind=SignalKind.MISSING_EVIDENCE,
+            severity="high",
+            summary="更正先前一条未经验证的断言，经实测证据推翻",
+        )
+    )
+    item_review, _ = rt.receipts.report_signal(
+        ReportSignalRequest(
+            client="claude-code",
+            session_id="s_orphan",
+            kind=SignalKind.RETRY_LOOP,
+            severity="warning",
+            summary="同一工具 `Bash` 相同输入在本轮已连续尝试 3 次",
+            tool_name="Bash",
+            detail={"attempt": 3},
+        )
+    )
+
+    # 3. GET /api/site/retro verifies has_queued_session, settlement_mode, and recommended_action
+    resp = client.get("/api/site/retro")
+    assert resp.status_code == 200
+    data = resp.json()
+    items = {it["retro_id"]: it for it in data["items"]}
+
+    r_keep = items[item_keep.retro_id]
+    assert r_keep["has_queued_session"] is True
+    assert r_keep["settlement_mode"] == "auto_next_batch"
+    assert r_keep["advisory"]["verdict"] == "keep"
+    assert r_keep["advisory"]["recommended_action"] == "promote"
+    assert "可点击「转入错题观察池」直接沉淀" in r_keep["advisory"]["reason"]
+
+    r_review = items[item_review.retro_id]
+    assert r_review["has_queued_session"] is False
+    assert r_review["settlement_mode"] == "manual_only"
+    assert r_review["advisory"]["verdict"] == "review"
+
+    # 4. Promote retro to mistake observation
+    prom_res = client.post(
+        "/api/site/retro/promote",
+        json={"retro_ids": [item_keep.retro_id]},
+    )
+    assert prom_res.status_code == 200
+    res_body = prom_res.json()
+    assert res_body["created"] is True
+    assert res_body["resolved_count"] == 1
+    assert res_body["retro_ids"] == [item_keep.retro_id]
+
+    obs = res_body["observation"]
+    assert obs["severity_grade"] == "red_silent"
+    assert obs["caught_by"] == "tool"
+    assert obs["title"] == "更正先前一条未经验证的断言，经实测证据推翻"
+    assert "来源实时异常线索" in obs["truth"]
+
+    # Verify retro item in DB is now resolved
+    retros_after = client.get("/api/site/retro?status=open").json()["items"]
+    open_ids = [it["retro_id"] for it in retros_after]
+    assert item_keep.retro_id not in open_ids
+    assert item_review.retro_id in open_ids
+
+    # Verify audit event was logged
+    audit_events = rt.db.list_audit_events(limit=10)
+    prom_audit = next((a for a in audit_events if a.get("event_type") == "retro_promoted_to_observation"), None)
+    assert prom_audit is not None
+    assert prom_audit["actor"] == "portal"
+    assert prom_audit["entity_type"] == "retro_queue"
+    assert prom_audit["entity_id"] == item_keep.retro_id
+
+    # 5. Error handling
+    assert client.post("/api/site/retro/promote", json={"retro_ids": []}).status_code == 400
+    assert client.post("/api/site/retro/promote", json={"retro_ids": ["nonexistent-id"]}).status_code == 404
+
 
