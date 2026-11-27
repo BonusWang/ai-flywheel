@@ -55,8 +55,16 @@ sessions:
 
   # Session triage:
   #   exclude_content_prefixes - session content prefixes to exclude (e.g. headless batch scripts)
+  #   controlled_write_markers - phrases that identify a controlled knowledge-base write dispatch
+  #                          in your installation (a heading of its dispatch template, the name of
+  #                          its writer skill). A session whose only instruction carries one is
+  #                          `excluded (SUBAGENT_FRAGMENT)`: it is the writing of a document, not a
+  #                          conversation to distill. Built in already: an approved write-set named
+  #                          together with the write contract (postflight check, pre/postimage,
+  #                          controlled-write wording) in a single-instruction brief.
   triage:
     exclude_content_prefixes: []
+    controlled_write_markers: []
 
 # Pluggable knowledge sink (decoupled from flywheel policies)
 knowledge_sink:
@@ -137,6 +145,17 @@ workflow:
   auto_approve_writes: false
   max_sessions_per_run: 10
   max_chars_per_run: 180000
+  # How late (seconds) the daily_flywheel job may still run after its fire time. A host that
+  # slept or was busy past the cron time resumes the batch on wake-up instead of losing it.
+  # The same value bounds the window in which a missed fire is caught up (see the next key).
+  # Minimum 60; 14400 is four hours.
+  misfire_grace_seconds: 14400
+  # Serve role only. When today's scheduled fire was missed (the service was not running at
+  # the cron time), the grace window is still open and there is work queued, the recovery
+  # loop records a `schedule_misfire_detected` audit event (at most once a day) and starts
+  # one catch-up batch (trigger="scheduled"). `false` records the miss and leaves
+  # `scheduler.missed_today = true` in GET /api/site/automations, but never starts a batch.
+  catchup_missed_schedule: true
 
 # Background AI execution runner for P02/P03/P04
 runner:

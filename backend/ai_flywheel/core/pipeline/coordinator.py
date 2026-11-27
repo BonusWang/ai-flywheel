@@ -61,6 +61,8 @@ from ai_flywheel.core.pipeline.helpers import (
     candidate_mistakes,
     domain_signal_names,
     eligible_promotions,
+    filter_governance_only_docs,
+    governance_only_skip_receipt,
     partial_write_payload,
     promote_observation,
     route_knowledge_doc,
@@ -68,7 +70,11 @@ from ai_flywheel.core.pipeline.helpers import (
 )
 from ai_flywheel.core.pipeline.recovery import RecoveryMixin
 from ai_flywheel.core.policies import PolicyEngine
-from ai_flywheel.core.queue_service import DistillQueueService
+from ai_flywheel.core.queue_service import (
+    DISTILL_MODE_GOVERNANCE_ONLY,
+    DISTILL_MODE_SKIPPED,
+    DistillQueueService,
+)
 from ai_flywheel.models import (
     CreateRuleRequest,
     DistillQueueItem,
@@ -357,6 +363,25 @@ class WorkflowOrchestrator(RecoveryMixin):
         """Source session records of a planned write, looked up where runs persist them."""
         return {record.session_key: record for key in session_keys if (record := self.db.get_session(key))}
 
+    def _distill_modes(self, session_keys: list[str]) -> dict[str, str]:
+        """How each of these sessions is distilled right now (``full`` unless declared otherwise)."""
+        modes: dict[str, str] = {}
+        for key in dict.fromkeys(session_keys):
+            record = self.db.get_session(key)
+            if record is not None:
+                modes[key] = self.queue.distill_mode_of(record)
+        return modes
+
+    def _declared_keys(self, session_keys: list[str], modes: frozenset[str]) -> list[str]:
+        """The sessions currently distilled in one of ``modes``.
+
+        Always read from the database, never carried over from an earlier node: a
+        client may declare a session hand-distilled while a batch that admitted it
+        is still between P01 and P04.
+        """
+        current = self._distill_modes(session_keys)
+        return [key for key, mode in current.items() if mode in modes]
+
     def _record_partial_writes(
         self,
         run: WorkflowRunRecord,
@@ -579,9 +604,12 @@ class WorkflowOrchestrator(RecoveryMixin):
                 if not admitted:
                     # A database seeded without queue rows still runs: the P00 bridge
                     # normally makes this unreachable, never a silent empty batch. An
-                    # opt-out is a hard veto, so an automatic batch skips it.
+                    # opt-out is a hard veto, so an automatic batch skips it, and so is
+                    # a session the client took out of distillation by hand.
                     for sess in selected_sessions[:max_sess]:
                         if sess.opt_out:
+                            continue
+                        if self.queue.distill_mode_of(sess) == DISTILL_MODE_SKIPPED:
                             continue
                         text = self.sessions.load_session_text(sess, max_chars=24000)
                         if used_chars + len(text) > max_chars and admitted:
@@ -590,15 +618,25 @@ class WorkflowOrchestrator(RecoveryMixin):
                         admitted.append((sess, text))
                         self.db.update_session_status(sess.session_key, SessionStatus.IN_PROGRESS)
             run.admitted_sessions = list(dict.fromkeys(s.session_key for s, _ in admitted))
+            distill_modes = self._distill_modes(run.admitted_sessions)
+            governance_only_keys = [
+                key for key, mode in distill_modes.items() if mode == DISTILL_MODE_GOVERNANCE_ONLY
+            ]
             queue_note = (
                 f"，认领队列项 {len(claimed_queue_ids)} 条" if claimed_queue_ids else ""
+            )
+            governance_note = (
+                f"，其中 {len(governance_only_keys)} 个已由客户端手工沉淀（仅治理提炼）"
+                if governance_only_keys
+                else ""
             )
             self._finish_node(
                 run,
                 "P01_BEGIN",
                 t0,
                 summary=(
-                    f"独占锁已获取，准入 {len(admitted)} 个会话单元（共 {used_chars} 字符）{queue_note}"
+                    f"独占锁已获取，准入 {len(admitted)} 个会话单元（共 {used_chars} 字符）"
+                    f"{queue_note}{governance_note}"
                 ),
                 internal_checks=[
                     {"name": "独占锁持有核验", "status": "PASS"},
@@ -609,6 +647,10 @@ class WorkflowOrchestrator(RecoveryMixin):
                     "admitted_sessions": run.admitted_sessions,
                     "used_chars": used_chars,
                     "claimed_queue_ids": claimed_queue_ids,
+                    # How each admitted session is distilled: a `hand_distilled` session is
+                    # reviewed in full, but P03 writes no knowledge document for it.
+                    "distill_modes": distill_modes,
+                    "governance_only_session_keys": governance_only_keys,
                 },
             )
             self._publish_queue_update("p01_claim", run.run_id, claimed_queue_ids)
@@ -651,6 +693,13 @@ class WorkflowOrchestrator(RecoveryMixin):
             review_findings["sent_session_keys"] = sent_session_keys
             review_findings["candidate_mistake_count"] = len(mistake_candidates)
             review_findings["candidate_dissent_count"] = len(dissent_candidates)
+
+            # P02 reviews a session the client hand-distilled like any other: its mistakes,
+            # dissents and rule candidates are what it was queued for. What makes it
+            # different is carried along for P03 and named in the planner's input.
+            review_findings["governance_only_session_keys"] = self._declared_keys(
+                run.admitted_sessions, frozenset({DISTILL_MODE_GOVERNANCE_ONLY})
+            )
 
             wf_candidates = len(review_findings.get("repeated_workflows", []))
             logger.info(
@@ -735,6 +784,45 @@ class WorkflowOrchestrator(RecoveryMixin):
                 raise
             planned_writes = plan_outcome.planned_writes
             plan_info = plan_outcome.diagnostics
+            # A session the client hand-distilled had its knowledge written up by hand. The
+            # planner is told so and asked not to propose a document for it, but a model's
+            # plan is not trusted: a knowledge document that speaks only for such sessions is
+            # taken out here, deterministically, before it is routed or can reach the approval
+            # card. Its rules, Skill plans, mistakes and dissents are what it was queued for.
+            # The declaration is read again rather than taken from P01/P02: it may have been
+            # made while this batch was already running. This never fails the node: a plan
+            # left with nothing to write is an empty plan, not an unavailable one. A session
+            # taken out entirely (`governance_only=false`) counts the same way: its knowledge
+            # was written by hand too.
+            governance_only_keys = sorted(
+                {
+                    *self._declared_keys(
+                        run.admitted_sessions,
+                        frozenset({DISTILL_MODE_GOVERNANCE_ONLY, DISTILL_MODE_SKIPPED}),
+                    ),
+                    *(review_findings.get("governance_only_session_keys") or []),
+                }
+            )
+            planned_writes, governance_only_skipped = filter_governance_only_docs(
+                planned_writes, set(governance_only_keys), run.admitted_sessions
+            )
+            if not self.knowledge.wiki_gate.applicable:
+                plan_info.kept_count = len(planned_writes)
+            if governance_only_skipped:
+                self.db.append_audit_event(
+                    entity_type="workflow_run",
+                    entity_id=run.run_id,
+                    event_type="governance_only_wiki_skipped",
+                    actor="p03_plan",
+                    summary=(
+                        f"{len(governance_only_skipped)} 篇笔记所属会话已由客户端手工沉淀，"
+                        f"仅做治理提炼，未列入写入计划"
+                    ),
+                    payload={
+                        "skipped_docs": governance_only_skipped,
+                        "governance_only_session_keys": governance_only_keys,
+                    },
+                )
             # On a schema-governed Wiki every knowledge_doc is routed before it is adapted: the planner's
             # declaration, validated against workspace and draft evidence and never corrected, says whether
             # it is written and where. A document without a consistent route is dropped here and surfaced
@@ -922,6 +1010,11 @@ class WorkflowOrchestrator(RecoveryMixin):
                 )
             deferred_count = len(plan_info.deferred_skill_candidates)
             deferred_note = f"；{deferred_count} 个重复流程候选未生成 Skill 计划" if deferred_count else ""
+            governance_note = (
+                f"；{len(governance_only_skipped)} 篇笔记所属会话已手工沉淀（仅治理提炼），未列入计划"
+                if governance_only_skipped
+                else ""
+            )
             self._finish_node(
                 run,
                 "P03_ROUTE_PLAN",
@@ -930,7 +1023,7 @@ class WorkflowOrchestrator(RecoveryMixin):
                     f"计划来源：{PLAN_SOURCE_LABELS.get(plan_info.source, plan_info.source)}；"
                     f"查重比对 {len(existing_rules)} 条规则与 {len(existing_skills)} 个技能，"
                     f"整理出 {len(planned_writes)} 项建议（含 {skill_plans} 项 Skill 封装/优化）"
-                    f"{dropped_note}{unrouted_note}{capacity_note}{domain_note}{deferred_note}"
+                    f"{dropped_note}{unrouted_note}{capacity_note}{domain_note}{deferred_note}{governance_note}"
                 ),
                 internal_checks=[
                     {"name": "规则与技能查重", "status": "PASS"},
@@ -959,6 +1052,20 @@ class WorkflowOrchestrator(RecoveryMixin):
                     *(
                         [
                             {
+                                "name": "已手工沉淀会话的知识文档过滤",
+                                "status": "PASS",
+                                "detail": {
+                                    "governance_only_session_keys": governance_only_keys,
+                                    "skipped_docs": len(governance_only_skipped),
+                                },
+                            }
+                        ]
+                        if governance_only_skipped
+                        else []
+                    ),
+                    *(
+                        [
+                            {
                                 "name": "知识文档路由校验",
                                 "status": "PASS",
                                 "detail": {
@@ -984,6 +1091,11 @@ class WorkflowOrchestrator(RecoveryMixin):
                     "plan_diagnostics": plan_info.to_dict(),
                     # What the model call cost: attempts, duration, served model, token usage.
                     "call_telemetry": plan_info.call_telemetry,
+                    # The knowledge documents left out because their sessions were written up
+                    # by hand (hand_distilled), and the sessions that made them be.
+                    "governance_only_session_keys": governance_only_keys,
+                    "governance_only_skipped_docs": governance_only_skipped,
+                    "governance_only_wiki_skipped": len(governance_only_skipped),
                 },
             )
 
@@ -1358,7 +1470,33 @@ class WorkflowOrchestrator(RecoveryMixin):
                 raise RuntimeError("Simulated P04 write verification failure")
 
             approved_items = [w for w in run.planned_writes if w.approved]
-            write_receipts: list[dict[str, Any]] = []
+            # The plan may have waited hours for approval. A session declared hand-distilled
+            # in that time has had its knowledge written up by hand since: its document is
+            # not written a second time, and the receipt says why.
+            approved_items, governance_only_skipped = filter_governance_only_docs(
+                approved_items,
+                set(
+                    self._declared_keys(
+                        run.admitted_sessions,
+                        frozenset({DISTILL_MODE_GOVERNANCE_ONLY, DISTILL_MODE_SKIPPED}),
+                    )
+                ),
+                run.admitted_sessions,
+            )
+            write_receipts: list[dict[str, Any]] = [
+                governance_only_skip_receipt(doc) for doc in governance_only_skipped
+            ]
+            if governance_only_skipped:
+                self.db.append_audit_event(
+                    entity_type="workflow_run",
+                    entity_id=run.run_id,
+                    event_type="governance_only_wiki_skipped",
+                    actor="p04_write",
+                    summary=(
+                        f"{len(governance_only_skipped)} 篇已批准笔记所属会话在等待审批期间被声明手工沉淀，未写入"
+                    ),
+                    payload={"skipped_docs": governance_only_skipped},
+                )
             p02_payload = self._get_node(run, "P02_REVIEW").payload
             if not isinstance(p02_payload, dict):
                 p02_payload = {}
@@ -1591,6 +1729,11 @@ class WorkflowOrchestrator(RecoveryMixin):
                     + (f"；{merged_domain_pages} 篇领域页按增量无损合并，原有内容完整保留" if merged_domain_pages else "")
                     + (f"；{no_new_content_skips} 篇领域页增量已存在于页面，未重复写入" if no_new_content_skips else "")
                     + (
+                        f"；{len(governance_only_skipped)} 篇笔记因所属会话已手工沉淀，未重复写入"
+                        if governance_only_skipped
+                        else ""
+                    )
+                    + (
                         f"；错题观察池入池 {len(persisted_observations)} 条"
                         if persisted_observations
                         else ""
@@ -1659,6 +1802,11 @@ class WorkflowOrchestrator(RecoveryMixin):
                     "written_paths": written_paths,
                     "written_practice_index_paths": written_index_paths,
                     "skipped_unrouted_docs": skipped_docs,
+                    **(
+                        {"governance_only_skipped_docs": governance_only_skipped}
+                        if governance_only_skipped
+                        else {}
+                    ),
                     **({"merged_domain_pages": merged_domain_pages} if merged_domain_pages else {}),
                     "persisted_observation_ids": [
                         str(o.get("obs_id")) for o in persisted_observations if o.get("obs_id")

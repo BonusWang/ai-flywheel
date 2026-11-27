@@ -81,6 +81,11 @@ _SKIPPED_RECORD_TYPES = frozenset(
     }
 )
 
+#: How much of a pending session the triage sweep reads; a write dispatch found in an
+#: excerpt this long is confirmed on the whole conversation.
+_TRIAGE_EXCERPT_CHARS = 8000
+_FULL_TRANSCRIPT_CHARS = 500_000
+
 
 def _extract_jsonl_text(obj: dict[str, Any]) -> str:
     # Support common Codex rollout / Claude Code transcript JSONL shapes,
@@ -223,13 +228,23 @@ class SessionAdapter:
         reason_counts: dict[str, int] = {}
 
         for sess in pending:
-            text = self.load_session_text(sess, max_chars=8000)
+            text = self.load_session_text(sess, max_chars=_TRIAGE_EXCERPT_CHARS)
             res = triage_session(
                 sess,
                 text,
                 triage_cfg,
                 has_open_retro=(sess.session_key in retro_keys),
             )
+            if res.get("reason") == "controlled_write_dispatch" and len(text) >= _TRIAGE_EXCERPT_CHARS:
+                # The excerpt may end before a later question. Whether anything follows
+                # the instruction — what makes a session a bare write dispatch — is
+                # decided on the whole conversation.
+                res = triage_session(
+                    sess,
+                    self.load_session_text(sess, max_chars=_FULL_TRANSCRIPT_CHARS),
+                    triage_cfg,
+                    has_open_retro=(sess.session_key in retro_keys),
+                )
             discovered_ws = res.get("workspace") or ""
             changed = False
             if discovered_ws and not sess.workspace:

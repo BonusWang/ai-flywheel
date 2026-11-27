@@ -20,10 +20,13 @@ import json
 import logging
 import re
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ai_flywheel.adapters.sessions import _extract_jsonl_text
+from ai_flywheel.core.privacy import mask_credential_shapes
+from ai_flywheel.core.time_utils import SHANGHAI_TZ
 from ai_flywheel.core.triage import (
     _UUID_RE,
     derive_readable_title,
@@ -71,7 +74,61 @@ MAX_ARCHIVE_FILES_PER_SOURCE = 500
 
 #: Excluded items with these codes are user/system decisions and are never
 #: re-opened by a rules re-triage.
-RE_TRIAGE_SKIP_REASON_CODES = frozenset({"USER_OPT_OUT", "MANUAL_EXCLUDE", "SUPERSEDED"})
+RE_TRIAGE_SKIP_REASON_CODES = frozenset(
+    {"USER_OPT_OUT", "MANUAL_EXCLUDE", "SUPERSEDED", "HAND_DISTILLED_SKIP"}
+)
+
+#: How a session is distilled. ``full`` is the default: review it and write. A
+#: session whose knowledge the client has already written up by hand is declared
+#: ``governance_only`` (rules, mistakes and dissents, never a knowledge document)
+#: or ``skipped`` (nothing at all). The mode lives on the queue item payload —
+#: the durable record — and is mirrored into the session metadata.
+DISTILL_MODE_FULL = "full"
+DISTILL_MODE_GOVERNANCE_ONLY = "governance_only"
+DISTILL_MODE_SKIPPED = "skipped"
+DISTILL_MODES = frozenset(
+    {DISTILL_MODE_FULL, DISTILL_MODE_GOVERNANCE_ONLY, DISTILL_MODE_SKIPPED}
+)
+
+#: Exclude reason of a session the client hand-distilled and took out entirely.
+HAND_DISTILLED_SKIP = "HAND_DISTILLED_SKIP"
+#: Audit trail of every queue item a ``hand_distilled`` declaration touched.
+HAND_DISTILLED_EVENT = "hand_distilled_declared"
+
+#: A structured brief is evidence for the review, not a second transcript: every
+#: string is capped, and so is each list.
+MAX_BRIEF_VALUE_CHARS = 2000
+MAX_BRIEF_ITEMS = 50
+MAX_BRIEF_DEPTH = 6
+
+#: How much of a session's opening a re-triage reads to recognise a write dispatch. A
+#: verdict taken on an excerpt this long is confirmed on the whole conversation.
+MAX_OPENING_CHARS = 24000
+_OPENING_USER_TURN_RE = re.compile(r"^\[(?:user|human)\]", re.IGNORECASE | re.MULTILINE)
+
+#: Session metadata keys that mirror a hand-distilled declaration.
+HAND_DISTILLED_META_KEYS = (
+    "distill_mode",
+    "hand_distilled_paths",
+    "hand_distilled_skip",
+    "hand_distilled_at",
+)
+
+
+def _shanghai_now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone(SHANGHAI_TZ).isoformat()
+
+
+def _declaration_meta(mode: str, paths: list[str], *, declared_at: str = "") -> dict[str, Any]:
+    """The session-metadata mirror of a hand-distilled declaration."""
+    meta: dict[str, Any] = {
+        "distill_mode": mode,
+        "hand_distilled_paths": list(paths),
+        "hand_distilled_at": declared_at or _shanghai_now_iso(),
+    }
+    if mode == DISTILL_MODE_SKIPPED:
+        meta["hand_distilled_skip"] = True
+    return meta
 
 
 # ---------------------------------------------------------------- transcript reader
@@ -304,9 +361,114 @@ def prepare_queue_chunks(
     }
 
 
-def compute_content_hash(text: str) -> str:
-    """The short fingerprint used by the idempotency / delta gate."""
-    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+#: The words a dictionary key can name a credential by. Redacted one string at a time,
+#: ``{"db_password": "…"}`` would keep its value: the pair is read as the assignment
+#: ``<word>=<value>`` it stands for, and the same test decides whether it is a credential.
+_CREDENTIAL_KEY_WORD_RE = re.compile(
+    r"(?i)(?:^|[_\s-])(api[_-]?key|token|secret|password)(?:$|[_\s-])|密码|口令|私钥|密钥|令牌"
+)
+
+
+def _mask_credential_entry(key: str, entry: Any) -> Any:
+    """The value under a key that names a credential: ``[REDACTED]`` when it is one."""
+    if not isinstance(entry, str) or not entry.strip():
+        return entry
+    match = _CREDENTIAL_KEY_WORD_RE.search(key)
+    if match is None:
+        return entry
+    assignment = f"{match.group(1) or match.group(0)}={entry}"
+    return "[REDACTED]" if mask_credential_shapes(assignment) != assignment else entry
+
+
+def compute_content_hash(
+    text: str, *, structured_brief: dict[str, Any] | None = None
+) -> str:
+    """The short fingerprint used by the idempotency / delta gate.
+
+    A structured brief is part of what was submitted, so it is part of the
+    fingerprint: the same transcript sent with a new brief is a new revision, and
+    the same brief sent twice is the same submission. Without a brief the
+    fingerprint is exactly what it always was.
+    """
+    digest = hashlib.sha256((text or "").encode("utf-8"))
+    if structured_brief:
+        digest.update(b"\n\x00structured_brief\n")
+        digest.update(_canonical_json(structured_brief).encode("utf-8"))
+    return digest.hexdigest()[:16]
+
+
+def _redact_brief_value(value: Any, *, depth: int) -> Any:
+    """One value of a structured brief, redacted and reduced to JSON-safe data."""
+    if isinstance(value, str):
+        return redact_text(value)[:MAX_BRIEF_VALUE_CHARS]
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        # NaN and infinity are not JSON: a number the transports cannot carry is dropped.
+        return value if value == value and abs(value) != float("inf") else None
+    if depth > MAX_BRIEF_DEPTH:
+        return redact_text(str(value))[:MAX_BRIEF_VALUE_CHARS]
+    if isinstance(value, (list, tuple)):
+        return [_redact_brief_value(entry, depth=depth + 1) for entry in list(value)[:MAX_BRIEF_ITEMS]]
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for raw_key, entry in list(value.items())[:MAX_BRIEF_ITEMS]:
+            key = redact_text(str(raw_key))[:120]
+            cleaned[key] = _redact_brief_value(
+                _mask_credential_entry(str(raw_key), entry), depth=depth + 1
+            )
+        return cleaned
+    return redact_text(str(value))[:MAX_BRIEF_VALUE_CHARS]
+
+
+def redact_structured_brief(brief: Any) -> dict[str, Any]:
+    """A client's structured brief as redacted, JSON-safe data (``{}`` when there is none).
+
+    Every string goes through ``redact_text`` — the keys too — because the brief
+    is persisted on the queue item and handed to the model-backed review. The value
+    of a key that names a credential (``password`` / ``token`` / ``密码`` …) is read
+    as the assignment it stands for, so ``{"password": "…"}`` keeps no secret either.
+    """
+    if not isinstance(brief, dict):
+        return {}
+    cleaned = _redact_brief_value(brief, depth=1)
+    return cleaned if isinstance(cleaned, dict) else {}
+
+
+def render_structured_brief(brief: Any) -> str:
+    """The brief as the review reads it, after the dialogue it belongs to.
+
+    Every line is an indented list entry, so nothing a client wrote in the brief
+    can read as a dialogue role marker.
+    """
+    if not isinstance(brief, dict) or not brief:
+        return ""
+    lines = [
+        "flywheel-brief: structured brief submitted by the client "
+        "(evidence for the review, not dialogue)"
+    ]
+    for key, value in brief.items():
+        for entry in value if isinstance(value, list) else [value]:
+            text = entry if isinstance(entry, str) else _canonical_json(entry)
+            for line in f"{key}: {text}".splitlines() or [f"{key}: "]:
+                lines.append(f"  - {line}".rstrip())
+    return "\n".join(lines)
+
+
+def redact_hand_distilled_paths(raw_paths: Any) -> list[str]:
+    """The knowledge paths a client reports as hand-written: redacted, trimmed, deduplicated."""
+    paths: list[str] = []
+    for raw in raw_paths if isinstance(raw_paths, (list, tuple)) else []:
+        path = redact_text(str(raw)).strip()[:500]
+        if path and path not in paths:
+            paths.append(path)
+    return paths
 
 
 def _path_is_within(raw_path: str, root: Path) -> bool:
@@ -422,10 +584,23 @@ class DistillQueueService:
                 "chunk_index": item.chunk_index,
                 "chunk_total": item.chunk_total,
                 "ingress_channel": item.ingress_channel.value,
+                **self._declared_fields(item),
             },
             to_status=item.status.value,
             reason_code=reason_code,
         )
+
+    @staticmethod
+    def _declared_fields(item: DistillQueueItem) -> dict[str, Any]:
+        """The hand-distilled declaration an item carries, for its audit trail (empty otherwise)."""
+        payload = item.payload if isinstance(item.payload, dict) else {}
+        fields: dict[str, Any] = {}
+        mode = str(payload.get("distill_mode") or "")
+        if mode in DISTILL_MODES:
+            fields["distill_mode"] = mode
+        if isinstance(payload.get("hand_distilled_paths"), list):
+            fields["hand_distilled_paths"] = list(payload["hand_distilled_paths"])
+        return fields
 
     def _transition(
         self,
@@ -533,6 +708,7 @@ class DistillQueueService:
         reason_code: str = "",
         reason_detail: str = "",
         source_path: str | None = None,
+        payload_extra: dict[str, Any] | None = None,
     ) -> DistillQueueItem:
         payload: dict[str, Any] = {
             "chunk_text": chunk.get("chunk_text", ""),
@@ -556,6 +732,7 @@ class DistillQueueService:
             payload["subagent_nickname"] = rec_meta["subagent_nickname"]
         if rec_meta.get("subagent_role"):
             payload["subagent_role"] = rec_meta["subagent_role"]
+        payload.update(payload_extra or {})
         return DistillQueueItem(
             queue_id=uuid.uuid4().hex,
             session_key=record.session_key,
@@ -599,6 +776,7 @@ class DistillQueueService:
         reason_code: str = "",
         reason_detail: str = "",
         source_path: str | None = None,
+        payload_extra: dict[str, Any] | None = None,
     ) -> list[DistillQueueItem]:
         from_turn = int(prepared.get("from_turn", 0))
         to_turn = int(prepared.get("total_turns", 0))
@@ -621,6 +799,7 @@ class DistillQueueService:
                 reason_code=reason_code,
                 reason_detail=reason_detail,
                 source_path=source_path,
+                payload_extra=payload_extra,
             )
             for chunk in prepared["chunks"]
         ]
@@ -678,12 +857,27 @@ class DistillQueueService:
         actor: str = "mcp",
         force: bool = True,
         priority: str = "P0_CORE",
+        structured_brief: dict[str, Any] | None = None,
+        distill_mode: str = "",
+        hand_distilled_paths: list[str] | None = None,
     ) -> list[DistillQueueItem]:
         """A user/MCP declaration: bypass the noise filter and queue at P0.
 
         ``force`` (the default) clears an earlier ``opt_out`` because the user is
         now explicitly asking for this session to be distilled. Without it, an
-        opted-out session is left untouched and nothing is enqueued.
+        opted-out session is left untouched and nothing is enqueued. It lifts a
+        hand-distilled declaration the same way — an explicit request distills the
+        session in full again — while a caller without ``force`` inherits whatever
+        the session was declared, and never re-opens a session taken out by hand.
+
+        ``structured_brief`` is the client's structured evidence for the review:
+        redacted, kept on the item and counted into the content fingerprint, so the
+        same transcript with a new brief is a new revision and the same brief twice
+        is the same submission.
+
+        ``distill_mode="governance_only"`` with ``hand_distilled_paths`` is the
+        ``hand_distilled`` declaration: the client already wrote the knowledge up,
+        so the session is queued for its rules, mistakes and dissents only.
         """
         if session is not None:
             record = session.model_copy(deep=True)
@@ -713,28 +907,68 @@ class DistillQueueService:
                 priority=priority,
                 status=SessionStatus.PENDING,
             )
+        meta = dict(record.metadata) if isinstance(record.metadata, dict) else {}
+        declared = self._hand_distilled_declaration(record.session_key, record)
+        declared_mode = declared["distill_mode"] if declared is not None else DISTILL_MODE_FULL
+        declared_paths = declared["hand_distilled_paths"] if declared is not None else []
         if record.opt_out and not force:
             return []
+        # A session the client took out by hand is never re-opened by a passive caller.
+        if not force and declared_mode == DISTILL_MODE_SKIPPED:
+            return []
+        mode = str(distill_mode or "").strip().lower()
+        if mode and mode != DISTILL_MODE_GOVERNANCE_ONLY:
+            raise ValueError(f"unsupported distill_mode: {distill_mode}")
+        if not mode:
+            mode = DISTILL_MODE_FULL if force else declared_mode
+        paths = redact_hand_distilled_paths(hand_distilled_paths)
+        if mode == DISTILL_MODE_GOVERNANCE_ONLY:
+            # Every document reported for this session stays reported: a second
+            # write-up adds a path, it never un-reports the first one. Only an
+            # explicit enqueue, which lifts the declaration, starts the list over.
+            paths = list(dict.fromkeys([*paths, *declared_paths]))
+        brief = redact_structured_brief(structured_brief)
+
+        # The session metadata mirrors the declaration; an explicit full request clears it.
+        if mode == DISTILL_MODE_GOVERNANCE_ONLY:
+            meta.update(
+                {
+                    **_declaration_meta(mode, paths, declared_at=str(meta.get("hand_distilled_at") or "")),
+                    "explicit_ingest": True,
+                }
+            )
+        elif force:
+            for key in HAND_DISTILLED_META_KEYS:
+                meta.pop(key, None)
+        record.metadata = meta
         record.opt_out = False
         record.opt_out_reason = ""
         record.status = SessionStatus.PENDING
         stored = self.db.upsert_session(record)
 
         text = self._session_text(stored)
-        content_hash = compute_content_hash(text)
+        content_hash = compute_content_hash(text, structured_brief=brief or None)
         total_turns = len(split_dialogue_turns(text))
-        # Same content already queued: an explicit re-submission is idempotent.
+        # Same content, same brief and same mode already queued: an explicit re-submission
+        # is idempotent. A declaration that changes the mode replaces the queued revision.
         active = self.db.list_session_queue_items(stored.session_key, statuses=[QueueStatus.QUEUED])
         if (
             active
             and len(active) == active[0].chunk_total
-            and all(item.content_hash == content_hash for item in active)
+            and all(
+                item.content_hash == content_hash and self._item_distill_mode(item) == mode
+                for item in active
+            )
         ):
-            return sorted(active, key=lambda item: item.chunk_index)
+            active = sorted(active, key=lambda item: item.chunk_index)
+            if mode == DISTILL_MODE_GOVERNANCE_ONLY:
+                return self._merge_governance_paths(active, paths, actor=actor)
+            return active
 
-        self._supersede_queued_items(stored.session_key, actor=actor)
+        superseded = self._supersede_queued_items(stored.session_key, actor=actor)
         revision = self.db.get_latest_queue_revision(stored.session_key) + 1
         prepared = prepare_queue_chunks(text, from_turn=0, max_item_chars=self.max_item_chars)
+        governance = mode == DISTILL_MODE_GOVERNANCE_ONLY
         items = self._build_chunk_items(
             stored,
             prepared,
@@ -744,16 +978,281 @@ class DistillQueueService:
             priority=priority,
             content_hash=content_hash,
             focus_note=focus_note,
+            payload_extra=self._declaration_payload(mode, paths, brief, text),
         )
         saved = self._insert_items(
-            items, actor=actor, summary=f"explicit enqueue via {channel.value}"
+            items,
+            actor=actor,
+            summary=(
+                f"hand_distilled: governance-only enqueue via {channel.value}"
+                if governance
+                else f"explicit enqueue via {channel.value}"
+            ),
         )
         self.db.update_session_watermark(
             stored.session_key,
             latest_content_hash=content_hash,
             latest_turn_count=total_turns,
         )
+        if governance:
+            self._audit_hand_distilled(
+                [*saved, *superseded],
+                mode=mode,
+                paths=paths,
+                actor=actor,
+                declaration="governance_only",
+                summary="hand_distilled: session queued for governance only",
+            )
         return saved
+
+    # ---------------- distill mode (hand_distilled) ----------------
+
+    @staticmethod
+    def _item_distill_mode(item: DistillQueueItem) -> str:
+        """The mode a queue item was enqueued under: ``full`` unless it declares another."""
+        payload = item.payload if isinstance(item.payload, dict) else {}
+        mode = str(payload.get("distill_mode") or "")
+        return mode if mode in DISTILL_MODES else DISTILL_MODE_FULL
+
+    @staticmethod
+    def _item_paths(item: DistillQueueItem) -> list[str]:
+        payload = item.payload if isinstance(item.payload, dict) else {}
+        return [str(path) for path in payload.get("hand_distilled_paths") or []]
+
+    def distill_mode_of(self, session: SessionRecord) -> str:
+        """The distill mode a session is under right now (``full`` unless declared otherwise)."""
+        declared = self._hand_distilled_declaration(session.session_key, session)
+        return declared["distill_mode"] if declared is not None else DISTILL_MODE_FULL
+
+    def _hand_distilled_declaration(
+        self, session_key: str, session: SessionRecord | None = None
+    ) -> dict[str, Any] | None:
+        """The hand-distilled declaration a session is under, or ``None`` for a plain session.
+
+        The queue history is the record that survives: a later registration can replace
+        the session metadata wholesale, but nothing rewrites a queue item. The newest
+        revision that declares a mode wins, so an explicit ``enqueue`` (a ``full`` item)
+        lifts an earlier declaration exactly like it clears an ``opt_out``.
+        """
+        meta = session.metadata if session is not None and isinstance(session.metadata, dict) else {}
+        paths = [str(path) for path in meta.get("hand_distilled_paths") or [] if str(path).strip()]
+        mode = ""
+        for item in self.db.list_session_queue_items(session_key):
+            payload = item.payload if isinstance(item.payload, dict) else {}
+            item_mode = str(payload.get("distill_mode") or "")
+            if item_mode in DISTILL_MODES:
+                mode = item_mode
+                if "hand_distilled_paths" in payload:
+                    paths = [str(path) for path in payload.get("hand_distilled_paths") or []]
+                break
+        if not mode:
+            declared = str(meta.get("distill_mode") or "")
+            if declared not in DISTILL_MODES and meta.get("hand_distilled_skip") is True:
+                declared = DISTILL_MODE_SKIPPED
+            mode = declared if declared in DISTILL_MODES else ""
+        if mode not in {DISTILL_MODE_GOVERNANCE_ONLY, DISTILL_MODE_SKIPPED}:
+            return None
+        return {"distill_mode": mode, "hand_distilled_paths": paths}
+
+    @staticmethod
+    def _declaration_payload(
+        mode: str, paths: list[str], brief: dict[str, Any], text: str
+    ) -> dict[str, Any]:
+        """What a queue item carries beyond its chunk: its distill mode and evidence."""
+        extra: dict[str, Any] = {"distill_mode": mode}
+        if mode == DISTILL_MODE_GOVERNANCE_ONLY:
+            extra["hand_distilled_paths"] = list(paths)
+        if brief:
+            extra["structured_brief"] = brief
+            # The transcript behind the brief, for the archive gate: an archive event
+            # arrives without the brief and must still recognise the same conversation.
+            extra["text_hash"] = compute_content_hash(text)
+        return extra
+
+    def _audit_hand_distilled(
+        self,
+        items: list[DistillQueueItem],
+        *,
+        mode: str,
+        paths: list[str],
+        actor: str,
+        declaration: str,
+        summary: str,
+    ) -> None:
+        """One ``queue_item`` audit event per item a ``hand_distilled`` declaration touched."""
+        for item in items:
+            self.db.append_audit_event(
+                entity_type="queue_item",
+                entity_id=item.queue_id,
+                event_type=HAND_DISTILLED_EVENT,
+                actor=actor,
+                summary=summary,
+                payload={
+                    "session_key": item.session_key,
+                    "declaration": declaration,
+                    "distill_mode": mode,
+                    "hand_distilled_paths": list(paths),
+                },
+                to_status=item.status.value,
+                reason_code=HAND_DISTILLED_SKIP if mode == DISTILL_MODE_SKIPPED else "",
+            )
+
+    def _merge_governance_paths(
+        self, items: list[DistillQueueItem], paths: list[str], *, actor: str
+    ) -> list[DistillQueueItem]:
+        """A repeated ``hand_distilled`` for an unchanged session: merge the paths in place."""
+        merged = list(paths)
+        for item in items:
+            for path in self._item_paths(item):
+                if path not in merged:
+                    merged.append(path)
+        if all(sorted(self._item_paths(item)) == sorted(merged) for item in items):
+            return items
+        refreshed: list[DistillQueueItem] = []
+        for item in items:
+            updated = self.db.update_queue_item_metadata(
+                item.queue_id, payload={**item.payload, "hand_distilled_paths": merged}
+            )
+            refreshed.append(updated or item)
+        self._audit_hand_distilled(
+            refreshed,
+            mode=DISTILL_MODE_GOVERNANCE_ONLY,
+            paths=merged,
+            actor=actor,
+            declaration="governance_only",
+            summary="hand_distilled: reported knowledge paths updated",
+        )
+        return refreshed
+
+    def _apply_hand_distilled_skip(
+        self,
+        session: SessionRecord,
+        *,
+        paths: list[str],
+        channel: IngressChannel,
+        actor: str,
+        source_path: str | None = None,
+        detail: str,
+    ) -> dict[str, Any]:
+        """Take the session out of distillation and keep the decision visible as ``excluded``.
+
+        Like the opt-out veto, the decision stays in the inventory: the unconsumed
+        items become ``excluded (HAND_DISTILLED_SKIP)``, and a session that had none
+        gets one visible record instead of disappearing without a trace.
+        """
+        key = session.session_key
+        touched: list[DistillQueueItem] = []
+        for item in self.db.list_session_queue_items(key, statuses=[QueueStatus.QUEUED]):
+            updated = self._transition(
+                item,
+                QueueStatus.EXCLUDED,
+                reason_code=HAND_DISTILLED_SKIP,
+                detail=detail,
+                actor=actor,
+                summary="hand_distilled skip",
+            )
+            if updated is None:
+                continue
+            stamped = self.db.update_queue_item_metadata(
+                updated.queue_id,
+                payload={
+                    **updated.payload,
+                    "distill_mode": DISTILL_MODE_SKIPPED,
+                    "hand_distilled_paths": list(paths),
+                },
+            )
+            touched.append(stamped or updated)
+        visible = [
+            item
+            for item in self.db.list_session_queue_items(key)
+            if self._item_distill_mode(item) == DISTILL_MODE_SKIPPED
+        ]
+        if not visible:
+            revision = self.db.get_latest_queue_revision(key) + 1
+            placeholder = self._build_item(
+                session,
+                revision=revision,
+                chunk={"chunk_text": "", "turn_start": 0, "turn_end": 0},
+                chunk_index=1,
+                chunk_total=1,
+                channel=channel,
+                status=QueueStatus.EXCLUDED,
+                priority=session.priority or "P1_GENERAL",
+                content_hash="",
+                total_chars=0,
+                compacted_chars=0,
+                from_turn=0,
+                to_turn=0,
+                reason_code=HAND_DISTILLED_SKIP,
+                reason_detail=detail,
+                source_path=source_path,
+                payload_extra={
+                    "distill_mode": DISTILL_MODE_SKIPPED,
+                    "hand_distilled_paths": list(paths),
+                },
+            )
+            touched.extend(
+                self._insert_items(
+                    [placeholder],
+                    actor=actor,
+                    reason_code=HAND_DISTILLED_SKIP,
+                    summary="hand_distilled skip",
+                )
+            )
+            visible = list(touched)
+        if touched:
+            self._audit_hand_distilled(
+                touched,
+                mode=DISTILL_MODE_SKIPPED,
+                paths=paths,
+                actor=actor,
+                declaration="skip",
+                summary="hand_distilled: session taken out of distillation",
+            )
+        return {
+            "action": "excluded",
+            "reason_code": HAND_DISTILLED_SKIP,
+            "session_key": key,
+            "hand_distilled_paths": list(paths),
+            "items": visible,
+        }
+
+    def on_hand_distilled_skip(
+        self,
+        session_key: str,
+        *,
+        wiki_paths: list[str] | None = None,
+        actor: str = "mcp",
+    ) -> dict[str, Any]:
+        """``hand_distilled`` with ``governance_only = false``.
+
+        The client wrote the knowledge up by hand and wants no distillation at all:
+        the unconsumed items are excluded and the session is taken out for good. A
+        later archive event never re-opens it; only an explicit ``enqueue`` does.
+        """
+        key = (session_key or "").strip()
+        if not key:
+            raise ValueError("session_key is required to hand_distilled")
+        session = self._ensure_session(key)
+        declared = self._hand_distilled_declaration(key, session)
+        declared_paths = declared["hand_distilled_paths"] if declared is not None else []
+        # The documents of an earlier declaration are as hand-written as the new ones.
+        paths = list(dict.fromkeys([*redact_hand_distilled_paths(wiki_paths), *declared_paths]))
+        meta = dict(session.metadata) if isinstance(session.metadata, dict) else {}
+        session.metadata = {
+            **meta,
+            **_declaration_meta(
+                DISTILL_MODE_SKIPPED, paths, declared_at=str(meta.get("hand_distilled_at") or "")
+            ),
+        }
+        session = self.db.upsert_session(session, preserve_existing_lifecycle=True)
+        return self._apply_hand_distilled_skip(
+            session,
+            paths=paths,
+            channel=IngressChannel.MCP_EXPLICIT,
+            actor=actor,
+            detail="hand-distilled by the client: no further distillation",
+        )
 
     # ---------------- ingress 2: archive ----------------
 
@@ -821,6 +1320,19 @@ class DistillQueueService:
             merged_meta["subagent_nickname"] = meta["subagent_nickname"]
         if meta.get("subagent_role"):
             merged_meta["subagent_role"] = meta["subagent_role"]
+        # A hand-distilled declaration outlives the metadata it was first mirrored into:
+        # a later registration replaces that metadata wholesale, the queue history does not.
+        declared = self._hand_distilled_declaration(skey, existing)
+        distill_mode = declared["distill_mode"] if declared is not None else DISTILL_MODE_FULL
+        distill_paths = declared["hand_distilled_paths"] if declared is not None else []
+        if declared is not None:
+            merged_meta.update(
+                _declaration_meta(
+                    distill_mode,
+                    distill_paths,
+                    declared_at=str(existing_meta.get("hand_distilled_at") or ""),
+                )
+            )
 
         record = SessionRecord(
             session_key=skey,
@@ -863,17 +1375,39 @@ class DistillQueueService:
         if self._is_unchanged(session, content_hash=content_hash, total_turns=total_turns):
             return {"action": "unchanged", "reason_code": "", "items": []}
 
-        # Gate 3: deterministic triage rules (0-token pre-filter).
-        open_retro = any(
-            retro.session_key == skey
-            for retro in self.db.list_retro_items(status=RetroStatus.OPEN.value, limit=200)
-        )
-        triage = triage_session(
-            session,
-            text,
-            self.cfg.sessions.triage,
-            has_open_retro=open_retro,
-        )
+        # Gate 2b: the client hand-distilled this session and took it out. A passive
+        # archive event never re-opens it, however much the conversation grew.
+        if distill_mode == DISTILL_MODE_SKIPPED:
+            return self._apply_hand_distilled_skip(
+                session,
+                paths=distill_paths,
+                channel=channel,
+                actor=actor,
+                source_path=source_path,
+                detail="hand-distilled by the client: no further distillation",
+            )
+
+        # Gate 3: deterministic triage rules (0-token pre-filter). A governance-only
+        # session is an explicit declaration, so the noise rules do not apply to it.
+        if distill_mode == DISTILL_MODE_GOVERNANCE_ONLY:
+            triage: dict[str, Any] = {
+                "admit": True,
+                "tier": "explicit",
+                "reason": "hand_distilled_governance_only",
+                "reason_code": "",
+                "workspace": session.workspace,
+            }
+        else:
+            open_retro = any(
+                retro.session_key == skey
+                for retro in self.db.list_retro_items(status=RetroStatus.OPEN.value, limit=200)
+            )
+            triage = triage_session(
+                session,
+                text,
+                self.cfg.sessions.triage,
+                has_open_retro=open_retro,
+            )
         superseded = self._supersede_queued_items(skey, actor=actor)
         revision = self.db.get_latest_queue_revision(skey) + 1
         if not triage["admit"]:
@@ -932,6 +1466,14 @@ class DistillQueueService:
             priority=session.priority or "P1_GENERAL",
             content_hash=content_hash,
             source_path=source_path,
+            # A later revision of a hand-distilled session stays governance-only until
+            # an explicit enqueue resets it, so a continued conversation never writes
+            # a second copy of what the client wrote by hand.
+            payload_extra=(
+                self._declaration_payload(distill_mode, distill_paths, {}, text)
+                if distill_mode != DISTILL_MODE_FULL
+                else None
+            ),
         )
         saved = self._insert_items(
             items, actor=actor, summary=f"archive enqueue via {channel.value}"
@@ -946,6 +1488,20 @@ class DistillQueueService:
             "superseded": superseded,
         }
 
+    @staticmethod
+    def _item_represents(item: DistillQueueItem, content_hash: str) -> bool:
+        """Whether a queue item was built from exactly this transcript.
+
+        An item that carries a structured brief is fingerprinted over transcript and
+        brief together. It also remembers the transcript's own fingerprint, which is
+        what an archive event arrives with: the brief must not make the same
+        conversation look like new content.
+        """
+        if item.content_hash == content_hash:
+            return True
+        payload = item.payload if isinstance(item.payload, dict) else {}
+        return bool(payload.get("text_hash")) and payload.get("text_hash") == content_hash
+
     def _is_unchanged(
         self, session: SessionRecord, *, content_hash: str, total_turns: int
     ) -> bool:
@@ -956,14 +1512,13 @@ class DistillQueueService:
         if not items:
             return False
         for item in items:
-            if (
-                item.status in {QueueStatus.QUEUED, QueueStatus.PROCESSING}
-                and item.content_hash == content_hash
+            if item.status in {QueueStatus.QUEUED, QueueStatus.PROCESSING} and self._item_represents(
+                item, content_hash
             ):
                 return True
         newest_revision = items[0].revision
         newest = [item for item in items if item.revision == newest_revision]
-        if not newest or any(item.content_hash != content_hash for item in newest):
+        if not newest or any(not self._item_represents(item, content_hash) for item in newest):
             return False
         return total_turns <= max(item.consumed_to_turn for item in newest)
 
@@ -1204,6 +1759,10 @@ class DistillQueueService:
         }
         changes: list[dict[str, Any]] = []
         metadata_refresh_count = 0
+        # How each session opens, read once: a write dispatch is recognised by its
+        # opening instruction, which only the source transcript still shows in full.
+        openings: dict[str, str] = {}
+        full_texts: dict[str, str] = {}
 
         for item in candidates:
             if (
@@ -1214,6 +1773,37 @@ class DistillQueueService:
             session = self.db.get_session(item.session_key)
             if session is None or session.opt_out:
                 continue
+
+            # A hand-distilled declaration is a user decision, not a triage verdict: the
+            # noise rules never drop a governance-only item, and a session the client took
+            # out by hand is never queued again.
+            item_mode = self._item_distill_mode(item)
+            if item.status is QueueStatus.QUEUED:
+                if item_mode == DISTILL_MODE_GOVERNANCE_ONLY:
+                    continue
+                session_meta = session.metadata if isinstance(session.metadata, dict) else {}
+                if item_mode == DISTILL_MODE_SKIPPED or session_meta.get("hand_distilled_skip") is True:
+                    detail = "hand-distilled by the client: no further distillation"
+                    changes.append(
+                        {
+                            "queue_id": item.queue_id,
+                            "session_key": item.session_key,
+                            "from_status": QueueStatus.QUEUED.value,
+                            "to_status": QueueStatus.EXCLUDED.value,
+                            "reason_code": HAND_DISTILLED_SKIP,
+                            "detail": detail,
+                        }
+                    )
+                    if not dry_run:
+                        self._transition(
+                            item,
+                            QueueStatus.EXCLUDED,
+                            reason_code=HAND_DISTILLED_SKIP,
+                            detail=detail,
+                            actor=actor,
+                            summary="re-triage excluded the item",
+                        )
+                    continue
 
             # Read source transcript if available to refresh metadata and identity
             source_file: Path | None = None
@@ -1238,6 +1828,9 @@ class DistillQueueService:
             is_sub = bool(meta.get("is_subagent") or item.is_subagent or parent_key)
             ws = meta.get("workspace") or item.workspace
             item_text = self.load_queue_item_text(item)
+            # A write dispatch is recognised by how the session opens and whether anything
+            # follows the instruction — never by one compacted chunk of it.
+            opening_text = self._session_opening_text(session, openings)
             new_title = derive_readable_title(
                 item.client,
                 canonical_id or item.session_key,
@@ -1335,7 +1928,21 @@ class DistillQueueService:
                 item_text,
                 self.cfg.sessions.triage,
                 has_open_retro=item.session_key in open_retro_keys,
+                opening_text=opening_text,
             )
+            if (
+                result.get("reason") == "controlled_write_dispatch"
+                and len(opening_text) >= MAX_OPENING_CHARS
+            ):
+                # The opening may end before a later question: whether anything follows
+                # the instruction is answered on the whole conversation.
+                result = triage_session(
+                    session_for_triage,
+                    item_text,
+                    self.cfg.sessions.triage,
+                    has_open_retro=item.session_key in open_retro_keys,
+                    opening_text=self._session_full_text(session, full_texts),
+                )
             if result["admit"] and item.status is QueueStatus.EXCLUDED:
                 changes.append(
                     {
@@ -1543,16 +2150,40 @@ class DistillQueueService:
 
     # ---------------- read helpers ----------------
 
+    def _session_opening_text(self, session: SessionRecord, cache: dict[str, str]) -> str:
+        """How a session opens, read once per pass; empty when its source is gone."""
+        text = cache.get(session.session_key)
+        if text is None:
+            head = self.sessions.load_session_text(session, max_chars=MAX_OPENING_CHARS)
+            text = head if _OPENING_USER_TURN_RE.search(head) else ""
+            cache[session.session_key] = text
+        return text
+
+    def _session_full_text(self, session: SessionRecord, cache: dict[str, str]) -> str:
+        """The whole conversation, read once per pass."""
+        text = cache.get(session.session_key)
+        if text is None:
+            text = self._session_text(session)
+            cache[session.session_key] = text
+        return text
+
     def load_queue_item_text(self, item: DistillQueueItem) -> str:
-        """The text of one queue item: its pre-compacted chunk, else the session text."""
+        """The text of one queue item: its pre-compacted chunk, else the session text.
+
+        The first chunk of an item carries the client's structured brief after the
+        dialogue, so the review reads the evidence with the conversation it belongs to.
+        """
         payload = item.payload if isinstance(item.payload, dict) else {}
         chunk_text = payload.get("chunk_text")
         if isinstance(chunk_text, str) and chunk_text.strip():
-            return redact_text(chunk_text)
-        session = self.db.get_session(item.session_key)
-        if session is None:
-            return ""
-        return self._session_text(session)
+            text = redact_text(chunk_text)
+        else:
+            session = self.db.get_session(item.session_key)
+            if session is None:
+                return ""
+            text = self._session_text(session)
+        brief = render_structured_brief(payload.get("structured_brief")) if item.chunk_index <= 1 else ""
+        return f"{text}\n\n{brief}" if brief else text
 
     def handle_session_intent(
         self,
@@ -1570,8 +2201,10 @@ class DistillQueueService:
         focus_note: str = "",
         reason: str = "",
         actor: str = "mcp",
+        wiki_paths: list[str] | None = None,
+        governance_only: bool = True,
     ) -> dict[str, Any]:
-        """The MCP declaration surface: ``enqueue`` / ``opt_out`` / ``withdraw``."""
+        """The MCP declaration surface: ``enqueue`` / ``opt_out`` / ``withdraw`` / ``hand_distilled``."""
         normalized = str(action or "").strip().lower().replace("-", "_")
         key = (session_key or "").strip()
         client_name = (client or "generic").strip() or "generic"
@@ -1582,6 +2215,49 @@ class DistillQueueService:
         elif key and not sid:
             sid = key
         resolved_key = key or (f"{client_name}:{sid}" if sid else "")
+
+        if normalized == "hand_distilled":
+            if not resolved_key:
+                raise ValueError("session_key is required to hand_distilled")
+            if governance_only:
+                items = self.on_explicit_enqueue(
+                    client=client_name,
+                    session_id=sid,
+                    title=title,
+                    project=project,
+                    workspace=workspace,
+                    transcript_path=transcript_path,
+                    summary=summary,
+                    content=content,
+                    focus_note=focus_note,
+                    channel=IngressChannel.MCP_EXPLICIT,
+                    actor=actor,
+                    force=True,
+                    priority="P0_CORE",
+                    distill_mode=DISTILL_MODE_GOVERNANCE_ONLY,
+                    hand_distilled_paths=wiki_paths,
+                )
+                reported = self._item_paths(items[0]) if items else redact_hand_distilled_paths(wiki_paths)
+                return {
+                    "status": "queued" if items else "unchanged",
+                    "action": "hand_distilled",
+                    "session_key": items[0].session_key if items else f"{client_name}:{sid}",
+                    "distill_mode": DISTILL_MODE_GOVERNANCE_ONLY,
+                    "hand_distilled_paths": reported,
+                    "queue_ids": [item.queue_id for item in items],
+                    "items": [self._item_brief(item) for item in items],
+                }
+            result = self.on_hand_distilled_skip(resolved_key, wiki_paths=wiki_paths, actor=actor)
+            return {
+                "status": "excluded",
+                "action": "hand_distilled",
+                "session_key": resolved_key,
+                "distill_mode": DISTILL_MODE_SKIPPED,
+                "reason_code": HAND_DISTILLED_SKIP,
+                "hand_distilled_paths": result["hand_distilled_paths"],
+                "queue_ids": [item.queue_id for item in result["items"]],
+                "items": [self._item_brief(item) for item in result["items"]],
+            }
 
         if normalized in {"enqueue", "queue", "ingest"}:
             if not sid:

@@ -35,7 +35,7 @@ def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
             "policies, collaboration preferences, and matched precedent rules; "
             "call flywheel_register_session or flywheel_ingest_session to enqueue sessions for "
             "background P00-P07 review; call flywheel_session_intent to declare "
-            "enqueue / opt_out / withdraw for the current session; "
+            "enqueue / hand_distilled / opt_out / withdraw for the current session; "
             "call flywheel_record_outcome with real evidence on major deliveries."
         ),
     )
@@ -80,8 +80,16 @@ def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
         content: str = "",
         project: str = "generic",
         tags: list[str] | None = None,
+        structured_brief: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Push session summary or conversation digest directly (ideal for MCP-only clients like Claude Desktop)."""
+        """Push session summary or conversation digest directly (ideal for MCP-only clients like Claude Desktop).
+
+        ``structured_brief`` (optional) is the client's own structured evidence for the
+        review, e.g. ``{"facts": [...], "decisions": [...], "domain_entities": [...],
+        "incidents": [...]}``. It is kept with the queued item and shown to the review
+        after the dialogue, so the verified conclusions survive a long transcript. Every
+        string is redacted before it is stored.
+        """
         rec = runtime.register_session(
             RegisterSessionRequest(
                 client=client,
@@ -98,6 +106,7 @@ def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
             channel=IngressChannel.MCP_EXPLICIT,
             actor="mcp",
             focus_note=title,
+            structured_brief=structured_brief,
         )
         return {
             "status": "ingested",
@@ -106,6 +115,7 @@ def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
             "queue_status": rec.status.value,
             "queue_ids": [item.queue_id for item in items],
             "queue_items": len(items),
+            "has_structured_brief": bool(structured_brief) and bool(items),
         }
 
     @mcp.tool()
@@ -122,11 +132,19 @@ def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
         content: str | None = None,
         focus_note: str = "",
         reason: str = "",
+        wiki_paths: list[str] | None = None,
+        governance_only: bool = True,
     ) -> dict[str, Any]:
         """Declare an explicit queue intent for the current session.
 
         Actions:
         - ``enqueue``: queue this session now at high priority (bypasses the noise filter).
+        - ``hand_distilled``: you have just written this session's knowledge into the Wiki
+          by hand. Pass the written documents as ``wiki_paths``. With ``governance_only``
+          (the default) the session is queued for governance only — rules, mistakes and
+          dissents, never a second knowledge document; with ``governance_only=false`` it is
+          taken out of distillation entirely. Either declaration also covers later
+          revisions of the session, until an explicit ``enqueue`` resets it.
         - ``opt_out``: this session is never distilled (persistent; clears the queue).
         - ``withdraw``: pull back still-queued items (the conversation continues).
 
@@ -148,6 +166,8 @@ def build_mcp_server(runtime: FlywheelRuntime) -> MCPServer:
             focus_note=focus_note,
             reason=reason,
             actor="mcp",
+            wiki_paths=wiki_paths,
+            governance_only=governance_only,
         )
 
     @mcp.tool()

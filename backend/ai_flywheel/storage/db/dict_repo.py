@@ -91,6 +91,8 @@ BUILTIN_DICT_SEEDS: tuple[dict[str, Any], ...] = (
           description="相对已消费水位线没有任何新增内容", sort_order=80),
     _item("exclude_reason", "SUPERSEDED", "已被新版本取代", "Superseded",
           description="同一会话的更新 revision 已覆盖该任务", sort_order=90),
+    _item("exclude_reason", "HAND_DISTILLED_SKIP", "客户端已手工沉淀", "Hand-distilled by client",
+          description="客户端已手工完成该会话的知识沉淀，并声明不再蒸馏", sort_order=95),
 
     # ---------------- client_type ----------------
     _item("client_type", "codex", "Codex", "Codex", group_key="ide",

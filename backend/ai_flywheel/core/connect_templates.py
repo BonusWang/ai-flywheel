@@ -88,6 +88,7 @@ def build_client_connect_guides(cfg: FlywheelConfig) -> dict[str, Any]:
 **显式队列声明**：注入上下文头带有 `session=<client>:<session_id>` 时，原样传给 `flywheel_session_intent`：
 
 - `action="enqueue"`：手工把当前会话提升为高优沉淀任务；
+- `action="hand_distilled"`：已在对话内手工把本会话的知识写入 Wiki 后调用，`wiki_paths` 传已写文档路径（默认只做治理提炼，不再重复写知识文档）；
 - `action="opt_out"`：本会话永不沉淀（用户说“本会话不沉淀”“不要沉淀”时调用）；
 - `action="withdraw"`：撤回尚未消费的排队任务（会话继续聊时）。
 """

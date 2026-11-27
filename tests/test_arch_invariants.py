@@ -26,6 +26,8 @@ import shutil
 import sqlite3
 import sys
 import threading
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -334,6 +336,51 @@ def test_the_example_config_matches_the_api_runner_default_timeout():
     assert example["runner"]["api"]["timeout_seconds"] == ApiRunnerConfig().timeout_seconds
 
 
+def test_the_example_config_matches_the_workflow_schedule_defaults():
+    """示例配置里的调度宽限期与漏跑补跑开关必须与代码默认值一致。"""
+    import yaml
+
+    from ai_flywheel.config import WorkflowConfig
+
+    example = FlywheelConfig.model_validate(
+        yaml.safe_load((REPO_ROOT / "flywheel.yaml.example").read_text(encoding="utf-8"))
+    )
+    defaults = WorkflowConfig()
+    assert defaults.misfire_grace_seconds == 14400
+    assert example.workflow.misfire_grace_seconds == defaults.misfire_grace_seconds
+    assert defaults.catchup_missed_schedule is True
+    assert example.workflow.catchup_missed_schedule is defaults.catchup_missed_schedule
+    # A wording only one installation uses is private configuration: the public
+    # template documents the key and ships an empty list.
+    assert example.sessions.triage.controlled_write_markers == []
+    with pytest.raises(ValueError):
+        WorkflowConfig(misfire_grace_seconds=59)
+
+
+async def test_the_mcp_server_keeps_exactly_seven_tools_and_four_resources(tmp_path: Path):
+    """新能力只扩展现有工具的可选参数：工具与资源的总数都不变。"""
+    rt = _runtime(tmp_path)
+    tools = sorted(tool.name for tool in await rt.mcp.list_tools())
+    assert tools == [
+        "flywheel_ingest_session",
+        "flywheel_preflight_activate",
+        "flywheel_record_outcome",
+        "flywheel_register_session",
+        "flywheel_report_signal",
+        "flywheel_session_intent",
+        "flywheel_status",
+    ]
+    assert len(await rt.mcp.list_resources()) == 4
+    schemas = {tool.name: tool.input_schema for tool in await rt.mcp.list_tools()}
+    for name, key in (
+        ("flywheel_session_intent", "wiki_paths"),
+        ("flywheel_session_intent", "governance_only"),
+        ("flywheel_ingest_session", "structured_brief"),
+    ):
+        assert key in schemas[name]["properties"], (name, key)
+        assert key not in schemas[name].get("required", []), (name, key)
+
+
 def test_the_frontend_run_status_union_matches_the_backend_enum():
     """前端的 `RunStatus` 联合必须与后端枚举逐值对应。"""
     types = (FRONTEND_SRC / "types.ts").read_text(encoding="utf-8")
@@ -450,6 +497,59 @@ def test_the_serve_role_runs_the_recovery_loop_and_shuts_down_cleanly(
     assert not any(t.is_alive() for t in recovery), "the recovery thread must stop with the app"
     failures = [record for record in caplog.records if record.name == "ai_flywheel.recovery"]
     assert failures == [], [record.getMessage() for record in failures]
+
+
+def test_only_the_serve_role_checks_for_a_missed_schedule_and_health_says_when_it_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """`/health.started_at` 是「调度时刻服务在不在」的外部证据；漏跑检查只挂在 serve 的巡检循环上。"""
+    shutil.copytree(REPO_ROOT / "profile", tmp_path / "profile")
+    serve = FlywheelRuntime(FlywheelConfig(base_dir=tmp_path), process_role="serve")
+
+    checked = threading.Event()
+    original = serve.automation.check_missed_schedule_catchup
+
+    def _catchup_spy(*args: Any, **kwargs: Any) -> Any:
+        checked.set()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(serve.automation, "check_missed_schedule_catchup", _catchup_spy)
+
+    with caplog.at_level(logging.ERROR, logger="ai_flywheel.recovery"):
+        with TestClient(create_app(runtime=serve)) as client:
+            health = client.get("/health")
+            assert health.status_code == 200
+            # A Shanghai instant, the same one the automation snapshot reports.
+            assert health.json()["started_at"] == serve.automation.started_at
+            started = datetime.fromisoformat(health.json()["started_at"])
+            assert started.utcoffset() == timedelta(hours=8)
+            assert serve.automation.get_snapshot()["scheduler"]["started_at"] == (
+                health.json()["started_at"]
+            )
+            assert checked.wait(timeout=10), "the recovery loop never checked for a missed schedule"
+        for thread in (t for t in threading.enumerate() if t.name == "flywheel-recovery"):
+            thread.join(timeout=10)
+    failures = [record for record in caplog.records if record.name == "ai_flywheel.recovery"]
+    assert failures == [], [record.getMessage() for record in failures]
+
+    # Any other role starts no daemon and never runs the check, however long it is up.
+    calls: list[str] = []
+    cli_dir = tmp_path / "cli"
+    shutil.copytree(REPO_ROOT / "profile", cli_dir / "profile")
+    cli = FlywheelRuntime(FlywheelConfig(base_dir=cli_dir), process_role="cli")
+    monkeypatch.setattr(
+        cli.automation,
+        "check_missed_schedule_catchup",
+        lambda *args, **kwargs: calls.append("checked"),
+    )
+    threads_before = set(threading.enumerate())
+    with TestClient(create_app(runtime=cli)) as client:
+        assert client.get("/health").json()["started_at"] == cli.automation.started_at
+        time.sleep(0.3)
+        assert not {
+            t.name for t in set(threading.enumerate()) - threads_before
+        } & {"flywheel-recovery", "flywheel-catchup"}
+    assert calls == []
 
 
 # ---------------------------------------------------------------- 5. Windows 契约

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from mcp.server.transport_security import TransportSecuritySettings
 
 from ai_flywheel import __version__
+from ai_flywheel.core.automation import CATCHUP_CHECK_INTERVAL_SECONDS
 from ai_flywheel.routes import (
     build_automations_router,
     build_governance_router,
@@ -73,6 +75,11 @@ def create_app(
             def _recovery_loop() -> None:
                 interval = float(os.environ.get("FLYWHEEL_RECOVERY_INTERVAL", "30"))
                 stale_after = int(os.environ.get("FLYWHEEL_RECOVERY_STALE_SECONDS", "300"))
+                # The lost-fire check runs on the first pass — a service started after the
+                # cron time finds out at once — and then a few times an hour: the window
+                # in which a fire may still be caught up is hours wide. It follows the
+                # recovery pass on purpose, so a lock held by a dead run is free by then.
+                last_catchup_check: float | None = None
                 while True:
                     try:
                         reaped = rt.orchestrator.recover_interrupted_runs(stale_after_seconds=stale_after)
@@ -80,6 +87,18 @@ def create_app(
                     except Exception as exc:
                         rt.automation.record_recovery_pass([], error=str(exc))
                         logging.getLogger("ai_flywheel.recovery").exception("recovery pass failed")
+                    tick = time.monotonic()
+                    if (
+                        last_catchup_check is None
+                        or tick - last_catchup_check >= CATCHUP_CHECK_INTERVAL_SECONDS
+                    ):
+                        last_catchup_check = tick
+                        try:
+                            rt.automation.check_missed_schedule_catchup()
+                        except Exception:
+                            logging.getLogger("ai_flywheel.recovery").exception(
+                                "schedule catch-up check failed"
+                            )
                     if recovery_stop.wait(interval):
                         break
 

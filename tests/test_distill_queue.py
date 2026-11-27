@@ -8,7 +8,8 @@
 5. P00–P07 队列消费：认领、结算、水位线推进与轨迹查询；
 6. 失败重试、死信隔离与审批取消零惩罚退回；
 7. 规则重筛 dry_run 只读预览与实际应用；
-8. 队列控制面 REST API 全链路。
+8. 队列控制面 REST API 全链路；
+9. `hand_distilled` 双轨意图、结构化摘要与受控写入派单拦截。
 
 会话、项目与技能名全部是虚构示例。
 """
@@ -23,8 +24,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ai_flywheel.app import create_app
-from ai_flywheel.config import FlywheelConfig, ScanSourceConfig
+from ai_flywheel.config import FlywheelConfig, ScanSourceConfig, SessionTriageConfig
 from ai_flywheel.core.pipeline.events import EventBroker
+from ai_flywheel.core.queue_service import compute_content_hash
+from ai_flywheel.core.triage import is_controlled_write_dispatch, triage_session
 from ai_flywheel.models import (
     DistillQueueItem,
     IngressChannel,
@@ -1431,3 +1434,1039 @@ def test_codex_response_item_msg_id_and_agents_boilerplate_never_corrupt_metadat
     assert canonical_items[0].title == "人工确认的显式标题"
 
 
+# ---------------------------------------------------------------- 9. 双轨意图 / 结构化摘要 / 写入派单
+#
+# feat-sediment-dual-track-and-scheduler-catchup. Both briefs below are fictional: each
+# stands for every brief of its kind, whichever installation wrote the original.
+
+
+#: A controlled knowledge-base write dispatch, as an orchestrator hands it to a writer
+#: subagent: one long instruction that hands over an approved write-set and names the
+#: write contract the result has to pass.
+DISPATCH_BRIEF = "\n".join(
+    [
+        "请把本轮排查的结论沉淀成一篇知识经验卡。这是一次受控写入，按下面的派单执行，不要扩大范围。",
+        "",
+        "## 背景",
+        "- 现象：灰度发布后，订单查询接口的 P99 延迟从 80 ms 升到 1.4 s，错误率没有变化。",
+        "- 根因：本地缓存在同一时刻集中过期，回源流量把连接池占满，请求排队等待连接。",
+        "- 修复：过期时间加上随机抖动，并给回源加互斥锁；修复后压测与线上指标均已恢复。",
+        "- 证据：修复前后各一轮压测报告、监控面板截图、发布记录中的变更单号。",
+        "",
+        "## 已批准的 write-set",
+        "- lessons/cache-stampede-prevention.md（新建）",
+        "- lessons/README.md（只追加一条索引，不改动已有条目）",
+        "",
+        "## 来源材料",
+        "- 排查会话的结论段落：现象、根因与修复的原始描述。",
+        "- 两轮压测报告：修复前的基线，以及修复后的对比。",
+        "- 监控面板截图：接口延迟、连接池使用率与回源并发三条曲线。",
+        "- 发布记录：变更单号、发布批次与回滚预案。",
+        "",
+        "## 交付对象",
+        "- 读者：维护订单服务与网关的后端工程师。",
+        "- 用途：发布评审与故障复盘时的参考。",
+        "",
+        "## 写前门禁",
+        "1. 写入前读取 `.wiki-schema.md`，确认目标目录允许新建经验卡，并记下必填段落。",
+        "2. 标题、日期与来源段落按 schema 给出的模板填写，日期使用上海时区。",
+        "3. 正文只写已经验证过的结论；推测性内容必须标注「待验证」，并说明还缺什么证据。",
+        "4. 引用监控数据时只写指标名、时间点与数值，不粘贴原始日志，不出现任何主机名或账号。",
+        "5. 涉及配置项时写出配置键与取值范围，不写出具体环境里的真实取值。",
+        "",
+        "## 正文结构",
+        "- 现象：一句话说明用户看到了什么，附上时间点。",
+        "- 根因：从现象推到根因的链条，每一步给出支撑它的证据。",
+        "- 修复：改了什么、为什么这样改、还有哪些备选方案被放弃。",
+        "- 验证：压测与线上指标的前后对比。",
+        "- 复用建议：其他服务满足哪些条件时可以照此处理。",
+        "- 关联阅读：指向已有的连接池与限流经验卡。",
+        "",
+        "## 术语约定",
+        "- 「过期抖动」指给每条缓存的过期时间加上一个随机偏移。",
+        "- 「回源互斥」指同一个键在同一时刻只允许一个请求回源。",
+        "- 文档内首次出现的缩写先写全称，再写缩写。",
+        "",
+        "## 写入步骤",
+        "1. 先读取已有的连接池经验卡，确认与本次结论既不重复也不冲突。",
+        "2. 新建经验卡正文，按上面的结构逐段填写。",
+        "3. 在索引文件末尾追加一条指向新卡的条目。",
+        "4. 本地运行一次链接检查，确认没有失效链接。",
+        "5. 提交写后核验，等待钩子给出结论。",
+        "6. 把钩子的结论整理成回执回报。",
+        "",
+        "## 禁止事项",
+        "- 不要把排查过程中的试错步骤写进正文，它们属于过程，不属于结论。",
+        "- 不要复制日志中的原始堆栈，只保留能说明根因的最小片段。",
+        "- 不要给经验卡起含日期或版本号的文件名，文件名只表达主题。",
+        "",
+        "## 写后核验",
+        "- 写后钩子会校验链接与 frontmatter，任何一项不通过就回滚本次写入并报告原因。",
+        "- 完成后在回执中列出实际写入的路径与每一项校验的结果。",
+        "- 若有回滚，写明触发回滚的校验项与回滚后的现场状态。",
+        "- 不要修改 write-set 之外的任何文件，不要提交或推送远端，也不要追加解释性长文。",
+    ]
+)
+
+#: The same length and layout, but not a write dispatch: a subagent asked to verify a
+#: release and report back. It names a write-set only to say there is none.
+VERIFICATION_BRIEF = "\n".join(
+    [
+        "请执行本次发布的自动化验证并回报结果。这是一次只读验证，不执行任何受控写入，也不涉及 write-set。",
+        "",
+        "## 范围",
+        "- 对象：订单服务本次发布的全部变更分支。",
+        "- 环境：预发环境，数据库使用只读副本。",
+        "- 时间窗：北京时间 02:00 到 04:00，期间不要触发任何写操作。",
+        "- 证据：每个步骤的输出摘要，以及对应报告的链接。",
+        "",
+        "## 准备",
+        "1. 拉取最新代码，确认依赖版本与发布单一致，并记录实际使用的提交号。",
+        "2. 核对配置项与预发环境的基线一致，只比对配置键，不读取任何真实取值。",
+        "3. 确认只读副本的延迟低于一秒，否则先等待再继续。",
+        "4. 准备测试数据集，所有数据均为虚构样例，不包含任何真实记录。",
+        "5. 通知值班的同事验证即将开始，并说明预计持续时间。",
+        "",
+        "## 步骤",
+        "1. 运行单元测试与集成测试，记录失败用例的名称与断言。",
+        "2. 运行接口回归，覆盖订单创建、查询、取消三条主链路。",
+        "3. 运行并发压测五分钟，观察接口延迟与错误率是否越过基线。",
+        "4. 检查日志中是否出现新的告警级别记录。",
+        "5. 重启一次服务实例，确认启动自检全部通过。",
+        "6. 重复步骤一至五，确认两轮结果一致。",
+        "7. 把两轮结果整理成对照表，标出任何不一致的条目。",
+        "",
+        "## 判定标准",
+        "- 单元测试与集成测试全部通过，没有任何跳过的用例。",
+        "- 接口回归的成功率为百分之百，响应时间不超过基线的一倍。",
+        "- 压测期间没有出现新的告警，连接池使用率低于八成。",
+        "- 重启后自检全部通过，健康检查在一分钟内恢复。",
+        "",
+        "## 异常处理",
+        "- 任一步骤失败时立即停止后续步骤，保留现场。",
+        "- 不要自行修复代码或配置，只记录现象与复现步骤。",
+        "- 失败信息中不要出现主机名、账号或任何真实数据。",
+        "",
+        "## 回报格式",
+        "- 第一行写明验证通过或失败。",
+        "- 随后逐条列出每个步骤的结论，以及支撑它的证据链接。",
+        "- 若有失败，写明失败用例、复现步骤与初步判断。",
+        "- 不要修改任何代码与配置，不要提交或推送，也不要追加解释性长文。",
+    ]
+)
+
+
+async def _mcp(rt: FlywheelRuntime, tool: str, arguments: dict) -> dict:
+    """Call one MCP tool in-process and return its structured result."""
+    result = await rt.mcp.call_tool(tool, arguments)
+    assert result.is_error is False, result
+    assert isinstance(result.structured_content, dict), result
+    return result.structured_content
+
+
+def _declare_hand_distilled(
+    rt: FlywheelRuntime, session_key: str, *, wiki_paths: list[str] | None = None, **fields
+) -> dict:
+    """``flywheel_session_intent(action="hand_distilled")`` at the service level."""
+    return rt.queue.handle_session_intent(
+        "hand_distilled", session_key=session_key, wiki_paths=wiki_paths, **fields
+    )
+
+
+def _declaration_events(rt: FlywheelRuntime, queue_id: str) -> list[dict]:
+    """The ``hand_distilled_declared`` audit events of one queue item, newest first."""
+    return [
+        event
+        for event in rt.db.list_audit_events(entity_type="queue_item", entity_id=queue_id)
+        if event["event_type"] == "hand_distilled_declared"
+    ]
+
+
+def _render_turns(turns: list[tuple[str, str]]) -> str:
+    """Dialogue turns as inline session content."""
+    return "\n\n".join(f"[{role}] {text}" for role, text in turns)
+
+
+def _dispatch_turns(brief: str = DISPATCH_BRIEF) -> list[tuple[str, str]]:
+    """A writer subagent's transcript: the dispatch, then the work done under it."""
+    return [
+        ("user", brief),
+        ("assistant", "已按派单完成知识经验卡与索引的写入，写后核验全部通过。"),
+    ]
+
+
+def _write_subagent_jsonl(
+    path: Path, *, session_id: str, parent_id: str, turns: list[tuple[str, str]]
+) -> None:
+    """A flagged Codex subagent rollout (an orphan when ``parent_id`` is empty)."""
+    meta: dict = {
+        "id": session_id,
+        "thread_source": "subagent",
+        "agent_nickname": "writer-c1",
+        "agent_role": "writer",
+        "cwd": "/projects/demo",
+    }
+    if parent_id:
+        meta["parent_thread_id"] = parent_id
+    lines: list[dict] = [{"type": "session_meta", "payload": meta}]
+    lines.extend(
+        {
+            "type": "message",
+            "message": {"role": role, "content": [{"type": "text", "text": text}]},
+        }
+        for role, text in turns
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(json.dumps(line, ensure_ascii=False) for line in lines) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _seed_subagent_session(
+    rt: FlywheelRuntime,
+    transcript: Path,
+    *,
+    session_id: str,
+    parent_id: str,
+    title: str,
+) -> str:
+    """Register a flagged subagent transcript the way the scan does; return its key."""
+    metadata: dict = {"discovered_by": "p00_reconcile_scan", "is_subagent": True}
+    if parent_id:
+        metadata["parent_session_key"] = f"codex:{parent_id}"
+    rt.db.upsert_session(
+        SessionRecord(
+            session_key=f"codex:{session_id}",
+            client="codex",
+            session_id=session_id,
+            title=title,
+            project="demo",
+            workspace="/projects/demo",
+            transcript_path=str(transcript),
+            status=SessionStatus.PENDING,
+            metadata=metadata,
+        )
+    )
+    return f"codex:{session_id}"
+
+
+# ---- 9.1 hand_distilled：治理专属入队 / 幂等替换 / 整体跳过
+
+
+@pytest.mark.asyncio
+async def test_hand_distilled_queues_a_governance_only_item_with_its_paths_and_an_audit_trail(
+    tmp_path: Path,
+):
+    """规格场景：手工沉淀后回调 hand_distilled → 一条 P0_CORE 治理专属队列项，并留审计。"""
+    rt = _runtime(tmp_path)
+    result = await _mcp(
+        rt,
+        "flywheel_session_intent",
+        {
+            "action": "hand_distilled",
+            "session_key": "codex:s-101",
+            "wiki_paths": ["projects/demo/note.md"],
+            "governance_only": True,
+            "title": "缓存击穿排查",
+            "project": "demo",
+            "content": CONTENT,
+        },
+    )
+    assert result["status"] == "queued"
+    assert result["action"] == "hand_distilled"
+    assert result["session_key"] == "codex:s-101"
+    assert result["distill_mode"] == "governance_only"
+    assert result["hand_distilled_paths"] == ["projects/demo/note.md"]
+    assert len(result["queue_ids"]) == 1
+
+    item = rt.db.get_queue_item(result["queue_ids"][0])
+    assert item.status is QueueStatus.QUEUED
+    assert item.priority == "P0_CORE"
+    assert item.project == "demo"
+    assert item.ingress_channel is IngressChannel.MCP_EXPLICIT
+    assert item.payload["distill_mode"] == "governance_only"
+    assert item.payload["hand_distilled_paths"] == ["projects/demo/note.md"]
+
+    # The declaration is mirrored onto the session, and the queue history is what decides.
+    session = rt.db.get_session("codex:s-101")
+    assert session.metadata["distill_mode"] == "governance_only"
+    assert session.metadata["hand_distilled_paths"] == ["projects/demo/note.md"]
+    assert rt.queue.distill_mode_of(session) == "governance_only"
+
+    trail = rt.db.list_audit_events(entity_type="queue_item", entity_id=item.queue_id)
+    declared = [event for event in trail if event["event_type"] == "hand_distilled_declared"]
+    assert len(declared) == 1
+    assert declared[0]["actor"] == "mcp"
+    assert declared[0]["to_status"] == "queued"
+    assert declared[0]["payload"]["distill_mode"] == "governance_only"
+    assert declared[0]["payload"]["hand_distilled_paths"] == ["projects/demo/note.md"]
+    created = [event for event in trail if event["event_type"] == "queue_item_created"]
+    assert created[0]["payload"]["distill_mode"] == "governance_only"
+
+
+def test_hand_distilled_replaces_the_queued_revision_and_repeats_idempotently(tmp_path: Path):
+    """幂等替换：同内容重复声明不新增队列项；新路径并入原项；内容增长后的修订沿用治理模式。"""
+    rt = _runtime(tmp_path)
+    plain = _enqueue(rt, "h-2", client="codex")
+    assert plain.payload["distill_mode"] == "full"
+
+    # A credential shape inside a reported path is redacted; a repeated path is dropped.
+    first = _declare_hand_distilled(
+        rt,
+        "codex:h-2",
+        wiki_paths=[
+            "projects/demo/a.md",
+            "projects/demo/ref?token=hunter2hunter2",
+            "projects/demo/a.md",
+        ],
+    )
+    first_paths = first["hand_distilled_paths"]
+    assert first_paths == ["projects/demo/a.md", "projects/demo/ref?token=[REDACTED]"]
+    governance = rt.db.get_queue_item(first["queue_ids"][0])
+    assert governance.status is QueueStatus.QUEUED
+    assert governance.revision == plain.revision + 1
+    assert governance.payload["hand_distilled_paths"] == first_paths
+    # The ordinary item it replaced stays visible, and so does the replacement.
+    assert _statuses(rt, "codex:h-2") == ["queued", "excluded"]
+    assert rt.db.get_queue_item(plain.queue_id).exclude_reason_code == "SUPERSEDED"
+    assert len(_declaration_events(rt, plain.queue_id)) == 1
+    assert len(_declaration_events(rt, governance.queue_id)) == 1
+
+    # The same declaration again is the same submission: no revision, no audit event.
+    again = _declare_hand_distilled(rt, "codex:h-2", wiki_paths=["projects/demo/a.md"])
+    assert again["queue_ids"] == first["queue_ids"]
+    assert again["hand_distilled_paths"] == first_paths
+    assert len(rt.db.list_session_queue_items("codex:h-2")) == 2
+    assert len(_declaration_events(rt, governance.queue_id)) == 1
+
+    # A second write-up adds its path to the same item; it opens no other.
+    extended = _declare_hand_distilled(rt, "codex:h-2", wiki_paths=["projects/demo/b.md"])
+    assert extended["queue_ids"] == first["queue_ids"]
+    assert extended["hand_distilled_paths"] == ["projects/demo/b.md", *first_paths]
+    merged = rt.db.get_queue_item(governance.queue_id)
+    assert merged.status is QueueStatus.QUEUED
+    assert merged.revision == governance.revision
+    assert merged.payload["hand_distilled_paths"] == extended["hand_distilled_paths"]
+    assert rt.db.get_session("codex:h-2").metadata["hand_distilled_paths"] == (
+        extended["hand_distilled_paths"]
+    )
+    assert len(_declaration_events(rt, governance.queue_id)) == 2
+
+    # The conversation grows afterwards: the next revision inherits mode and paths alike.
+    grown = rt.queue.on_archive(
+        "codex",
+        "h-2",
+        project="demo",
+        content=CONTENT + "\n用户：补充一轮结论。\n助手：已补充。",
+    )
+    assert grown["action"] == "enqueued"
+    assert _statuses(rt, "codex:h-2") == ["queued", "excluded", "excluded"]
+    latest = rt.db.list_session_queue_items("codex:h-2", statuses=[QueueStatus.QUEUED])[0]
+    assert latest.payload["distill_mode"] == "governance_only"
+    assert latest.payload["hand_distilled_paths"] == extended["hand_distilled_paths"]
+
+
+@pytest.mark.asyncio
+async def test_hand_distilled_skip_takes_the_session_out_until_an_explicit_enqueue(tmp_path: Path):
+    """governance_only=false：未消费的排队项置为 excluded，此后归档不再触发任何分析。"""
+    rt = _runtime(tmp_path)
+    queued = _enqueue(rt, "k-1", client="codex")
+    result = await _mcp(
+        rt,
+        "flywheel_session_intent",
+        {
+            "action": "hand_distilled",
+            "session_key": "codex:k-1",
+            "wiki_paths": ["projects/demo/k-1.md"],
+            "governance_only": False,
+        },
+    )
+    assert result["status"] == "excluded"
+    assert result["distill_mode"] == "skipped"
+    assert result["reason_code"] == "HAND_DISTILLED_SKIP"
+    assert result["hand_distilled_paths"] == ["projects/demo/k-1.md"]
+    assert result["queue_ids"] == [queued.queue_id]
+
+    item = rt.db.get_queue_item(queued.queue_id)
+    assert item.status is QueueStatus.EXCLUDED
+    assert item.exclude_reason_code == "HAND_DISTILLED_SKIP"
+    assert item.payload["distill_mode"] == "skipped"
+    assert item.payload["hand_distilled_paths"] == ["projects/demo/k-1.md"]
+    session = rt.db.get_session("codex:k-1")
+    assert session.metadata["distill_mode"] == "skipped"
+    assert session.metadata["hand_distilled_skip"] is True
+    declared = _declaration_events(rt, item.queue_id)
+    assert len(declared) == 1
+    assert declared[0]["reason_code"] == "HAND_DISTILLED_SKIP"
+    assert declared[0]["payload"]["distill_mode"] == "skipped"
+
+    # However much the conversation grows, a passive archive event never re-opens it.
+    grown = rt.queue.on_archive(
+        "codex",
+        "k-1",
+        project="demo",
+        content=CONTENT + "\n用户：继续补充结论。\n助手：已补充。",
+    )
+    assert grown["action"] == "excluded"
+    assert grown["reason_code"] == "HAND_DISTILLED_SKIP"
+    assert not rt.db.list_session_queue_items("codex:k-1", statuses=[QueueStatus.QUEUED])
+    assert len(rt.db.list_session_queue_items("codex:k-1")) == 1
+    assert rt.queue.distill_mode_of(rt.db.get_session("codex:k-1")) == "skipped"
+
+    # Only an explicit enqueue lifts the declaration.
+    back = await _mcp(
+        rt,
+        "flywheel_session_intent",
+        {
+            "action": "enqueue",
+            "session_key": "codex:k-1",
+            "project": "demo",
+            "content": CONTENT,
+        },
+    )
+    assert back["status"] == "queued"
+    assert _statuses(rt, "codex:k-1") == ["queued", "excluded"]
+    restored = rt.db.get_session("codex:k-1")
+    assert rt.queue.distill_mode_of(restored) == "full"
+    assert "distill_mode" not in restored.metadata
+    assert "hand_distilled_skip" not in restored.metadata
+
+
+def test_hand_distilled_skip_on_a_session_that_was_never_queued_leaves_a_visible_record(
+    tmp_path: Path,
+):
+    """从没入过队的会话被整体跳过：留一条可见的 excluded 记录，而不是无影无踪。"""
+    rt = _runtime(tmp_path)
+    result = _declare_hand_distilled(rt, "codex:k-2", governance_only=False)
+    assert result["status"] == "excluded"
+    assert len(result["queue_ids"]) == 1
+    item = rt.db.get_queue_item(result["queue_ids"][0])
+    assert item.status is QueueStatus.EXCLUDED
+    assert item.exclude_reason_code == "HAND_DISTILLED_SKIP"
+    assert item.payload["distill_mode"] == "skipped"
+    assert rt.db.get_session("codex:k-2").metadata["hand_distilled_skip"] is True
+
+    later = rt.queue.on_archive("codex", "k-2", project="demo", content=CONTENT)
+    assert later["action"] == "excluded"
+    assert later["reason_code"] == "HAND_DISTILLED_SKIP"
+    assert len(rt.db.list_session_queue_items("codex:k-2")) == 1
+
+
+# ---- 9.2 hand_distilled：被动归档不覆盖
+
+
+def test_archive_sync_never_demotes_a_hand_distilled_session_back_to_a_plain_item(
+    tmp_path: Path,
+):
+    """规格场景：被动归档同步不覆盖已登记的 hand_distilled 模式。"""
+    rt = _runtime(tmp_path)
+    archive = tmp_path / "archived_sessions"
+    sid = "01934e8f-7777-8888-9999-000000000021"
+    rollout = archive / f"rollout-2026-11-25T10-00-00-{sid}.jsonl"
+    turns = [
+        ("user", "排查缓存集中过期导致的连接池耗尽，并给出修复方案。"),
+        ("assistant", "已定位根因，给过期时间加随机抖动并补上回源互斥，压测通过。"),
+    ]
+    _write_jsonl(rollout, turns)
+    rt.cfg.sessions.codex_archive_sources = [ScanSourceConfig(client="codex", path=str(archive))]
+    key = f"codex:{sid}"
+
+    assert rt.queue.reconcile_codex_archives()["enqueued"] == 1
+    plain = rt.db.list_session_queue_items(key, statuses=[QueueStatus.QUEUED])[0]
+    assert plain.ingress_channel is IngressChannel.CODEX_ARCHIVE
+    # An ordinary archive item is distilled in full and carries no mode of its own.
+    assert "distill_mode" not in plain.payload
+
+    # The client writes the knowledge up by hand and says so.
+    declared = _declare_hand_distilled(rt, key, wiki_paths=["projects/demo/note.md"])
+    governance = rt.db.get_queue_item(declared["queue_ids"][0])
+    assert governance.status is QueueStatus.QUEUED
+    assert governance.revision == plain.revision + 1
+    assert governance.payload["distill_mode"] == "governance_only"
+    assert _statuses(rt, key) == ["queued", "excluded"]
+
+    # The archive sync sees the same file again: nothing new, and nothing demoted.
+    same = rt.queue.reconcile_codex_archives()
+    assert (same["enqueued"], same["excluded"], same["unchanged"]) == (0, 0, 1)
+    assert [item.revision for item in rt.db.list_session_queue_items(key)] == [2, 1]
+    assert rt.db.get_queue_item(governance.queue_id).status is QueueStatus.QUEUED
+
+    # The conversation continues after the declaration: the next revision inherits the
+    # mode instead of queueing a second plain write.
+    _write_jsonl(
+        rollout,
+        [
+            *turns,
+            ("user", "请把回源超时的兜底策略也补充进去。"),
+            ("assistant", "已补充：回源超时直接返回旧值，并记录一条降级日志。"),
+        ],
+    )
+    assert rt.queue.reconcile_codex_archives()["enqueued"] == 1
+    assert _statuses(rt, key) == ["queued", "excluded", "excluded"]
+    latest = rt.db.list_session_queue_items(key, statuses=[QueueStatus.QUEUED])[0]
+    assert latest.ingress_channel is IngressChannel.CODEX_ARCHIVE
+    assert latest.payload["distill_mode"] == "governance_only"
+    assert latest.payload["hand_distilled_paths"] == ["projects/demo/note.md"]
+    session = rt.db.get_session(key)
+    assert session.metadata["distill_mode"] == "governance_only"
+    assert rt.queue.distill_mode_of(session) == "governance_only"
+
+
+def test_a_hand_distilled_declaration_outlives_the_metadata_it_was_mirrored_into(
+    tmp_path: Path,
+):
+    """队列历史才是记录：一次整体替换会话 metadata 的登记不会抹掉声明。"""
+    rt = _runtime(tmp_path)
+    _declare_hand_distilled(rt, "claude-code:w-9", wiki_paths=["projects/demo/w-9.md"], content=CONTENT)
+
+    # A registration that stores its own metadata wholesale, as `upsert_session` does
+    # for a session no lifecycle hook protects.
+    rt.db.upsert_session(
+        SessionRecord(
+            session_key="claude-code:w-9",
+            client="claude-code",
+            session_id="w-9",
+            title="部署报错修复",
+            project="demo",
+            content=CONTENT,
+            status=SessionStatus.PENDING,
+        )
+    )
+    session = rt.db.get_session("claude-code:w-9")
+    assert "distill_mode" not in session.metadata
+    assert rt.queue.distill_mode_of(session) == "governance_only"
+
+    grown = rt.queue.on_archive(
+        "claude-code",
+        "w-9",
+        project="demo",
+        content=CONTENT + "\n用户：补充一轮结论。\n助手：已补充。",
+    )
+    assert grown["action"] == "enqueued"
+    latest = grown["items"][0]
+    assert latest.payload["distill_mode"] == "governance_only"
+    assert latest.payload["hand_distilled_paths"] == ["projects/demo/w-9.md"]
+    assert rt.db.get_session("claude-code:w-9").metadata["distill_mode"] == "governance_only"
+
+
+# ---- 9.3 主动入队的结构化摘要
+
+
+@pytest.mark.asyncio
+async def test_ingest_session_persists_a_redacted_structured_brief_and_counts_it_into_the_hash(
+    tmp_path: Path,
+):
+    """规格场景：通过 MCP 传入结构化摘要，脱敏后随队列项持久化，并计入内容哈希。"""
+    rt = _runtime(tmp_path)
+    mask = "[REDACTED]"
+    # Shaped like an API key, assembled here so the fixture is obviously not one.
+    fake_key = "sk-" + "dummy" * 6
+    brief = {
+        "facts": ["连接池上限应大于并发工作线程数", f"调用示例里用的是 {fake_key}"],
+        "decisions": [
+            {"decision": "过期时间加随机抖动", "password": "hunter2"},
+            {
+                "decision": "凭据改为环境变量注入",
+                "db_password": "hunter2hunter2",
+                "note": "仓库里不落明文",
+            },
+        ],
+        "domain_entities": ["连接池", "本地缓存"],
+        "incidents": "灰度发布后订单查询接口延迟升高",
+    }
+    ingest = {
+        "client": "claude",
+        "session_id": "brief-1",
+        "title": "缓存击穿排查",
+        "summary": CONTENT,
+    }
+    first = await _mcp(rt, "flywheel_ingest_session", {**ingest, "structured_brief": brief})
+    assert first["has_structured_brief"] is True
+    assert first["queue_items"] == 1
+
+    item = rt.db.get_queue_item(first["queue_ids"][0])
+    stored = item.payload["structured_brief"]
+    assert stored == {
+        "facts": ["连接池上限应大于并发工作线程数", f"调用示例里用的是 {mask}"],
+        "decisions": [
+            {"decision": "过期时间加随机抖动", "password": mask},
+            {"decision": "凭据改为环境变量注入", "db_password": mask, "note": "仓库里不落明文"},
+        ],
+        "domain_entities": ["连接池", "本地缓存"],
+        "incidents": "灰度发布后订单查询接口延迟升高",
+    }
+    text = rt.sessions.load_session_text(rt.db.get_session("claude:brief-1"), max_chars=500_000)
+    assert item.content_hash == compute_content_hash(text, structured_brief=stored)
+    assert item.payload["text_hash"] == compute_content_hash(text)
+
+    # The review reads the brief after the dialogue it belongs to, never as part of it.
+    rendered = rt.queue.load_queue_item_text(item)
+    marker = "flywheel-brief: structured brief submitted by the client "
+    assert marker in rendered
+    assert rendered.index(CONTENT) < rendered.index(marker)
+    brief_block = rendered[rendered.index(marker):]
+    assert "  - facts: 连接池上限应大于并发工作线程数" in brief_block
+    assert "  - facts: 调用示例里用的是 [REDACTED]" in brief_block
+    assert "  - domain_entities: 本地缓存" in brief_block
+    assert "  - incidents: 灰度发布后订单查询接口延迟升高" in brief_block
+    assert all(line.startswith("  - ") for line in brief_block.splitlines()[1:])
+
+    # The same submission twice is one item; a changed brief is a new revision.
+    again = await _mcp(rt, "flywheel_ingest_session", {**ingest, "structured_brief": brief})
+    assert again["queue_ids"] == first["queue_ids"]
+    assert len(rt.db.list_session_queue_items("claude:brief-1")) == 1
+    changed = await _mcp(
+        rt,
+        "flywheel_ingest_session",
+        {
+            **ingest,
+            "structured_brief": {**brief, "facts": [*brief["facts"], "回源需要互斥"]},
+        },
+    )
+    assert changed["queue_ids"] != first["queue_ids"]
+    assert _statuses(rt, "claude:brief-1") == ["queued", "excluded"]
+    assert rt.db.get_queue_item(changed["queue_ids"][0]).revision == 2
+
+    # An archive event for the same conversation recognises the transcript it already
+    # holds: the brief must not make it look like new content.
+    same = rt.queue.on_archive(
+        "claude", "brief-1", project="demo", summary=CONTENT, content=CONTENT
+    )
+    assert same["action"] == "unchanged"
+
+    # Without a brief nothing changes: no brief keys, and the fingerprint the queue
+    # has always used.
+    plain = await _mcp(rt, "flywheel_ingest_session", {**ingest, "session_id": "brief-2"})
+    assert plain["has_structured_brief"] is False
+    plain_item = rt.db.get_queue_item(plain["queue_ids"][0])
+    assert "structured_brief" not in plain_item.payload
+    assert "text_hash" not in plain_item.payload
+    plain_text = rt.sessions.load_session_text(
+        rt.db.get_session("claude:brief-2"), max_chars=500_000
+    )
+    assert plain_item.content_hash == compute_content_hash(plain_text)
+
+
+# ---- 9.4 受控写入派单：规则本身
+
+
+def test_the_dispatch_rule_reads_the_dialogue_and_skips_the_machine_bookkeeping():
+    """规则只看用户自己的那一轮指令；编排器转达的消息不是对话，也不打断「只有一条派单」。"""
+    cfg = SessionTriageConfig()
+    relay = "The coordinator sent a message while you were working:\n请按原派单继续，完成后回报。"
+    question = "请排查缓存集中过期导致连接池耗尽的问题。"
+    dispatch = _render_turns(_dispatch_turns())
+
+    # A bare dispatch: the instruction, then the writer working through it.
+    assert is_controlled_write_dispatch(dispatch, cfg) is True
+    # A message relayed while the writer was running is bookkeeping: still that one dispatch.
+    assert (
+        is_controlled_write_dispatch(f"{dispatch}\n\n[user] {relay}\n\n[assistant] 已继续执行。", cfg)
+        is True
+    )
+    # A person's own question before or after it makes the session a conversation.
+    assert (
+        is_controlled_write_dispatch(
+            f"[user] {question}\n\n[assistant] 好的，先看监控。\n\n[user] {relay}\n\n[assistant] 已完成。",
+            cfg,
+        )
+        is False
+    )
+    assert (
+        is_controlled_write_dispatch(
+            f"{dispatch}\n\n[user] 根因那段请压缩到三行以内。\n\n[assistant] 已压缩。", cfg
+        )
+        is False
+    )
+    # Talking or asking about a controlled write is not performing one.
+    assert (
+        is_controlled_write_dispatch(
+            "[user] 已批准的 write-set 超过 8 条时规划器会怎么处理？写前门禁会拦吗？\n\n"
+            "[assistant] 会被要求收缩到预算以内。",
+            cfg,
+        )
+        is False
+    )
+    verification = _render_turns([("user", VERIFICATION_BRIEF), ("assistant", "验证全部通过。")])
+    assert is_controlled_write_dispatch(verification, cfg) is False
+
+
+def test_a_persons_explicit_submission_is_kept_but_a_subagents_dispatch_is_not(tmp_path: Path):
+    """规则次序：用户显式提交永远先放行；子代理记录不是用户的请求，先回答它是不是派单。"""
+    rt = _runtime(tmp_path)
+    cfg = rt.cfg.sessions.triage
+    dispatch = _render_turns(_dispatch_turns())
+    main = SessionRecord(
+        session_key="claude-code:s-main",
+        client="claude-code",
+        session_id="s-main",
+        title="知识经验卡写入",
+        project="demo",
+        content=dispatch,
+        status=SessionStatus.PENDING,
+        metadata={"explicit_ingest": True},
+    )
+    verdict = triage_session(main, dispatch, cfg)
+    assert (verdict["admit"], verdict["tier"]) == (True, "explicit")
+
+    subagent = main.model_copy(
+        update={
+            "session_key": "claude-code:s-writer",
+            "session_id": "s-writer",
+            "metadata": {
+                "explicit_ingest": True,
+                "is_subagent": True,
+                "parent_session_key": "claude-code:s-main",
+            },
+        }
+    )
+    verdict = triage_session(subagent, dispatch, cfg)
+    assert verdict["admit"] is False
+    assert verdict["reason"] == "controlled_write_dispatch"
+    assert verdict["reason_code"] == "SUBAGENT_FRAGMENT"
+
+    # A short dispatch the built-in rule cannot recognise is admitted ...
+    short = "[user] 测试派单标记：把上面的结论写成 lessons/short-note.md。\n\n[assistant] 已写入。"
+    passive = SessionRecord(
+        session_key="claude-code:s-short",
+        client="claude-code",
+        session_id="s-short",
+        title="短派单",
+        project="demo",
+        status=SessionStatus.PENDING,
+        metadata={"discovered_by": "on_archive"},
+    )
+    assert is_controlled_write_dispatch(short, cfg) is False
+    assert triage_session(passive, short, cfg)["admit"] is True
+    # ... until the installation configures the phrase its own dispatches carry.
+    cfg.controlled_write_markers = ["测试派单标记"]
+    assert is_controlled_write_dispatch(short, cfg) is True
+    verdict = triage_session(passive, short, cfg)
+    assert verdict["admit"] is False
+    assert verdict["reason_code"] == "SUBAGENT_FRAGMENT"
+
+
+# ---- 9.5 受控写入派单：入队拦截
+
+
+def test_a_controlled_write_dispatch_is_excluded_at_every_passive_ingress(tmp_path: Path):
+    """标记子代理、未标记的转录、找不到父会话的子代理、内联内容：入口处一律 excluded。"""
+    rt = _runtime(tmp_path)
+    archive = tmp_path / "archived_sessions"
+    parent = "01934e8f-7777-8888-9999-000000000051"
+    child = "01934e8f-7777-8888-9999-000000000052"
+    orphan = "01934e8f-7777-8888-9999-000000000053"
+
+    plain = tmp_path / "dispatch-plain.jsonl"
+    _write_jsonl(plain, _dispatch_turns())
+    attached = archive / f"rollout-2026-11-25T10-05-00-{child}.jsonl"
+    _write_subagent_jsonl(attached, session_id=child, parent_id=parent, turns=_dispatch_turns())
+    lost = archive / f"rollout-2026-11-25T10-06-00-{orphan}.jsonl"
+    _write_subagent_jsonl(lost, session_id=orphan, parent_id="", turns=_dispatch_turns())
+
+    cases = [
+        ("claude-code", "dispatch-plain", {"transcript_path": str(plain)}),
+        ("codex", child, {"transcript_path": str(attached)}),
+        ("codex", orphan, {"transcript_path": str(lost)}),
+        ("codex", "dispatch-inline", {"content": _render_turns(_dispatch_turns())}),
+    ]
+    for client, session_id, fields in cases:
+        result = rt.queue.on_archive(client, session_id, project="demo", **fields)
+        assert result["action"] == "excluded", (session_id, result)
+        assert result["reason_code"] == "SUBAGENT_FRAGMENT", (session_id, result)
+        [item] = result["items"]
+        assert item.status is QueueStatus.EXCLUDED
+        assert item.exclude_reason_code == "SUBAGENT_FRAGMENT"
+        assert item.exclude_reason_detail == "controlled_write_dispatch"
+        assert not rt.db.list_session_queue_items(item.session_key, statuses=[QueueStatus.QUEUED])
+        trail = rt.db.list_audit_events(entity_type="queue_item", entity_id=item.queue_id)
+        assert any(
+            event["to_status"] == "excluded" and event["reason_code"] == "SUBAGENT_FRAGMENT"
+            for event in trail
+        )
+    assert rt.db.list_queued_items_prioritized(include_subagents=True) == []
+
+
+def test_a_long_brief_that_is_not_a_write_dispatch_is_still_queued(tmp_path: Path):
+    """同样的长度与版式，只是没有交接已批准的 write-set：照常入队。"""
+    rt = _runtime(tmp_path)
+    parent = "01934e8f-7777-8888-9999-000000000061"
+    child = "01934e8f-7777-8888-9999-000000000062"
+    turns = [("user", VERIFICATION_BRIEF), ("assistant", "验证全部通过，两轮结果一致。")]
+
+    transcript = tmp_path / "archived_sessions" / f"rollout-2026-11-25T11-00-00-{child}.jsonl"
+    _write_subagent_jsonl(transcript, session_id=child, parent_id=parent, turns=turns)
+    attached = rt.queue.on_archive("codex", child, project="demo", transcript_path=str(transcript))
+    assert attached["action"] == "enqueued"
+    [item] = attached["items"]
+    assert item.status is QueueStatus.QUEUED
+    assert item.is_subagent is True
+    assert item.parent_session_key == f"codex:{parent}"
+
+    plain = tmp_path / "verification-plain.jsonl"
+    _write_jsonl(plain, turns)
+    assert rt.queue.on_archive(
+        "claude-code", "verification-plain", project="demo", transcript_path=str(plain)
+    )["action"] == "enqueued"
+
+
+def test_a_flagged_subagent_that_lost_its_parent_is_a_fragment_even_when_it_is_no_dispatch(
+    tmp_path: Path,
+):
+    """规则 3 的加固：元数据标记的子代理找不到父会话就没有独立上下文；此前只有文件名命中的才算碎片。"""
+    rt = _runtime(tmp_path)
+    archive = tmp_path / "archived_sessions"
+    orphan = "01934e8f-7777-8888-9999-000000000063"
+    turns = [("user", VERIFICATION_BRIEF), ("assistant", "验证全部通过，两轮结果一致。")]
+    transcript = archive / f"rollout-2026-11-25T11-30-00-{orphan}.jsonl"
+    _write_subagent_jsonl(transcript, session_id=orphan, parent_id="", turns=turns)
+
+    # The same brief with a parent is queued (the test above); it is no write dispatch.
+    assert is_controlled_write_dispatch(_render_turns(turns), rt.cfg.sessions.triage) is False
+    result = rt.queue.on_archive("codex", orphan, project="demo", transcript_path=str(transcript))
+    assert result["action"] == "excluded"
+    assert result["reason_code"] == "SUBAGENT_FRAGMENT"
+    [item] = result["items"]
+    assert item.status is QueueStatus.EXCLUDED
+    assert item.exclude_reason_code == "SUBAGENT_FRAGMENT"
+    assert item.exclude_reason_detail == "subagent_or_system_fragment"
+    assert rt.db.list_queued_items_prioritized(include_subagents=True) == []
+
+
+def test_the_pending_sweep_archives_a_dispatch_session_as_a_write_dispatch(tmp_path: Path):
+    """P00 的待处理初筛走同一条规则：派单会话归档，普通会话留给审查。"""
+    rt = _runtime(tmp_path)
+    dispatch = tmp_path / "dispatch-sweep.jsonl"
+    _write_jsonl(dispatch, _dispatch_turns())
+    ordinary = tmp_path / "ordinary-sweep.jsonl"
+    _write_jsonl(
+        ordinary,
+        [
+            ("user", "请排查缓存集中过期导致连接池耗尽的问题，并给出修复方案。"),
+            ("assistant", "已定位根因，给过期时间加随机抖动并补上回源互斥，压测通过。"),
+        ],
+    )
+    for session_id, transcript in (("dispatch-sweep", dispatch), ("ordinary-sweep", ordinary)):
+        rt.db.upsert_session(
+            SessionRecord(
+                session_key=f"claude-code:{session_id}",
+                client="claude-code",
+                session_id=session_id,
+                title="缓存击穿排查",
+                project="demo",
+                transcript_path=str(transcript),
+                status=SessionStatus.PENDING,
+                metadata={"discovered_by": "p00_reconcile_scan"},
+            )
+        )
+
+    report = rt.sessions.sweep_pending_triage()
+    assert (report["checked"], report["skipped"], report["admitted"]) == (2, 1, 1)
+    assert report["reasons"] == {"controlled_write_dispatch": 1}
+    archived = rt.db.get_session("claude-code:dispatch-sweep")
+    assert archived.status is SessionStatus.ARCHIVED
+    assert archived.metadata["triage_reason"] == "controlled_write_dispatch"
+    assert rt.db.get_session("claude-code:ordinary-sweep").status is SessionStatus.PENDING
+
+
+# ---- 9.6 受控写入派单：存量清洗与用户决定优先
+
+
+def _seed_legacy_queued_item(
+    rt: FlywheelRuntime,
+    key: str,
+    *,
+    parent_key: str,
+    transcript: Path,
+    title: str,
+    payload: dict,
+    queue_id: str,
+) -> DistillQueueItem:
+    """A queued row from before the dispatch rule existed."""
+    return rt.db.upsert_queue_item(
+        DistillQueueItem(
+            queue_id=queue_id,
+            session_key=key,
+            parent_session_key=parent_key,
+            is_subagent=True,
+            client="codex",
+            project="demo",
+            workspace="/projects/demo",
+            title=title,
+            ingress_channel=IngressChannel.CODEX_ARCHIVE,
+            status=QueueStatus.QUEUED,
+            source_path=str(transcript),
+            payload=payload,
+        )
+    )
+
+
+def _claimable(rt: FlywheelRuntime) -> set[str]:
+    """The queued items an automatic batch can claim, subagents included."""
+    return {
+        item.queue_id for item in rt.db.list_queued_items_prioritized(include_subagents=True)
+    }
+
+
+def test_re_triage_moves_a_legacy_controlled_write_subagent_item_out_of_the_queue(
+    tmp_path: Path,
+):
+    """规格场景：存量受控写入子代理排队项在重筛后移出队列，不再被自动批次认领。"""
+    rt = _runtime(tmp_path)
+    parent = "01934e8f-7777-8888-9999-000000000071"
+    child = "01934e8f-7777-8888-9999-000000000072"
+    transcript = tmp_path / "archived_sessions" / f"rollout-2026-11-25T10-05-00-{child}.jsonl"
+    _write_subagent_jsonl(transcript, session_id=child, parent_id=parent, turns=_dispatch_turns())
+    key = _seed_subagent_session(
+        rt, transcript, session_id=child, parent_id=parent, title="知识经验卡写入"
+    )
+    # Only the writer's trailing output is left of this row: the instruction that makes
+    # it a dispatch survives in the transcript alone.
+    legacy = _seed_legacy_queued_item(
+        rt,
+        key,
+        parent_key=f"codex:{parent}",
+        transcript=transcript,
+        title="知识经验卡写入",
+        queue_id="q-legacy-dispatch",
+        payload={
+            "chunk_text": "[assistant] 已按派单完成知识经验卡与索引的写入，写后核验全部通过。",
+        },
+    )
+    assert legacy.queue_id in _claimable(rt)
+
+    # A dry run names the change and writes nothing.
+    preview = rt.queue.re_triage_queue(dry_run=True)
+    change = next(c for c in preview["changes"] if c["queue_id"] == legacy.queue_id)
+    assert (change["from_status"], change["to_status"]) == ("queued", "excluded")
+    assert change["reason_code"] == "SUBAGENT_FRAGMENT"
+    assert change["detail"] == "controlled_write_dispatch"
+    assert rt.db.get_queue_item(legacy.queue_id).status is QueueStatus.QUEUED
+    assert rt.db.list_audit_events(entity_type="queue_item", entity_id=legacy.queue_id) == []
+
+    rt.queue.re_triage_queue(dry_run=False)
+    excluded = rt.db.get_queue_item(legacy.queue_id)
+    assert excluded.status is QueueStatus.EXCLUDED
+    assert excluded.exclude_reason_code == "SUBAGENT_FRAGMENT"
+    assert excluded.exclude_reason_detail == "controlled_write_dispatch"
+    assert legacy.queue_id not in _claimable(rt)
+    trail = rt.db.list_audit_events(entity_type="queue_item", entity_id=legacy.queue_id)
+    assert any(
+        event["from_status"] == "queued"
+        and event["to_status"] == "excluded"
+        and event["reason_code"] == "SUBAGENT_FRAGMENT"
+        for event in trail
+    )
+    # The rule and the inventory now agree: a second pass has nothing left to change.
+    again = rt.queue.re_triage_queue(dry_run=True)
+    assert all(c["queue_id"] != legacy.queue_id for c in again["changes"])
+
+
+def test_re_triage_keeps_a_writer_session_once_a_person_joined_the_conversation(tmp_path: Path):
+    """派单之后用户又追问过：它已经是对话，不再是没有独立业务上下文的派单。"""
+    rt = _runtime(tmp_path)
+    parent = "01934e8f-7777-8888-9999-000000000081"
+    child = "01934e8f-7777-8888-9999-000000000082"
+    dialogue = [
+        ("user", DISPATCH_BRIEF),
+        ("assistant", "已写入初稿。"),
+        ("user", "根因那段能不能再补一条连接池等待时间的证据？"),
+        ("assistant", "已补充监控曲线的说明。"),
+    ]
+    transcript = tmp_path / "archived_sessions" / f"rollout-2026-11-25T10-05-00-{child}.jsonl"
+    _write_subagent_jsonl(transcript, session_id=child, parent_id=parent, turns=dialogue)
+    key = _seed_subagent_session(
+        rt, transcript, session_id=child, parent_id=parent, title="知识经验卡写入"
+    )
+    legacy = _seed_legacy_queued_item(
+        rt,
+        key,
+        parent_key=f"codex:{parent}",
+        transcript=transcript,
+        title="知识经验卡写入",
+        queue_id="q-legacy-dialogue",
+        payload={"chunk_text": _render_turns(dialogue)},
+    )
+
+    preview = rt.queue.re_triage_queue(dry_run=True)
+    assert all(c["queue_id"] != legacy.queue_id for c in preview["changes"])
+    rt.queue.re_triage_queue(dry_run=False)
+    assert rt.db.get_queue_item(legacy.queue_id).status is QueueStatus.QUEUED
+    assert legacy.queue_id in _claimable(rt)
+
+
+def test_re_triage_never_overrides_a_hand_distilled_declaration(tmp_path: Path):
+    """重筛是规则判定，不是用户决定：治理专属项不被丢掉，手工跳过的会话不再入队。"""
+    rt = _runtime(tmp_path)
+    parent = "01934e8f-7777-8888-9999-000000000091"
+    child = "01934e8f-7777-8888-9999-000000000092"
+    transcript = tmp_path / "archived_sessions" / f"rollout-2026-11-25T10-05-00-{child}.jsonl"
+    _write_subagent_jsonl(transcript, session_id=child, parent_id=parent, turns=_dispatch_turns())
+    key = _seed_subagent_session(
+        rt, transcript, session_id=child, parent_id=parent, title="知识经验卡写入"
+    )
+
+    # 1. Governance only, declared on a writer session: the dispatch rule would drop it,
+    #    but a person said this session is wanted for its rules.
+    governance = _declare_hand_distilled(rt, key, wiki_paths=["projects/demo/note.md"])
+    assert governance["status"] == "queued"
+    # 2. Taken out by hand: it stays out.
+    skipped = _enqueue(rt, "k-3", client="codex")
+    _declare_hand_distilled(rt, "codex:k-3", governance_only=False)
+    # 3. A row still queued under a skipped declaration.
+    rt.db.upsert_session(
+        SessionRecord(
+            session_key="codex:k-4",
+            client="codex",
+            session_id="k-4",
+            title="部署报错修复",
+            project="demo",
+            content=CONTENT,
+            status=SessionStatus.PENDING,
+            metadata={"distill_mode": "skipped", "hand_distilled_skip": True},
+        )
+    )
+    rt.db.upsert_queue_item(
+        DistillQueueItem(
+            queue_id="q-legacy-skipped",
+            session_key="codex:k-4",
+            client="codex",
+            status=QueueStatus.QUEUED,
+            title="部署报错修复",
+            payload={"chunk_text": CONTENT, "distill_mode": "skipped"},
+        )
+    )
+
+    preview = rt.queue.re_triage_queue(dry_run=True)
+    changes = {change["queue_id"]: change for change in preview["changes"]}
+    assert set(changes) == {"q-legacy-skipped"}
+    assert changes["q-legacy-skipped"]["reason_code"] == "HAND_DISTILLED_SKIP"
+    assert rt.db.get_queue_item("q-legacy-skipped").status is QueueStatus.QUEUED
+
+    rt.queue.re_triage_queue(dry_run=False)
+    assert rt.db.get_queue_item(governance["queue_ids"][0]).status is QueueStatus.QUEUED
+    assert governance["queue_ids"][0] in _claimable(rt)
+    assert _statuses(rt, "codex:k-3") == ["excluded"]
+    assert rt.db.get_queue_item(skipped.queue_id).exclude_reason_code == "HAND_DISTILLED_SKIP"
+    legacy = rt.db.get_queue_item("q-legacy-skipped")
+    assert legacy.status is QueueStatus.EXCLUDED
+    assert legacy.exclude_reason_code == "HAND_DISTILLED_SKIP"
+
+
+@pytest.mark.asyncio
+async def test_the_mcp_surface_and_the_dictionary_know_the_new_intents(tmp_path: Path):
+    """工具总数不变，新参数全部可选；排除原因字典能给出新码的名称。"""
+    rt = _runtime(tmp_path)
+    tools = {tool.name: tool for tool in await rt.mcp.list_tools()}
+    assert len(tools) == 7
+    intent = tools["flywheel_session_intent"].input_schema
+    assert {"wiki_paths", "governance_only"} <= set(intent["properties"])
+    ingest = tools["flywheel_ingest_session"].input_schema
+    assert "structured_brief" in ingest["properties"]
+    # A client that sends none of them gets the contract it always had.
+    assert not {"wiki_paths", "governance_only"} & set(intent.get("required", []))
+    assert "structured_brief" not in ingest.get("required", [])
+
+    labels = {item.code: item.label_zh for item in rt.db.list_dicts(dict_type="exclude_reason")}
+    assert labels["HAND_DISTILLED_SKIP"] == "客户端已手工沉淀"

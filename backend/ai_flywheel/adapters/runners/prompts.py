@@ -265,6 +265,23 @@ def _build_p03_prompt(
     }
     if routing_candidates is not None:
         payload["routing_candidates"] = routing_candidates.to_dict(description_limit=120)
+    # Sessions the client wrote up by hand (hand_distilled): their knowledge is in the Wiki
+    # already. They are named in the input only when there are any, so every other batch gets
+    # the prompt it always had, byte for byte. A plan that drafts their knowledge again is
+    # taken out after the reply as well: this note saves the tokens, the filter is the gate.
+    hand_distilled_keys = [
+        str(key) for key in review_findings.get("governance_only_session_keys") or [] if str(key)
+    ]
+    if hand_distilled_keys:
+        payload["governance_only_session_keys"] = hand_distilled_keys
+    hand_distilled_note = (
+        'HAND-DISTILLED SESSIONS: every session_key in "governance_only_session_keys" has had its knowledge '
+        "written into the Wiki by the client already. Do NOT plan a \"knowledge_doc\" whose \"source_session_keys\" "
+        "all come from that list, and do not spend an item slot on one: a rule, a Skill plan, a mistake or a "
+        "dissent found in such a session is still wanted.\n"
+        if hand_distilled_keys
+        else ""
+    )
     skill_sections_note = (
         '"existing_skill_sections" in the input lists the level-2 headings each Skill to update already has. '
         "Write only what those Skills do not cover yet, and never repeat a heading that is already listed there.\n"
@@ -284,6 +301,7 @@ def _build_p03_prompt(
         f"{routing_paragraph}"
         f"{deposit_paragraph}"
         f"{skill_sections_note}"
+        f"{hand_distilled_note}"
         "Allowed target_kind values:\n"
         f'1. "knowledge_doc": relative_path under "{default_doc_prefix}{today}-slug.md", action="create|update", '
         f'content_preview=concise structured markdown (220-450 chars) with frontmatter including '

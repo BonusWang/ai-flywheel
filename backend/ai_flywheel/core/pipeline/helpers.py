@@ -2,8 +2,9 @@
 
 Everything here is deterministic: normalisation of a review's mistake and dissent
 candidates, the two-track promotion rule, routing validation for a knowledge
-document, and the payload a half-done P04 batch leaves behind. Nothing in this
-module writes knowledge documents, observations, dissents or Skills — the stage
+document, the knowledge documents a batch leaves out because their sessions were
+written up by hand, and the payload a half-done P04 batch leaves behind. Nothing in
+this module writes knowledge documents, observations, dissents or Skills — the stage
 that calls a helper owns the side effect.
 """
 from __future__ import annotations
@@ -292,4 +293,70 @@ def partial_write_payload(
         "partial_write_receipts": list(write_receipts),
         "partial_written_paths": list(written_paths),
         "partial_write_error": str(error),
+    }
+
+
+# ---------------- P03 / P04: sessions the client hand-distilled ----------------
+
+#: Status and reason P04 puts on the receipt of an approved document it did not write.
+GOVERNANCE_ONLY_SKIP_STATUS = "SKIPPED_GOVERNANCE_ONLY"
+GOVERNANCE_ONLY_SKIP_REASON = "governance_only_session"
+
+
+def filter_governance_only_docs(
+    planned_writes: list[PlannedWrite],
+    governance_only_keys: set[str] | frozenset[str],
+    admitted_keys: list[str],
+) -> tuple[list[PlannedWrite], list[dict[str, Any]]]:
+    """Take the knowledge documents a batch may not write out of a plan.
+
+    A session declared ``hand_distilled`` had its knowledge written up by the client
+    itself and was queued for its rules, mistakes and dissents only. A knowledge
+    document is therefore dropped when every session it cites is such a session, or
+    when it cites none and the whole batch is governance-only. Everything else —
+    rules, Skill plans, a document that also speaks for an ordinary session — is
+    exactly what those sessions were queued for and stays.
+
+    Returns the plan that remains and, per dropped document, what the node payload
+    and the audit trail record about it. Nothing is written here.
+    """
+    admitted = [str(key) for key in dict.fromkeys(admitted_keys)]
+    governance = {str(key) for key in governance_only_keys}
+    all_governance = bool(admitted) and all(key in governance for key in admitted)
+    kept: list[PlannedWrite] = []
+    skipped: list[dict[str, Any]] = []
+    for write in planned_writes:
+        if write.target_kind != "knowledge_doc":
+            kept.append(write)
+            continue
+        sources = [str(key) for key in write.source_session_keys]
+        hand_written = (
+            all(key in governance for key in sources) if sources else all_governance
+        )
+        if not hand_written:
+            kept.append(write)
+            continue
+        skipped.append(
+            {
+                "title": write.title,
+                "relative_path": write.relative_path,
+                "action": write.action,
+                "source_session_keys": sources,
+                "reason_code": GOVERNANCE_ONLY_SKIP_REASON,
+            }
+        )
+    return kept, skipped
+
+
+def governance_only_skip_receipt(skipped_doc: dict[str, Any]) -> dict[str, Any]:
+    """The write receipt P04 leaves for an approved document it did not write."""
+    return {
+        "relative_path": skipped_doc.get("relative_path"),
+        "title": skipped_doc.get("title"),
+        "status": GOVERNANCE_ONLY_SKIP_STATUS,
+        "skipped": True,
+        "written": False,
+        "reason_code": GOVERNANCE_ONLY_SKIP_REASON,
+        "reason": "会话已由客户端手工沉淀，知识文档不重复写入",
+        "source_session_keys": [str(key) for key in skipped_doc.get("source_session_keys") or []],
     }

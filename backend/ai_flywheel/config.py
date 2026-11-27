@@ -51,6 +51,14 @@ class SessionTriageConfig(BaseModel):
         default_factory=lambda: ["agent-", "subagent-", "warmup-"]
     )
     exclude_content_prefixes: list[str] = Field(default_factory=list)
+    # Phrases that identify a controlled knowledge-base write dispatch in this
+    # installation (see `is_controlled_write_dispatch`): a heading of its dispatch
+    # template, the name of its writer skill. A session whose only instruction
+    # carries one is the writing of a document, not a conversation to distill, and
+    # is excluded. The built-in rule already recognises a dispatch that hands over
+    # an approved write-set and names the write contract; a phrase only one
+    # installation uses belongs here, in the private configuration, never in the code.
+    controlled_write_markers: list[str] = Field(default_factory=list)
     project_workspace_patterns: list[str] = Field(
         default_factory=lambda: ["projects", "github", "repos", "workspace", "wiki", "src", "ideaprojects"]
     )
@@ -146,6 +154,16 @@ class WorkflowConfig(BaseModel):
     auto_approve_writes: bool = False
     max_sessions_per_run: int = 10
     max_chars_per_run: int = 180000
+    # How late the daily_flywheel job may still run after its fire time. A host
+    # that slept or was busy past the cron time resumes the batch on wake-up
+    # instead of losing it; 14400 is four hours. The same value bounds the
+    # window in which a missed fire (the service was not running at all) is
+    # caught up by the recovery loop.
+    misfire_grace_seconds: int = Field(default=14400, ge=60)
+    # Serve role only: when today's scheduled fire was missed and the grace
+    # window is still open, the recovery loop starts one catch-up batch
+    # (trigger="scheduled") instead of only recording the miss.
+    catchup_missed_schedule: bool = True
 
 
 class CliRunnerConfig(BaseModel):

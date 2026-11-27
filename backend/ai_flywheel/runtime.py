@@ -84,6 +84,9 @@ class FlywheelRuntime:
             broker=self.broker,
             process_role=self.process_role,
             feishu_provider=self._feishu_daemon_status,
+            # The scheduler reads the same clock as the store: a test that injects
+            # one sees one "today" on both sides (production uses the system clock).
+            clock=self.clock.now,
         )
         # An outcome or a signal changes rules, dissents and freshness: the
         # derived core card is a projection of those, so it is refreshed with them.

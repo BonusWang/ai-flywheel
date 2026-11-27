@@ -19,7 +19,14 @@ def build_overview_router(rt: FlywheelRuntime) -> APIRouter:
     # ---------------- Public Unified Layer (AIHOT-inspired) ----------------
     @router.get("/health")
     def health() -> dict[str, Any]:
-        return {"status": "ok", "version": __version__, "lock": rt.db.get_workflow_lock()}
+        # `started_at` (Shanghai, ISO 8601) says when this process came up: whether it
+        # can have been awake for today's scheduled fire is then answerable from outside.
+        return {
+            "status": "ok",
+            "version": __version__,
+            "lock": rt.db.get_workflow_lock(),
+            "started_at": rt.automation.started_at,
+        }
 
     @router.get("/llms.txt", response_class=PlainTextResponse)
     def llms_txt() -> str:

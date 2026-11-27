@@ -470,18 +470,125 @@ def _is_explicit_submission(session: SessionRecord) -> bool:
     return False
 
 
+_USER_TURN_LINE_RE = re.compile(r"^\[(?:user|human)\]", re.IGNORECASE | re.MULTILINE)
+_NEXT_ROLE_MARKER_RE = re.compile(r"\[(?:assistant|model|user|human)\]", re.IGNORECASE)
+_MD_HEADING_LINE_RE = re.compile(r"^\s{0,3}#{1,6}\s+\S", re.IGNORECASE | re.MULTILINE)
+_MD_LIST_LINE_RE = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+\S", re.MULTILINE)
+
+#: A controlled write is an *approved* write: a dispatch hands over a write-set that was
+#: approved and names the write contract it has to pass. Both are tool-neutral on purpose;
+#: a phrase only one installation's dispatches use is configured, never coded
+#: (``sessions.triage.controlled_write_markers``).
+_CONTROLLED_WRITE_APPROVAL_RE = re.compile(
+    r"(?:批准|授权|审批|已批|获批|approved?|authori[sz]ed)[^。\n]{0,30}write[-_ ]set"
+    r"|write[-_ ]set[^。\n]{0,16}(?:批准|授权|审批|获批|approved?|authori[sz]ed)",
+    re.IGNORECASE,
+)
+_CONTROLLED_WRITE_CONTRACT_MARKERS = (
+    "受控写入",
+    "受控沉淀",
+    "写前门禁",
+    "写后核验",
+    "写后钩子",
+    "postflight",
+    "preimage",
+    "postimage",
+)
+
+#: A dispatch is a written brief, not a remark that happens to name an approved write-set:
+#: it is long and laid out in sections or steps. Below this, a conversation that merely
+#: talks *about* a controlled write is left alone.
+_CONTROLLED_WRITE_MIN_OPENING_CHARS = 1200
+_CONTROLLED_WRITE_MIN_HEADINGS = 2
+_CONTROLLED_WRITE_MIN_LIST_ITEMS = 6
+
+#: A user turn that only carries the machine's own bookkeeping is not a question a person
+#: asked: a context continuation, an injected reminder, a hook's feedback, or a message an
+#: orchestrator relayed to an agent that was already running.
+_NON_DIALOGUE_USER_PREFIXES = (
+    "this session is being continued from a previous conversation",
+    "<system-reminder>",
+    "<task-notification>",
+    "the coordinator sent a message",
+)
+
+
+def _dialogue_user_turns(text: str) -> list[str]:
+    """The user turns that carry an instruction or a question, in order."""
+    turns: list[str] = []
+    for match in _USER_TURN_LINE_RE.finditer(text or ""):
+        rest = text[match.end():].lstrip()
+        if any(rest.lower().startswith(prefix) for prefix in _NON_DIALOGUE_USER_PREFIXES):
+            continue
+        end = _NEXT_ROLE_MARKER_RE.search(rest)
+        turns.append(rest[: end.start()].strip() if end else rest.strip())
+    return turns
+
+
+def _configured_write_markers(cfg: SessionTriageConfig | None) -> tuple[str, ...]:
+    raw = getattr(cfg, "controlled_write_markers", None) if cfg is not None else None
+    return tuple(str(marker).strip().lower() for marker in (raw or []) if str(marker).strip())
+
+
+def _is_dispatch_brief(opening: str) -> bool:
+    """Whether an opening instruction is laid out like a written brief."""
+    if len(opening) < _CONTROLLED_WRITE_MIN_OPENING_CHARS:
+        return False
+    return (
+        len(_MD_HEADING_LINE_RE.findall(opening)) >= _CONTROLLED_WRITE_MIN_HEADINGS
+        or len(_MD_LIST_LINE_RE.findall(opening)) >= _CONTROLLED_WRITE_MIN_LIST_ITEMS
+    )
+
+
+def is_controlled_write_dispatch(text: str, cfg: SessionTriageConfig | None = None) -> bool:
+    """Whether a transcript is the *dispatch* of a controlled knowledge-base write.
+
+    Such a session is the writing of a document — one instruction, then the writer
+    working through it — not knowledge about the work behind it. Distilled, it would
+    describe the writing process to the very knowledge base it wrote to.
+
+    It is recognised by content, never by a tool or agent name, and it has to be
+    unambiguous, because the cost of being wrong is a real conversation never being
+    distilled:
+
+    * the conversation has exactly one instruction and nothing follows it — a message
+      an orchestrator relayed while the writer was running does not count;
+    * the instruction hands over an *approved* write-set and names the write contract,
+      or carries a marker configured in ``sessions.triage.controlled_write_markers``;
+    * unless a configured marker says so, it is a written brief — long, laid out in
+      sections or steps — so that a question *about* a controlled write is never taken
+      for one.
+    """
+    turns = _dialogue_user_turns(text)
+    if len(turns) != 1:
+        return False
+    opening = turns[0].lower()
+    if any(marker in opening for marker in _configured_write_markers(cfg)):
+        return True
+    if not _CONTROLLED_WRITE_APPROVAL_RE.search(opening):
+        return False
+    if not any(marker in opening for marker in _CONTROLLED_WRITE_CONTRACT_MARKERS):
+        return False
+    return _is_dispatch_brief(opening)
+
+
 def triage_session(
     session: SessionRecord,
     text: str,
     cfg: SessionTriageConfig,
     *,
     has_open_retro: bool = False,
+    opening_text: str = "",
 ) -> dict[str, Any]:
     """Level-1 deterministic session triage (0-token pre-filter before P02 LLM review).
 
     ``reason_code`` is the standard ``exclude_reason`` code for a rejected
     session (``USER_OPT_OUT`` / ``SUBAGENT_FRAGMENT`` / ...) and the empty
     string for an admitted one; ``reason`` keeps the human-readable detail.
+
+    ``opening_text`` is the opening of the whole session when ``text`` is only part of
+    it (a later chunk, a review excerpt): a write dispatch is recognised by how the
+    conversation opens and whether anything follows, which an excerpt may no longer show.
     """
     if not cfg.enabled:
         return {
@@ -492,8 +599,17 @@ def triage_session(
             "workspace": session.workspace,
         }
 
-    # 1. Explicit user ingestion (MCP ingest_session / manual UI) always bypasses auto-drop
-    if _is_explicit_submission(session):
+    meta = session.metadata if isinstance(session.metadata, dict) else {}
+    has_parent = bool(meta.get("parent_session_key"))
+    tp_name = Path(session.transcript_path).name if session.transcript_path else ""
+    is_sub_file = is_subagent_filename(session.session_id, cfg) or (tp_name and is_subagent_filename(tp_name, cfg))
+    flagged_subagent = bool(meta.get("is_subagent", False))
+    subagent_record = flagged_subagent or is_sub_file or has_parent
+
+    # 1. Explicit user ingestion (MCP ingest_session / manual UI) always bypasses auto-drop.
+    #    A subagent record is not a person asking for a distillation, so for those the
+    #    write-dispatch check below is answered first.
+    if not subagent_record and _is_explicit_submission(session):
         return {
             "admit": True,
             "tier": "explicit",
@@ -502,13 +618,29 @@ def triage_session(
             "workspace": session.workspace,
         }
 
-    # 2. Check parentage & subagent / headless fragments
-    meta = session.metadata if isinstance(session.metadata, dict) else {}
-    has_parent = bool(meta.get("parent_session_key"))
-    tp_name = Path(session.transcript_path).name if session.transcript_path else ""
-    is_sub_file = is_subagent_filename(session.session_id, cfg) or (tp_name and is_subagent_filename(tp_name, cfg))
+    # 2. A controlled knowledge-base write dispatch describes the writing of a document,
+    #    not the work behind it: distilling it again is recursion, so it never enters the queue.
+    if is_controlled_write_dispatch(opening_text or text, cfg):
+        return {
+            "admit": False,
+            "tier": "skipped",
+            "reason": "controlled_write_dispatch",
+            "reason_code": "SUBAGENT_FRAGMENT",
+            "workspace": session.workspace,
+        }
 
-    if is_sub_file and not has_parent:
+    if subagent_record and _is_explicit_submission(session):
+        return {
+            "admit": True,
+            "tier": "explicit",
+            "reason": "explicit_user_submission",
+            "reason_code": "",
+            "workspace": session.workspace,
+        }
+
+    # 3. Check parentage & subagent / headless fragments. A subagent record without
+    #    its parent lost the context that made it meaningful: it is a fragment.
+    if (is_sub_file or flagged_subagent) and not has_parent:
         return {
             "admit": False,
             "tier": "skipped",
@@ -517,7 +649,7 @@ def triage_session(
             "workspace": session.workspace,
         }
 
-    # 3. Discover workspace if empty
+    # 4. Discover workspace if empty
     workspace = (session.workspace or "").strip()
     if not workspace and session.transcript_path:
         workspace = extract_jsonl_workspace(Path(session.transcript_path))

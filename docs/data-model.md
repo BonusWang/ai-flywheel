@@ -150,7 +150,7 @@ erDiagram
 |---|---|---|
 | `queue_status` | 沉淀队列状态机 | `queued`、`processing`、`processed`、`excluded`、`withdrawn`、`dead_letter` |
 | `ingress_channel` | 入队通道 | `mcp_explicit`、`manual_portal`、`codex_archive`、`claude_exit`、`legacy_scan` |
-| `exclude_reason` | 排除原因码 | `USER_OPT_OUT`、`SUBAGENT_FRAGMENT`、`EXCLUDED_WORKSPACE`、`TOO_SHORT`、`TEMP_CHAT_LOW_SIGNAL`、`SINGLE_TURN_LOOKUP`、`MANUAL_EXCLUDE`、`EMPTY_DELTA`、`SUPERSEDED` |
+| `exclude_reason` | 排除原因码 | `USER_OPT_OUT`、`SUBAGENT_FRAGMENT`、`EXCLUDED_WORKSPACE`、`TOO_SHORT`、`TEMP_CHAT_LOW_SIGNAL`、`SINGLE_TURN_LOOKUP`、`MANUAL_EXCLUDE`、`EMPTY_DELTA`、`SUPERSEDED`、`HAND_DISTILLED_SKIP` |
 | `client_type` | 接入端类型 | `codex`、`claude-code`、`claude`、`antigravity`、`portal-sandbox`、`generic` |
 | `priority_level` | 认领优先级 | `P0_CORE`、`P1_SIGNAL`、`P1_GENERAL`、`P2_META` |
 | `run_status` | 批次状态机 | `PENDING`、`RUNNING`、`AWAITING_APPROVAL`、`PASS`、`PARTIAL`、`CANCELLED`、`FAILED` |
