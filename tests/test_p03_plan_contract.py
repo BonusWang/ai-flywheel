@@ -10,12 +10,16 @@
 再往后的几节覆盖文档深度、事件分卡与领域页独立预算（feat-agy-ingest-and-high-fidelity-distill）：
 知识文档不再限 220-450 字、审查的 `events` 进入计划提示词、`max_domain_writes_per_run` 单独计数，
 以及事故卡在计划规范化时就被标记为敏感写入。同样只用虚构示例，不发出任何真实模型请求。
+
+「缓存与隐私门禁」一节覆盖回包落盘的那条线：隐私门禁拒绝的计划项仍在整份回包里，所以这样的回包
+在 API 与 CLI 两条通道上都不写缓存；干净回包照常缓存。合成密钥在运行时拼出，文件里不出现完整形状。
 """
 from __future__ import annotations
 
 import json
 import logging
 import shutil
+import sys
 import textwrap
 from pathlib import Path
 from typing import Any
@@ -544,6 +548,280 @@ def test_cli_runner_applies_the_same_contract(tmp_path: Path, monkeypatch: pytes
     with pytest.raises(PlanUnavailableError) as excinfo:
         runner.plan_writes(NO_FINDINGS, [], 8)
     assert "本地 CLI 返回的写入计划 1 项全部未列入" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------- the cache and the privacy gate
+# A reply the privacy gate refused an item of is still one reply, and the refused item is still in it.
+# The cache is a plain file on disk: such a reply must never be written there, on either channel.
+
+
+# Built here, so the credential shape never appears whole in this file. It opens nothing.
+SYNTHETIC_KEY = "sk-" + "9" * 32
+# A credential assignment: only the strict check reads it, so it is not a reason to drop an item.
+SYNTHETIC_ASSIGNMENT = "临时说明 password: Hk9-Qp31x"
+
+
+def _leaky_doc(slug: str = "leaky") -> dict[str, Any]:
+    """A document whose draft carries a key: the privacy gate refuses it before it is planned."""
+    item = _doc(title="联调凭据复盘", slug=slug, with_summary=True)
+    item["content_preview"] += f"- 联调时随手贴的密钥 {SYNTHETIC_KEY}，不要外传。\n"
+    return item
+
+
+class _ReplyModel:
+    """Stands in for the model gateway and always answers with the same reply, whatever the prompt."""
+
+    def __init__(self, reply: dict[str, Any]) -> None:
+        self.reply = json.dumps(reply, ensure_ascii=False)
+        self.prompts: list[str] = []
+
+    def __call__(self, prompt: str, system_prompt: str) -> str:
+        self.prompts.append(prompt)
+        return self.reply
+
+
+def _files_under(root: Path) -> list[str]:
+    return sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()) if root.is_dir() else []
+
+
+def _cli_runner(base: Path, reply: dict[str, Any]) -> tuple[CliSubprocessRunner, Path]:
+    """A CLI runner whose "local CLI" is this interpreter: it reads the prompt, prints a canned reply.
+
+    The second value is a log that gains one character per call, so a test can count the calls.
+    """
+    base.mkdir(parents=True, exist_ok=True)
+    cfg = FlywheelConfig(base_dir=base)
+    cfg.runner.mode = "cli"
+    reply_file = base / "cli-reply.json"
+    reply_file.write_text(json.dumps(reply, ensure_ascii=True), encoding="ascii")
+    calls = base / "cli-calls.log"
+    script = (
+        "import sys, pathlib; "
+        "pathlib.Path(%r).open('a', encoding='ascii').write(sys.stdin.read()[:1]); "
+        "sys.stdout.write(pathlib.Path(%r).read_text(encoding='ascii'))"
+    ) % (str(calls), str(reply_file))
+    cfg.runner.cli.command = sys.executable
+    cfg.runner.cli.args = ["-c", script]
+    return CliSubprocessRunner(cfg, ImmutableFileStore(base / "cli-receipts")), calls
+
+
+def _api_runner(tmp_path: Path) -> OpenAICompatibleRunner:
+    """An API runner whose receipts root — and so whose `api_cache/` — sits under the test directory."""
+    rt, _ = _runtime(tmp_path)
+    runner = OpenAICompatibleRunner(rt.cfg, rt.fs_store)
+    assert runner.fs_store.root == tmp_path / "data" / "receipts"
+    return runner
+
+
+def _assert_only_the_clean_item_is_planned(outcome: PlanOutcome) -> None:
+    assert [w.title for w in outcome.planned_writes] == ["接口超时排查复盘"]
+    assert [(d["index"], d["reasons"]) for d in outcome.diagnostics.dropped_items] == [(1, ["SECRET_LEAK_BLOCKED"])]
+    assert outcome.diagnostics.source in {PLAN_SOURCE_MODEL, PLAN_SOURCE_CLI}
+
+
+def _assert_nothing_was_cached(root: Path, *outcomes: PlanOutcome) -> None:
+    """No file under the receipts root, and no outcome claims a cache file or a cache hit."""
+    assert _files_under(root) == []
+    for outcome in outcomes:
+        assert (outcome.diagnostics.cache_hit, outcome.diagnostics.cache_file) == (False, None)
+
+
+MIXED_REPLY = {"planned_writes": [_doc(with_summary=True), _leaky_doc()]}
+
+
+def test_a_reply_with_an_item_the_privacy_gate_refused_is_never_cached_on_the_api_path(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, heuristic_planner_forbidden: None
+):
+    runner = _api_runner(tmp_path)
+    fake = _FakeModel(MIXED_REPLY["planned_writes"])
+    runner._call_chat_completion = fake
+
+    with caplog.at_level(logging.WARNING, logger=RUN_LOGGER):
+        first = runner.plan_writes_detailed(NO_FINDINGS, [], 8)
+        second = runner.plan_writes_detailed(NO_FINDINGS, [], 8)
+
+    # The mixed reply: the usable item is planned, the one the gate refused is not.
+    _assert_only_the_clean_item_is_planned(first)
+    assert first.diagnostics.source == PLAN_SOURCE_MODEL
+    _assert_only_the_clean_item_is_planned(second)
+    # The refused item is still in the reply, so the reply stayed off the disk: the identical
+    # second call asks the model again instead of being served the file.
+    assert len(fake.prompts) == 2
+    _assert_nothing_was_cached(runner.fs_store.root, first, second)
+    assert not (runner.fs_store.root / "api_cache").exists()
+    # The diagnostics and the log never carry the key; the log names the kind and the file.
+    assert SYNTHETIC_KEY not in json.dumps(first.diagnostics.to_dict(), ensure_ascii=False)
+    assert SYNTHETIC_KEY not in caplog.text
+    refusals = [r.getMessage() for r in caplog.records if "Reply not cached" in r.getMessage()]
+    assert len(refusals) == 2  # one per call
+    assert all(
+        message.startswith("Reply not cached (p03_plan-") and message.endswith(
+            "): a credential shape is in the reply (OpenAI/Anthropic API Key). "
+            "The next identical batch asks again."
+        )
+        for message in refusals
+    )
+
+
+def test_a_reply_with_an_item_the_privacy_gate_refused_is_never_cached_on_the_cli_path(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, heuristic_planner_forbidden: None
+):
+    runner, calls = _cli_runner(tmp_path, MIXED_REPLY)
+
+    with caplog.at_level(logging.WARNING, logger=RUN_LOGGER):
+        first = runner.plan_writes_detailed(NO_FINDINGS, [], 8)
+        second = runner.plan_writes_detailed(NO_FINDINGS, [], 8)
+
+    _assert_only_the_clean_item_is_planned(first)
+    assert first.diagnostics.source == PLAN_SOURCE_CLI
+    _assert_only_the_clean_item_is_planned(second)
+    # The local CLI really ran, twice: nothing was cached to spare the second call.
+    assert len(calls.read_text(encoding="ascii")) == 2
+    _assert_nothing_was_cached(runner.fs_store.root, first, second)
+    assert not (runner.fs_store.root / "cli_cache").exists()
+    assert SYNTHETIC_KEY not in caplog.text
+    assert SYNTHETIC_KEY not in json.dumps(first.diagnostics.to_dict(), ensure_ascii=False)
+
+
+def test_a_clean_reply_is_cached_on_both_channels_so_the_gate_is_not_an_empty_switch(tmp_path: Path):
+    """The control: a clean reply is still cached and served, on both channels."""
+    api = _api_runner(tmp_path)
+    fake = _FakeModel([_doc(with_summary=True)])
+    api._call_chat_completion = fake
+
+    first = api.plan_writes_detailed(NO_FINDINGS, [], 8)
+    second = api.plan_writes_detailed(NO_FINDINGS, [], 8)
+
+    assert len(fake.prompts) == 1
+    assert (first.diagnostics.cache_hit, second.diagnostics.cache_hit) == (False, True)
+    assert _files_under(api.fs_store.root) == [f"api_cache/{first.diagnostics.cache_file}"]
+
+    cli, calls = _cli_runner(tmp_path / "cli", {"planned_writes": [_doc(with_summary=True)]})
+    first = cli.plan_writes_detailed(NO_FINDINGS, [], 8)
+    second = cli.plan_writes_detailed(NO_FINDINGS, [], 8)
+
+    assert len(calls.read_text(encoding="ascii")) == 1
+    assert (first.diagnostics.cache_hit, second.diagnostics.cache_hit) == (False, True)
+    assert _files_under(cli.fs_store.root) == [f"cli_cache/{first.diagnostics.cache_file}"]
+    assert json.loads((cli.fs_store.root / "cli_cache" / first.diagnostics.cache_file).read_text(encoding="utf-8")) == {
+        "planned_writes": [_doc(with_summary=True)]
+    }
+
+
+@pytest.mark.parametrize(
+    ("reply", "kind"),
+    [
+        pytest.param(MIXED_REPLY, "OpenAI/Anthropic API Key", id="an-item-the-privacy-gate-refused"),
+        pytest.param(
+            {
+                "planned_writes": [
+                    _doc(with_summary=True),
+                    {**_doc(slug="leaky-summary", with_summary=True), "summary": f"记录联调密钥 {SYNTHETIC_KEY}"},
+                ]
+            },
+            "OpenAI/Anthropic API Key",
+            id="the-summary-of-an-item",
+        ),
+        pytest.param(
+            {
+                "planned_writes": [
+                    _doc(with_summary=True),
+                    {"target_kind": "note", "action": "create", "title": f"未知类型 {SYNTHETIC_KEY}", "summary": "摘要"},
+                ]
+            },
+            "OpenAI/Anthropic API Key",
+            id="an-item-dropped-for-another-reason",
+        ),
+        pytest.param(
+            {"planned_writes": [_doc(with_summary=True)], "notes": SYNTHETIC_ASSIGNMENT},
+            "Credential Assignment",
+            id="free-text-beside-the-items",
+        ),
+    ],
+)
+def test_a_credential_anywhere_in_a_reply_keeps_the_whole_reply_out_of_the_cache(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    heuristic_planner_forbidden: None,
+    reply: dict[str, Any],
+    kind: str,
+):
+    """The privacy gate reads items one by one, the cache reads the whole reply.
+
+    A credential may sit where the gate never looks (a summary, a title, a field beside the
+    items), or in an item dropped for another reason. The plan keeps the usable item; the
+    reply as a whole stays off the disk. Only the strict check reads a credential assignment.
+    """
+    runner = _api_runner(tmp_path)
+    fake = _ReplyModel(reply)
+    runner._call_chat_completion = fake
+
+    with caplog.at_level(logging.WARNING, logger=RUN_LOGGER):
+        first = runner.plan_writes_detailed(NO_FINDINGS, [], 8)
+        second = runner.plan_writes_detailed(NO_FINDINGS, [], 8)
+
+    assert [w.title for w in first.planned_writes][:1] == ["接口超时排查复盘"]
+    assert len(fake.prompts) == 2
+    _assert_nothing_was_cached(runner.fs_store.root, first, second)
+    assert SYNTHETIC_KEY not in caplog.text
+    assert SYNTHETIC_KEY not in json.dumps(first.diagnostics.to_dict(), ensure_ascii=False)
+    (refusal,) = [r.getMessage() for r in caplog.records if "Reply not cached" in r.getMessage()][:1]
+    assert refusal.endswith(f"): a credential shape is in the reply ({kind}). The next identical batch asks again.")
+
+
+def test_an_item_the_privacy_gate_did_not_refuse_keeps_its_own_reason(
+    tmp_path: Path, heuristic_planner_forbidden: None
+):
+    """The control for the case above: a credential in a dropped item's title is not what dropped it.
+
+    So the cache cannot learn about that credential from the plan's drop reasons; it has to
+    read the reply itself.
+    """
+    runner = _api_runner(tmp_path)
+    runner._call_chat_completion = _ReplyModel(
+        {
+            "planned_writes": [
+                _doc(with_summary=True),
+                {"target_kind": "note", "action": "create", "title": f"未知类型 {SYNTHETIC_KEY}", "summary": "摘要"},
+            ]
+        }
+    )
+
+    outcome = runner.plan_writes_detailed(NO_FINDINGS, [], 8)
+
+    (dropped,) = outcome.diagnostics.dropped_items
+    assert dropped["index"] == 1 and dropped["reasons"] == ["UNSUPPORTED_TARGET_KIND: note"]
+    assert outcome.diagnostics.cache_file is None
+
+
+def test_a_cache_file_from_before_the_cache_refused_credentials_is_discarded_not_served(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    """A file written before this rule is not served, and does not stay on the disk."""
+    runner = _api_runner(tmp_path)
+    runner._call_chat_completion = _FakeModel([_doc(with_summary=True)])
+    cached = runner.plan_writes_detailed(NO_FINDINGS, [], 8)
+    (cache_file,) = (runner.fs_store.root / "api_cache").glob("p03_plan-*.json")
+    assert cached.diagnostics.cache_file == cache_file.name
+
+    # The file a reply the gate refused part of left behind.
+    cache_file.write_text(json.dumps(MIXED_REPLY, ensure_ascii=False), encoding="utf-8")
+    asked = _FakeModel([_doc(with_summary=True)])
+    runner._call_chat_completion = asked
+    with caplog.at_level(logging.WARNING, logger=RUN_LOGGER):
+        again = runner.plan_writes_detailed(NO_FINDINGS, [], 8)
+
+    assert len(asked.prompts) == 1  # the file was not served
+    assert [w.title for w in again.planned_writes] == ["接口超时排查复盘"]
+    assert again.diagnostics.cache_hit is False  # and is not reported as a hit
+    assert json.loads(cache_file.read_text(encoding="utf-8")) == {"planned_writes": [_doc(with_summary=True)]}
+    assert SYNTHETIC_KEY not in cache_file.read_text(encoding="utf-8")
+    assert SYNTHETIC_KEY not in caplog.text
+    (discarded,) = [r.getMessage() for r in caplog.records if "Cached reply discarded" in r.getMessage()]
+    assert discarded == (
+        f"Cached reply discarded ({cache_file.name}): a credential shape is in it "
+        "(OpenAI/Anthropic API Key). The run asks again."
+    )
 
 
 # ---------------------------------------------------------------- no template Skills

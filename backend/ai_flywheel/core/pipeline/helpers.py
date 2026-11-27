@@ -2,14 +2,16 @@
 
 Everything here is deterministic: normalisation of a review's mistake and dissent
 candidates, the two-track promotion rule, routing validation for a knowledge
-document, the knowledge documents a batch leaves out because their sessions were
-written up by hand, and the payload a half-done P04 batch leaves behind. Nothing in
+document, the plan items a batch leaves out because of what the client declared about
+the sessions behind them, and the payload a half-done P04 batch leaves behind. Nothing in
 this module writes knowledge documents, observations, dissents or Skills — the stage
 that calls a helper owns the side effect.
 """
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Collection
+from dataclasses import dataclass, field
 from typing import Any
 
 from ai_flywheel.adapters.knowledge import KnowledgeSinkAdapter
@@ -308,54 +310,124 @@ def partial_write_payload(
 
 # ---------------- P03 / P04: sessions the client hand-distilled ----------------
 
-#: Status and reason P04 puts on the receipt of an approved document it did not write.
+#: Status and reason P04 puts on the receipt of an approved document it did not write,
+#: because the sessions behind it had their knowledge written up by hand.
 GOVERNANCE_ONLY_SKIP_STATUS = "SKIPPED_GOVERNANCE_ONLY"
 GOVERNANCE_ONLY_SKIP_REASON = "governance_only_session"
+#: The same for any approved item behind a session taken out of distillation entirely
+#: (``hand_distilled`` with ``governance_only=false``): such a session produces nothing.
+HAND_DISTILLED_SKIP_STATUS = "SKIPPED_HAND_DISTILLED"
+HAND_DISTILLED_SKIP_REASON = "hand_distilled_skip_session"
+#: The same for an approved item of a batch that admitted no session at all: nothing was
+#: reviewed, so nothing stands behind it.
+NO_SESSION_STATUS = "SKIPPED_NO_SESSION"
+NO_SESSION_REASON = "no_session_admitted"
+
+#: Status and wording of the receipt P04 leaves for an approved item it did not write.
+ITEM_LEFT_OUT_RECEIPTS: dict[str, tuple[str, str]] = {
+    HAND_DISTILLED_SKIP_REASON: (
+        HAND_DISTILLED_SKIP_STATUS,
+        "会话已被声明 hand_distilled skip（完全跳过），本批不产出任何内容",
+    ),
+    NO_SESSION_REASON: (
+        NO_SESSION_STATUS,
+        "本批没有准入任何会话，该项没有可依托的送审会话，未写入",
+    ),
+}
 
 
-def filter_governance_only_docs(
+@dataclass
+class HandDistilledPlan:
+    """A plan after what may not be written was read out of it, by the declarations on record."""
+
+    kept: list[PlannedWrite] = field(default_factory=list)
+    #: Knowledge documents not written: the client wrote their knowledge up by hand.
+    documents_left_out: list[dict[str, Any]] = field(default_factory=list)
+    #: Items of any kind not written: a session taken out of distillation is behind them, or
+    #: the batch admitted no session to stand behind them.
+    items_left_out: list[dict[str, Any]] = field(default_factory=list)
+    #: Items citing a session that is not in the batch — a key the planner misspelt, or one
+    #: it made up. Reported, never trusted to stand for a session of the batch.
+    unknown_source_keys: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _left_out(write: PlannedWrite, sources: list[str], reason_code: str, *, with_kind: bool = False) -> dict[str, Any]:
+    """What the node payload and the audit trail record about an item that was not written."""
+    return {
+        "title": write.title,
+        **({"target_kind": write.target_kind} if with_kind else {}),
+        "relative_path": write.relative_path,
+        "action": write.action,
+        "source_session_keys": sources,
+        "reason_code": reason_code,
+    }
+
+
+def filter_hand_distilled_plan(
     planned_writes: list[PlannedWrite],
-    governance_only_keys: set[str] | frozenset[str],
+    *,
+    governance_only_keys: Collection[str],
+    taken_out_keys: Collection[str],
     admitted_keys: list[str],
-) -> tuple[list[PlannedWrite], list[dict[str, Any]]]:
-    """Take the knowledge documents a batch may not write out of a plan.
+) -> HandDistilledPlan:
+    """Take what a batch may not write out of a plan. Nothing is written here.
 
-    A session declared ``hand_distilled`` had its knowledge written up by the client
-    itself and was queued for its rules, mistakes and dissents only. A knowledge
-    document is therefore dropped when every session it cites is such a session, or
-    when it cites none and the whole batch is governance-only. Everything else —
-    rules, Skill plans, a document that also speaks for an ordinary session — is
-    exactly what those sessions were queued for and stays.
+    Two kinds of session are read out of the database by the caller:
 
-    Returns the plan that remains and, per dropped document, what the node payload
-    and the audit trail record about it. Nothing is written here.
+    * one declared ``hand_distilled`` with ``governance_only`` had its knowledge written
+      by the client itself. It is queued for its rules, mistakes and dissents, so only a
+      knowledge document is left out when every session of the batch that stands behind
+      the document is such a session.
+    * one taken out of distillation entirely produces nothing: an item of any kind — a
+      document, a rule, a Skill plan — is left out when such sessions are all that stand
+      behind it.
+
+    Which sessions stand behind an item is read strictly. A cited key that names no session
+    of the batch is taken off the item and reported, never taken for a session of its own:
+    under the older reading a misspelt key made a document look like it spoke for an
+    ordinary session, and the document of a hand-distilled batch was written. And when
+    every session the batch admitted is hand-distilled, there is no ordinary session a
+    document could speak for, so every knowledge document is left out whatever it cites.
+    A batch that admitted nothing leaves every item out: nothing was reviewed, so no item
+    has a session to stand on.
     """
     admitted = [str(key) for key in dict.fromkeys(admitted_keys)]
     governance = {str(key) for key in governance_only_keys}
-    all_governance = bool(admitted) and all(key in governance for key in admitted)
-    kept: list[PlannedWrite] = []
-    skipped: list[dict[str, Any]] = []
+    taken_out = {str(key) for key in taken_out_keys}
+    hand_written = governance | taken_out
+    # A declared session counts by its declaration even when the batch did not admit it.
+    known = set(admitted) | hand_written
+    whole_batch_hand_written = bool(admitted) and all(key in hand_written for key in admitted)
+    whole_batch_taken_out = bool(admitted) and all(key in taken_out for key in admitted)
+
+    result = HandDistilledPlan()
     for write in planned_writes:
-        if write.target_kind != "knowledge_doc":
-            kept.append(write)
-            continue
         sources = [str(key) for key in write.source_session_keys]
-        hand_written = (
-            all(key in governance for key in sources) if sources else all_governance
-        )
-        if not hand_written:
-            kept.append(write)
+        unknown = [key for key in sources if key not in known]
+        if unknown:
+            result.unknown_source_keys.append(
+                {"title": write.title, "target_kind": write.target_kind, "source_session_keys": sources, "unknown_source_keys": unknown}
+            )
+            # Taken off the item: what it cites must be a session of the batch, whole. The
+            # declaration of a cited session counts even when the batch did not admit it:
+            # the batch does not admit such sessions, and an item that cites one is still theirs.
+            write.source_session_keys = [key for key in sources if key in known]
+        standing = [str(key) for key in write.source_session_keys]
+        only_taken_out = all(key in taken_out for key in standing) if standing else whole_batch_taken_out
+        if only_taken_out:
+            result.items_left_out.append(_left_out(write, sources, HAND_DISTILLED_SKIP_REASON, with_kind=True))
             continue
-        skipped.append(
-            {
-                "title": write.title,
-                "relative_path": write.relative_path,
-                "action": write.action,
-                "source_session_keys": sources,
-                "reason_code": GOVERNANCE_ONLY_SKIP_REASON,
-            }
-        )
-    return kept, skipped
+        if not admitted:
+            result.items_left_out.append(_left_out(write, sources, NO_SESSION_REASON, with_kind=True))
+            continue
+        if write.target_kind == "knowledge_doc" and (
+            whole_batch_hand_written
+            or (bool(standing) and all(key in hand_written for key in standing))
+        ):
+            result.documents_left_out.append(_left_out(write, sources, GOVERNANCE_ONLY_SKIP_REASON))
+            continue
+        result.kept.append(write)
+    return result
 
 
 def governance_only_skip_receipt(skipped_doc: dict[str, Any]) -> dict[str, Any]:
@@ -369,4 +441,26 @@ def governance_only_skip_receipt(skipped_doc: dict[str, Any]) -> dict[str, Any]:
         "reason_code": GOVERNANCE_ONLY_SKIP_REASON,
         "reason": "会话已由客户端手工沉淀，知识文档不重复写入",
         "source_session_keys": [str(key) for key in skipped_doc.get("source_session_keys") or []],
+    }
+
+
+def left_out_item_receipt(skipped_item: dict[str, Any]) -> dict[str, Any]:
+    """The write receipt P04 leaves for an approved item it did not write, saying which kind.
+
+    ``reason_code`` is the one the plan filter recorded for the item (see
+    ``filter_hand_distilled_plan``): a session taken out of distillation, or a batch that
+    admitted no session.
+    """
+    reason_code = str(skipped_item.get("reason_code") or HAND_DISTILLED_SKIP_REASON)
+    status, reason = ITEM_LEFT_OUT_RECEIPTS.get(reason_code, ITEM_LEFT_OUT_RECEIPTS[HAND_DISTILLED_SKIP_REASON])
+    return {
+        "relative_path": skipped_item.get("relative_path"),
+        "title": skipped_item.get("title"),
+        "target_kind": skipped_item.get("target_kind"),
+        "status": status,
+        "skipped": True,
+        "written": False,
+        "reason_code": reason_code,
+        "reason": reason,
+        "source_session_keys": [str(key) for key in skipped_item.get("source_session_keys") or []],
     }

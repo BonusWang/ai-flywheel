@@ -642,16 +642,19 @@ export interface AutomationsSnapshot {
     cron_error: string | null
     // When this process came up, and how a scheduled fire it was not awake for is
     // handled: how late a batch may still run, whether the recovery loop catches a
-    // lost one up, and whether today's fire is still outstanding. `scheduled_today`
-    // is the fire `missed_today` is about and `catchup_window_until` the moment the
-    // recovery loop stops catching it up. Optional because an older backend does
-    // not send them.
+    // lost one up, and whether the latest fire is still outstanding. `scheduled_today`
+    // is the fire `missed_today` is about — today's latest, or yesterday's while its
+    // grace window is still open — and `catchup_window_until` the moment the recovery
+    // loop stops catching it up. `catchup_run_id` is the batch the recovery loop
+    // started for a lost fire, when it started one. Optional because an older backend
+    // does not send them.
     started_at?: string | null
     misfire_grace_seconds?: number
     catchup_missed_schedule?: boolean
     missed_today?: boolean
     scheduled_today?: string | null
     catchup_window_until?: string | null
+    catchup_run_id?: string | null
   }
   metrics: {
     today_date: string

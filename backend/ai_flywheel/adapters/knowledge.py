@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -34,9 +35,64 @@ from ai_flywheel.storage.fs_store import file_sha256
 FTS_PARTITION_IDS = {"entities", "topics", "sources", "comparisons", "synthesis", "projects"}
 EXCLUDED_STATUSES = {"archived", "deprecated", "retired", "snapshot", "placeholder", "process_data"}
 
+# How many times a domain increment is merged when the page keeps changing under it. A page
+# edited by a person, an editor that rewrites files, or another Flywheel process changes
+# every now and then, not several times within one merge.
+MERGE_ATTEMPTS = 3
+
+# One lock per target page, for the threads of this process. Keyed by the page's resolved path.
+_PAGE_LOCKS: dict[str, Any] = {}
+_PAGE_LOCKS_GUARD = threading.Lock()
+
 
 class KnowledgeWriteError(ValueError):
     """Raised when a knowledge write violates allowed prefixes, path traversal, or read-back checks."""
+
+
+class _PageChangedUnderMerge(Exception):
+    """The page on disk is no longer the page a merge was computed on.
+
+    Internal to the write path: caught by the merge loop, which merges again on the page
+    that is there now. Nothing has been written when it is raised.
+    """
+
+
+def _page_write_lock(target: Path) -> Any:
+    """The lock of one target page, shared by every thread of this process.
+
+    A merge reads a page, computes, and replaces it. Two merges of the same page running
+    at once would both read the first page and the later one would overwrite the other's
+    result, so they take turns.
+    """
+    key = os.path.normcase(str(target))
+    with _PAGE_LOCKS_GUARD:
+        return _PAGE_LOCKS.setdefault(key, threading.RLock())
+
+
+def _read_page_base(target: Path) -> tuple[str, str] | None:
+    """The page as it is on disk — its text, and the SHA-256 of the bytes read — from one read.
+
+    ``None`` when there is no page. The text is read exactly as the Wiki gate reads a
+    domain page (UTF-8, undecodable bytes replaced, line ends normalised). The digest is
+    taken over the same bytes, so it names the page the text came from and no other:
+    read in two steps, an edit landing between them would give a digest that does not
+    belong to the text, and a merge computed on the text would then pass as current.
+    """
+    try:
+        raw = target.read_bytes() if target.is_file() else None
+    except OSError:
+        return None
+    if raw is None:
+        return None
+    text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    return text, hashlib.sha256(raw).hexdigest()
+
+
+def _on_disk_sha256(target: Path) -> str:
+    """The SHA-256 of the page's bytes right now; ``ABSENT`` when there is no page."""
+    if not target.exists():
+        return "ABSENT"
+    return hashlib.sha256(target.read_bytes()).hexdigest()
 
 
 class KnowledgeSinkAdapter:
@@ -341,12 +397,68 @@ class KnowledgeSinkAdapter:
         moment, never written over it. The merged page goes through the same gates as
         any other document. An increment the page already holds writes nothing and
         returns a receipt marked ``UPDATE_NO_NEW_CONTENT``.
+
+        The merge reads, computes and replaces under one lock per target page, and it
+        replaces only the page it read: when the page on disk turns out to have changed
+        in between — a person's edit, an editor that rewrites files, another process —
+        nothing is written, and the increment is merged again into the page that is
+        there now, gates included. A page that keeps changing is left as it is and the
+        write fails; it is never overwritten with a merge of an older page.
         """
         target = self._safe_resolve(relative_path)
         rel = relative_path.replace("\\", "/").lstrip("/")
-        merge_receipt: dict[str, Any] | None = None
         if merge_increment:
-            content, merge_receipt = self._merge_domain_increment(rel, content)
+            with _page_write_lock(target):
+                return self._write_domain_increment(
+                    target=target,
+                    rel=rel,
+                    increment=content,
+                    action=action,
+                    sync_fts=sync_fts,
+                    sync_practice_index=sync_practice_index,
+                    approved_side_effects=approved_side_effects,
+                )
+        return self._commit_document(
+            target=target,
+            rel=rel,
+            content=self._prepare_document(rel, content),
+            action=action,
+            sync_fts=sync_fts,
+            sync_practice_index=sync_practice_index,
+            approved_side_effects=approved_side_effects,
+        )
+
+    @staticmethod
+    def _prepare_document(rel: str, content: str) -> str:
+        """The document as it is written: private spans redacted, no credential, LF line ends."""
+        # v3 write-time privacy & secret leak gate (<private> redaction + refuseSecrets)
+        content = sanitize_and_check_secrets(content, context=f"knowledge_doc:{rel}")
+        # LF-only documents: a Windows write must never introduce CRLF into an
+        # LF-governed Wiki, so the line endings are normalised before the gate sees it.
+        return content.replace("\r\n", "\n")
+
+    def _write_domain_increment(
+        self,
+        *,
+        target: Path,
+        rel: str,
+        increment: str,
+        action: str,
+        sync_fts: bool,
+        sync_practice_index: bool,
+        approved_side_effects: list[dict[str, object]] | None,
+    ) -> dict[str, Any]:
+        """Merge ``increment`` into the page at ``target`` and replace the page. The page lock is held.
+
+        Each attempt reads the page once (text and digest together), merges on that text,
+        and commits against that digest. A page that changed after the read is not written:
+        the attempt starts over on the page that is there now.
+        """
+        for attempt in range(1, MERGE_ATTEMPTS + 1):
+            base = _read_page_base(target)
+            if base is None:
+                raise KnowledgeWriteError(f"Domain update target is missing, nothing to merge into: {rel}")
+            content, merge_receipt = self._merge_domain_increment(rel, increment, existing=base[0])
             if merge_receipt is None:
                 return {
                     "relative_path": rel,
@@ -356,12 +468,41 @@ class KnowledgeSinkAdapter:
                     "written": False,
                     "reason": "增量内容均已存在于目标页，没有新增实质内容",
                 }
-        # v3 write-time privacy & secret leak gate (<private> redaction + refuseSecrets)
-        content = sanitize_and_check_secrets(content, context=f"knowledge_doc:{rel}")
-        # LF-only documents: a Windows write must never introduce CRLF into an
-        # LF-governed Wiki, so the line endings are normalised before the gate sees it.
-        content = content.replace("\r\n", "\n")
+            try:
+                receipt = self._commit_document(
+                    target=target,
+                    rel=rel,
+                    content=self._prepare_document(rel, content),
+                    action=action,
+                    sync_fts=sync_fts,
+                    sync_practice_index=sync_practice_index,
+                    approved_side_effects=approved_side_effects,
+                    expected_preimage_sha256=base[1],
+                )
+            except _PageChangedUnderMerge:
+                continue
+            if attempt > 1:
+                merge_receipt = {**merge_receipt, "remerged": attempt - 1}
+            receipt["merge"] = merge_receipt
+            return receipt
+        raise KnowledgeWriteError(
+            f"Domain page kept changing under the merge, nothing was written and the page was "
+            f"left as it is: {rel}"
+        )
 
+    def _commit_document(
+        self,
+        *,
+        target: Path,
+        rel: str,
+        content: str,
+        action: str,
+        sync_fts: bool,
+        sync_practice_index: bool,
+        approved_side_effects: list[dict[str, object]] | None,
+        expected_preimage_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        """Write a prepared document: the practice-index transaction, then the document itself."""
         registration = (
             self._plan_practice_index_registration(rel, content)
             if sync_practice_index
@@ -383,6 +524,7 @@ class KnowledgeSinkAdapter:
                     action=action,
                     sync_fts=sync_fts,
                     registration=registration,
+                    expected_preimage_sha256=expected_preimage_sha256,
                 )
         else:
             receipt = self._write_document_transaction(
@@ -392,20 +534,23 @@ class KnowledgeSinkAdapter:
                 action=action,
                 sync_fts=sync_fts,
                 registration=registration,
+                expected_preimage_sha256=expected_preimage_sha256,
             )
-        if merge_receipt is not None:
-            receipt["merge"] = merge_receipt
         return receipt
 
-    def _merge_domain_increment(self, rel: str, increment: str) -> tuple[str, dict[str, Any] | None]:
+    def _merge_domain_increment(
+        self, rel: str, increment: str, *, existing: str | None = None
+    ) -> tuple[str, dict[str, Any] | None]:
         """Merge an increment into the project-domain page at ``rel`` as it is on disk.
 
+        ``existing`` is the page as the caller read it; without it the page is read here.
         Returns the merged page and what the merge did, or ``(page, None)`` when the page
         already holds everything the increment says. Raises when the increment cannot
         enter the page without loss, or when it carries a credential: a configuration
         page is read by the strict privacy check here as it was at planning time.
         """
-        existing = self.wiki_gate.read_domain_page(rel)
+        if existing is None:
+            existing = self.wiki_gate.read_domain_page(rel)
         if existing is None:
             raise KnowledgeWriteError(f"Domain update target is missing, nothing to merge into: {rel}")
         template = self.wiki_gate.domain_page_template(rel, existing)
@@ -447,7 +592,11 @@ class KnowledgeSinkAdapter:
         action: str,
         sync_fts: bool,
         registration: PracticeIndexRegistration | None,
+        expected_preimage_sha256: str | None = None,
     ) -> dict[str, Any]:
+        """Write one document and verify it. Raises `_PageChangedUnderMerge` before anything
+        is written when ``expected_preimage_sha256`` is given and the page is no longer the
+        page ``content`` was computed from."""
         gate_result = self.wiki_gate.validate_document(rel, content)
         if gate_result.applicable and not gate_result.ok:
             self.wiki_gate.write_artifact(
@@ -468,6 +617,10 @@ class KnowledgeSinkAdapter:
         )
         if action == "update" and _is_unchanged(preimage_bytes, content):
             raise KnowledgeWriteError(f"Update action produced no content change on {rel}")
+        if expected_preimage_sha256 is not None and preimage_sha != expected_preimage_sha256:
+            # A merge of a page that is no longer on disk: written now, it would overwrite
+            # whatever changed the page. Nothing has been written.
+            raise _PageChangedUnderMerge(rel)
 
         index_target: Path | None = None
         index_preimage: bytes | None = None
@@ -503,6 +656,10 @@ class KnowledgeSinkAdapter:
 
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
+            if expected_preimage_sha256 is not None and _on_disk_sha256(target) != expected_preimage_sha256:
+                # Read once more right before the replace: the index write above took time.
+                # The index goes back to what it was along with this document's not being written.
+                raise _PageChangedUnderMerge(rel)
             _atomic_write_text(target, content)
         except Exception:
             if index_written and index_target is not None:

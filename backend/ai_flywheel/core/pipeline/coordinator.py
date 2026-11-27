@@ -56,13 +56,15 @@ from ai_flywheel.core.pipeline.constants import (
 from ai_flywheel.core.pipeline.events import EventBroker
 from ai_flywheel.core.pipeline.git_commit import commit_p04_written_files
 from ai_flywheel.core.pipeline.helpers import (
+    HandDistilledPlan,
     apply_route_decision,
     candidate_dissents,
     candidate_mistakes,
     domain_signal_names,
     eligible_promotions,
-    filter_governance_only_docs,
+    filter_hand_distilled_plan,
     governance_only_skip_receipt,
+    left_out_item_receipt,
     partial_write_payload,
     promote_observation,
     route_knowledge_doc,
@@ -73,11 +75,13 @@ from ai_flywheel.core.policies import PolicyEngine
 from ai_flywheel.core.queue_service import (
     DISTILL_MODE_GOVERNANCE_ONLY,
     DISTILL_MODE_SKIPPED,
+    HAND_DISTILLED_SKIP,
     DistillQueueService,
 )
 from ai_flywheel.models import (
     CreateRuleRequest,
     DistillQueueItem,
+    INCIDENT_APPROVAL_REASON,
     INCIDENT_PAGE_TYPE,
     NodeExecution,
     NodeStatus,
@@ -88,6 +92,7 @@ from ai_flywheel.models import (
     SessionRecord,
     SessionStatus,
     WorkflowRunRecord,
+    is_incident_write,
     is_sensitive_write,
     utc_now_iso,
 )
@@ -95,6 +100,27 @@ from ai_flywheel.storage.db import FlywheelDB
 from ai_flywheel.storage.fs_store import ImmutableFileStore
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_approval_mode(cfg: FlywheelConfig, auto_approve_override: bool | None = None) -> str:
+    """The approval mode a batch really runs with: ``smart``, ``always`` or ``auto``.
+
+    The one answer every entry shares — the configured mode, the CLI flag, the portal's
+    request and the background trigger all come through here, so none of them can run a
+    batch under a mode another would have refused.
+
+    ``None`` leaves the configured mode in force, read as ``effective_approval_mode``
+    reads it. ``False`` asks for a human every time. ``True`` asks for ``auto``, and the
+    safety valve has the last word on that: with ``safety_valves.auto_approve_writes``
+    off the batch runs ``smart`` — it is held for a human where a human is needed, never
+    waved through. Which is exactly what the configured ``auto`` comes to under the same
+    valve.
+    """
+    if auto_approve_override is False:
+        return "always"
+    if auto_approve_override is True:
+        return "auto" if cfg.safety_valves.auto_approve_writes else "smart"
+    return cfg.effective_approval_mode
 
 
 def _facade_module() -> Any:
@@ -183,10 +209,24 @@ class WorkflowOrchestrator(RecoveryMixin):
         approval_mode: str,
         high_write_threshold: int = 6,
     ) -> tuple[bool, list[str]]:
-        if not planned_writes or approval_mode == "auto":
+        """Whether a batch stops for a human before anything is written, and the reasons it shows.
+
+        ``always`` stops for every batch and ``smart`` for the sensitive ones. ``auto``
+        releases routine writes without asking — and nothing else: an incident card is a
+        record of what went wrong and why, and it is held for a human under ``auto`` as it
+        is under every other mode. An approval mode is not a licence to write one unseen.
+        """
+        if not planned_writes:
             return False, []
         if approval_mode == "always":
             return True, [f"当前为每次人工审批模式（共 {len(planned_writes)} 项）"]
+        if approval_mode == "auto":
+            forced = [
+                write.approval_reason or INCIDENT_APPROVAL_REASON
+                for write in planned_writes
+                if is_incident_write(write)
+            ]
+            return bool(forced), forced
         # Smart mode: routine notes & trial rules auto-pass; only Skill creation/updates, high-risk, or large batches pause
         reasons: list[str] = []
         for w in planned_writes:
@@ -383,6 +423,91 @@ class WorkflowOrchestrator(RecoveryMixin):
         current = self._distill_modes(session_keys)
         return [key for key, mode in current.items() if mode in modes]
 
+    # ---------------- sessions the client hand-distilled ----------------
+
+    def _taken_out_of_distillation(self, session_key: str) -> bool:
+        """Whether the session is declared ``hand_distilled`` with ``governance_only=false`` right now.
+
+        Read from the database on every call: the declaration can be made at any moment,
+        including while a batch that named this session is already between P00 and P01.
+        Such a session produces nothing — no document, no rule, no Skill, no mistake or
+        dissent — so it is not admitted in the first place. Only an explicit enqueue,
+        which makes a new declaration, takes it back.
+        """
+        return self._distill_modes([session_key]).get(session_key) == DISTILL_MODE_SKIPPED
+
+    def _leave_out_hand_distilled(
+        self,
+        run: WorkflowRunRecord,
+        items: list[PlannedWrite],
+        *,
+        actor: str,
+        documents_summary: str,
+        items_summary: str,
+        report_unknown_keys: bool = True,
+    ) -> tuple[HandDistilledPlan, set[str]]:
+        """Take what may not be written out of ``items``, by the declarations in the database.
+
+        Every declaration is read from the database here and nowhere else — not from P01
+        or P02: a client may declare a session hand-distilled while a batch that admitted
+        it is waiting for approval. A document whose knowledge was written by hand is left
+        out; so is an item of any kind behind a session taken out of distillation, or of a
+        batch that admitted no session. What was left out goes to the audit trail. This
+        never fails a node: a plan left with nothing to write is an empty plan, not an
+        unavailable one.
+
+        Returns the filtered plan and the sessions currently taken out of distillation,
+        for the candidates P02 found.
+        """
+        cited = [str(key) for item in items for key in item.source_session_keys]
+        modes = self._distill_modes([*run.admitted_sessions, *cited])
+        governance = {key for key, mode in modes.items() if mode == DISTILL_MODE_GOVERNANCE_ONLY}
+        taken_out = {key for key, mode in modes.items() if mode == DISTILL_MODE_SKIPPED}
+        plan = filter_hand_distilled_plan(
+            items,
+            governance_only_keys=governance,
+            taken_out_keys=taken_out,
+            admitted_keys=run.admitted_sessions,
+        )
+        if plan.documents_left_out:
+            self.db.append_audit_event(
+                entity_type="workflow_run",
+                entity_id=run.run_id,
+                event_type="governance_only_wiki_skipped",
+                actor=actor,
+                summary=f"{len(plan.documents_left_out)} {documents_summary}",
+                payload={
+                    "skipped_docs": plan.documents_left_out,
+                    "governance_only_session_keys": sorted(governance | taken_out),
+                },
+            )
+        if plan.items_left_out:
+            self.db.append_audit_event(
+                entity_type="workflow_run",
+                entity_id=run.run_id,
+                event_type="plan_items_left_out",
+                actor=actor,
+                summary=f"{len(plan.items_left_out)} {items_summary}",
+                payload={
+                    "items": plan.items_left_out,
+                    "taken_out_session_keys": sorted(taken_out),
+                    "admitted_session_keys": list(run.admitted_sessions),
+                },
+            )
+        if report_unknown_keys and plan.unknown_source_keys:
+            self.db.append_audit_event(
+                entity_type="workflow_run",
+                entity_id=run.run_id,
+                event_type="plan_item_unknown_source_keys",
+                actor=actor,
+                summary=(
+                    f"{len(plan.unknown_source_keys)} 项计划引用了不在本批送审会话中的来源键，"
+                    "已剥离，不作为来源采信"
+                ),
+                payload={"items": plan.unknown_source_keys, "admitted_session_keys": list(run.admitted_sessions)},
+            )
+        return plan, taken_out
+
     @staticmethod
     def _reviewed_session(sess: SessionRecord, item: DistillQueueItem) -> SessionRecord:
         """The session as P02 reviews it: carrying the structured brief its queue item holds.
@@ -446,12 +571,8 @@ class WorkflowOrchestrator(RecoveryMixin):
         resolved_phase = self.resolve_phase(phase)
         if resolved_phase == "both" and not self.cfg.workflow.friday_weekly_enabled:
             resolved_phase = "daily"
-        if auto_approve_override is True:
-            init_approval_mode = "auto"
-        elif auto_approve_override is False:
-            init_approval_mode = "always"
-        else:
-            init_approval_mode = self.cfg.effective_approval_mode
+        # The one reading of the approval mode, for this record, the gate below and every entry.
+        init_approval_mode = resolve_approval_mode(self.cfg, auto_approve_override)
         run = WorkflowRunRecord(
             run_id=run_id,
             trigger=trigger,
@@ -471,6 +592,19 @@ class WorkflowOrchestrator(RecoveryMixin):
             summary=f"启动批次（阶段={resolved_phase}，审批模式={init_approval_mode}）",
             payload={"phase": resolved_phase, "approval_mode": init_approval_mode, "runner": runner_mode},
         )
+        if auto_approve_override is True and init_approval_mode != "auto":
+            # Said out loud, not only visible in the mode: the request asked for `auto`.
+            self.db.append_audit_event(
+                entity_type="workflow_run",
+                entity_id=run_id,
+                event_type="auto_approve_vetoed",
+                actor="safety_valve",
+                summary=(
+                    "请求自动放行被安全阀否决（auto_approve_writes=false），"
+                    "本批按 smart 审批：敏感写入与事故卡仍需人工确认"
+                ),
+                payload={"requested": "auto", "effective": init_approval_mode},
+            )
         self._emit_run("run_started", run)
 
         active_node = "P00_PREPARE"
@@ -570,14 +704,34 @@ class WorkflowOrchestrator(RecoveryMixin):
             claimed_queue_ids: list[str] = []
             admitted: list[tuple[SessionRecord, str]] = []
             used_chars = 0
+            taken_out_sessions: list[str] = []
+            taken_out_queue_ids: list[str] = []
+
+            def session_taken_out(session_key: str) -> bool:
+                """Record a session the client took out of distillation, and say whether it was."""
+                if not self._taken_out_of_distillation(session_key):
+                    return False
+                if session_key not in taken_out_sessions:
+                    taken_out_sessions.append(session_key)
+                return True
+
             if queue_ids:
                 # An explicit queue_ids batch jumps the line: claim exactly those items.
+                # Naming an item is not the explicit enqueue that takes a session back:
+                # one of a session taken out of distillation is left where it is.
                 for qid in dict.fromkeys(str(q) for q in queue_ids if str(q).strip()):
                     item = self.db.get_queue_item(qid)
                     if item is None:
                         continue
                     sess = self.db.get_session(item.session_key)
                     if sess is None:
+                        continue
+                    if session_taken_out(item.session_key):
+                        if item.status is QueueStatus.QUEUED:
+                            # Left in the queue by a run that ended after the declaration:
+                            # it gets the end state the declaration gives it, not another claim.
+                            self.queue.on_hand_distilled_skip(item.session_key, actor="p01_begin")
+                            taken_out_queue_ids.append(item.queue_id)
                         continue
                     text = self.queue.load_queue_item_text(item)
                     if used_chars + len(text) > max_chars and admitted:
@@ -590,8 +744,11 @@ class WorkflowOrchestrator(RecoveryMixin):
                     claimed_queue_ids.append(item.queue_id)
             elif session_keys:
                 # Explicit session_keys keep the historical admission path; any queued
-                # item of an admitted session is claimed along with it.
+                # item of an admitted session is claimed along with it. A session taken
+                # out of distillation is not admitted, named or not: it produces nothing.
                 for sess in selected_sessions[:max_sess]:
+                    if session_taken_out(sess.session_key):
+                        continue
                     text = self.sessions.load_session_text(sess, max_chars=24000)
                     if used_chars + len(text) > max_chars and admitted:
                         break
@@ -619,6 +776,13 @@ class WorkflowOrchestrator(RecoveryMixin):
                     sess = self.db.get_session(item.session_key)
                     if sess is None:
                         continue
+                    if session_taken_out(item.session_key):
+                        # Only a run that ended after the declaration leaves a queued item
+                        # of such a session behind. It is excluded here as the declaration
+                        # would have excluded it, instead of being claimed or left to wait.
+                        self.queue.on_hand_distilled_skip(item.session_key, actor="p01_begin")
+                        taken_out_queue_ids.append(item.queue_id)
+                        continue
                     text = self.queue.load_queue_item_text(item)
                     if used_chars + len(text) > max_chars and admitted:
                         break
@@ -636,7 +800,7 @@ class WorkflowOrchestrator(RecoveryMixin):
                     for sess in selected_sessions[:max_sess]:
                         if sess.opt_out:
                             continue
-                        if self.queue.distill_mode_of(sess) == DISTILL_MODE_SKIPPED:
+                        if session_taken_out(sess.session_key):
                             continue
                         text = self.sessions.load_session_text(sess, max_chars=24000)
                         if used_chars + len(text) > max_chars and admitted:
@@ -657,18 +821,52 @@ class WorkflowOrchestrator(RecoveryMixin):
                 if governance_only_keys
                 else ""
             )
+            taken_out_note = (
+                f"，{len(taken_out_sessions)} 个会话已声明 hand_distilled skip（完全跳过），未准入"
+                if taken_out_sessions
+                else ""
+            )
+            if taken_out_sessions:
+                self.db.append_audit_event(
+                    entity_type="workflow_run",
+                    entity_id=run.run_id,
+                    event_type="hand_distilled_skip_not_admitted",
+                    actor="p01_begin",
+                    summary=(
+                        f"{len(taken_out_sessions)} 个会话已声明 hand_distilled skip（完全跳过），"
+                        "未准入，本批不产出其任何内容"
+                    ),
+                    payload={
+                        "session_keys": list(taken_out_sessions),
+                        "excluded_queue_ids": list(taken_out_queue_ids),
+                    },
+                )
             self._finish_node(
                 run,
                 "P01_BEGIN",
                 t0,
                 summary=(
                     f"独占锁已获取，准入 {len(admitted)} 个会话单元（共 {used_chars} 字符）"
-                    f"{queue_note}{governance_note}"
+                    f"{queue_note}{governance_note}{taken_out_note}"
                 ),
                 internal_checks=[
                     {"name": "独占锁持有核验", "status": "PASS"},
                     {"name": "预算与字符上限准入", "status": "PASS", "detail": {"chars": used_chars, "limit": max_chars}},
                     {"name": "队列项认领与 run 绑定", "status": "PASS", "detail": {"claimed": len(claimed_queue_ids)}},
+                    *(
+                        [
+                            {
+                                "name": "已声明完全跳过会话的准入排除",
+                                "status": "PASS",
+                                "detail": {
+                                    "session_keys": list(taken_out_sessions),
+                                    "excluded_queue_ids": len(taken_out_queue_ids),
+                                },
+                            }
+                        ]
+                        if taken_out_sessions
+                        else []
+                    ),
                 ],
                 payload={
                     "admitted_sessions": run.admitted_sessions,
@@ -678,9 +876,12 @@ class WorkflowOrchestrator(RecoveryMixin):
                     # reviewed in full, but P03 writes no knowledge document for it.
                     "distill_modes": distill_modes,
                     "governance_only_session_keys": governance_only_keys,
+                    # Sessions named or due for this batch that were taken out of distillation, and so not admitted.
+                    "hand_distilled_skipped_session_keys": list(taken_out_sessions),
+                    "hand_distilled_excluded_queue_ids": list(taken_out_queue_ids),
                 },
             )
-            self._publish_queue_update("p01_claim", run.run_id, claimed_queue_ids)
+            self._publish_queue_update("p01_claim", run.run_id, claimed_queue_ids + taken_out_queue_ids)
 
             # ---------------- P02 REVIEW ----------------
             active_node = "P02_REVIEW"
@@ -827,11 +1028,12 @@ class WorkflowOrchestrator(RecoveryMixin):
             # plan is not trusted: a knowledge document that speaks only for such sessions is
             # taken out here, deterministically, before it is routed or can reach the approval
             # card. Its rules, Skill plans, mistakes and dissents are what it was queued for.
+            # A session taken out of distillation entirely (`governance_only=false`) is one
+            # step further: it is not admitted, and whatever the plan still puts behind it —
+            # a document, a rule, a Skill plan — is taken out too.
             # The declaration is read again rather than taken from P01/P02: it may have been
             # made while this batch was already running. This never fails the node: a plan
-            # left with nothing to write is an empty plan, not an unavailable one. A session
-            # taken out entirely (`governance_only=false`) counts the same way: its knowledge
-            # was written by hand too.
+            # left with nothing to write is an empty plan, not an unavailable one.
             governance_only_keys = sorted(
                 {
                     *self._declared_keys(
@@ -841,26 +1043,18 @@ class WorkflowOrchestrator(RecoveryMixin):
                     *(review_findings.get("governance_only_session_keys") or []),
                 }
             )
-            planned_writes, governance_only_skipped = filter_governance_only_docs(
-                planned_writes, set(governance_only_keys), run.admitted_sessions
+            hand_plan, _taken_out_sessions = self._leave_out_hand_distilled(
+                run,
+                planned_writes,
+                actor="p03_plan",
+                documents_summary="篇笔记所属会话已由客户端手工沉淀，仅做治理提炼，未列入写入计划",
+                items_summary="项计划所属会话已被声明 hand_distilled skip（完全跳过），或本批未准入任何会话，未列入写入计划",
             )
+            planned_writes = hand_plan.kept
+            governance_only_skipped = hand_plan.documents_left_out
+            taken_out_skipped = hand_plan.items_left_out
             if not self.knowledge.wiki_gate.applicable:
                 plan_info.kept_count = len(planned_writes)
-            if governance_only_skipped:
-                self.db.append_audit_event(
-                    entity_type="workflow_run",
-                    entity_id=run.run_id,
-                    event_type="governance_only_wiki_skipped",
-                    actor="p03_plan",
-                    summary=(
-                        f"{len(governance_only_skipped)} 篇笔记所属会话已由客户端手工沉淀，"
-                        f"仅做治理提炼，未列入写入计划"
-                    ),
-                    payload={
-                        "skipped_docs": governance_only_skipped,
-                        "governance_only_session_keys": governance_only_keys,
-                    },
-                )
             # On a schema-governed Wiki every knowledge_doc is routed before it is adapted: the planner's
             # declaration, validated against workspace and draft evidence and never corrected, says whether
             # it is written and where. A document without a consistent route is dropped here and surfaced
@@ -1061,6 +1255,12 @@ class WorkflowOrchestrator(RecoveryMixin):
                 if governance_only_skipped
                 else ""
             )
+            taken_out_note = (
+                f"；{len(taken_out_skipped)} 项计划所属会话已被声明 hand_distilled skip（完全跳过）"
+                f"或本批未准入任何会话，未列入计划"
+                if taken_out_skipped
+                else ""
+            )
             self._finish_node(
                 run,
                 "P03_ROUTE_PLAN",
@@ -1069,7 +1269,7 @@ class WorkflowOrchestrator(RecoveryMixin):
                     f"计划来源：{PLAN_SOURCE_LABELS.get(plan_info.source, plan_info.source)}；"
                     f"查重比对 {len(existing_rules)} 条规则与 {len(existing_skills)} 个技能，"
                     f"整理出 {len(planned_writes)} 项建议（含 {skill_plans} 项 Skill 封装/优化）"
-                    f"{dropped_note}{unrouted_note}{capacity_note}{domain_note}{incident_note}{deferred_note}{governance_note}"
+                    f"{dropped_note}{unrouted_note}{capacity_note}{domain_note}{incident_note}{deferred_note}{governance_note}{taken_out_note}"
                 ),
                 internal_checks=[
                     {"name": "规则与技能查重", "status": "PASS"},
@@ -1112,6 +1312,20 @@ class WorkflowOrchestrator(RecoveryMixin):
                     *(
                         [
                             {
+                                "name": "无送审会话或已声明完全跳过会话的计划项排除",
+                                "status": "PASS",
+                                "detail": {
+                                    "taken_out_session_keys": sorted(_taken_out_sessions),
+                                    "items": len(taken_out_skipped),
+                                },
+                            }
+                        ]
+                        if taken_out_skipped
+                        else []
+                    ),
+                    *(
+                        [
+                            {
                                 "name": "知识文档路由校验",
                                 "status": "PASS",
                                 "detail": {
@@ -1143,16 +1357,17 @@ class WorkflowOrchestrator(RecoveryMixin):
                     "governance_only_session_keys": governance_only_keys,
                     "governance_only_skipped_docs": governance_only_skipped,
                     "governance_only_wiki_skipped": len(governance_only_skipped),
+                    # Plan items of every kind left out: their sessions were taken out of
+                    # distillation entirely (hand_distilled skip), or the batch admitted nothing.
+                    "taken_out_session_keys": sorted(_taken_out_sessions),
+                    "items_left_out": taken_out_skipped,
+                    "plan_item_unknown_source_keys": hand_plan.unknown_source_keys,
                 },
             )
 
-            # Check Approval Gate (supports smart | always | auto)
-            if auto_approve_override is True:
-                effective_mode = "auto"
-            elif auto_approve_override is False:
-                effective_mode = "always"
-            else:
-                effective_mode = self.cfg.effective_approval_mode
+            # Check Approval Gate (supports smart | always | auto). The mode is the one this
+            # batch was started under — valve and all — not a second reading of the request.
+            effective_mode = init_approval_mode
 
             should_pause, pause_reasons = self._needs_manual_approval(
                 planned_writes,
@@ -1517,33 +1732,6 @@ class WorkflowOrchestrator(RecoveryMixin):
                 raise RuntimeError("Simulated P04 write verification failure")
 
             approved_items = [w for w in run.planned_writes if w.approved]
-            # The plan may have waited hours for approval. A session declared hand-distilled
-            # in that time has had its knowledge written up by hand since: its document is
-            # not written a second time, and the receipt says why.
-            approved_items, governance_only_skipped = filter_governance_only_docs(
-                approved_items,
-                set(
-                    self._declared_keys(
-                        run.admitted_sessions,
-                        frozenset({DISTILL_MODE_GOVERNANCE_ONLY, DISTILL_MODE_SKIPPED}),
-                    )
-                ),
-                run.admitted_sessions,
-            )
-            write_receipts: list[dict[str, Any]] = [
-                governance_only_skip_receipt(doc) for doc in governance_only_skipped
-            ]
-            if governance_only_skipped:
-                self.db.append_audit_event(
-                    entity_type="workflow_run",
-                    entity_id=run.run_id,
-                    event_type="governance_only_wiki_skipped",
-                    actor="p04_write",
-                    summary=(
-                        f"{len(governance_only_skipped)} 篇已批准笔记所属会话在等待审批期间被声明手工沉淀，未写入"
-                    ),
-                    payload={"skipped_docs": governance_only_skipped},
-                )
             p02_payload = self._get_node(run, "P02_REVIEW").payload
             if not isinstance(p02_payload, dict):
                 p02_payload = {}
@@ -1553,6 +1741,65 @@ class WorkflowOrchestrator(RecoveryMixin):
             dissent_candidates = [
                 c for c in (p02_payload.get("candidate_dissents") or []) if isinstance(c, dict)
             ]
+            # The plan may have waited hours for approval. A session declared hand-distilled
+            # in that time has had its knowledge written up by hand since: its document is
+            # not written a second time, and the receipt says why. A session taken out of
+            # distillation entirely in that time produces nothing at all: no document, no
+            # rule, no Skill plan, and not the mistake or the dissent the review found in it.
+            # The declarations are read again here, from the database — not taken from P03.
+            hand_plan, taken_out_sessions = self._leave_out_hand_distilled(
+                run,
+                approved_items,
+                actor="p04_write",
+                documents_summary="篇已批准笔记所属会话在等待审批期间被声明手工沉淀，未写入",
+                items_summary=(
+                    "项已批准计划所属会话在等待审批期间被声明 hand_distilled skip（完全跳过），"
+                    "或本批未准入任何会话，未写入"
+                ),
+            )
+            approved_items = hand_plan.kept
+            governance_only_skipped = list(hand_plan.documents_left_out)
+            taken_out_skipped = list(hand_plan.items_left_out)
+
+            def candidate_left_out(candidate: dict[str, Any]) -> bool:
+                """Whether no session of the batch stands behind a mistake or a dissent.
+
+                Its session was taken out of distillation, or the batch admitted nothing.
+                A candidate the review did not attribute to a session is left out only when
+                every session of the batch is gone: it may still speak for one that remains.
+                """
+                if not run.admitted_sessions:
+                    return True
+                key = str(candidate.get("session_key") or "")
+                if key:
+                    return key in taken_out_sessions
+                return all(admitted in taken_out_sessions for admitted in run.admitted_sessions)
+
+            mistakes_left_out = sum(1 for c in mistake_candidates if candidate_left_out(c))
+            dissents_left_out = sum(1 for c in dissent_candidates if candidate_left_out(c))
+            mistake_candidates = [c for c in mistake_candidates if not candidate_left_out(c)]
+            dissent_candidates = [c for c in dissent_candidates if not candidate_left_out(c)]
+            write_receipts: list[dict[str, Any]] = [
+                governance_only_skip_receipt(doc) for doc in governance_only_skipped
+            ] + [left_out_item_receipt(item) for item in taken_out_skipped]
+            if mistakes_left_out or dissents_left_out:
+                # What P02 found in such a session is not persisted either.
+                self.db.append_audit_event(
+                    entity_type="workflow_run",
+                    entity_id=run.run_id,
+                    event_type="review_candidates_left_out",
+                    actor="p04_write",
+                    summary=(
+                        f"{mistakes_left_out + dissents_left_out} 条审查候选（错题 {mistakes_left_out}、"
+                        f"分歧 {dissents_left_out}）所属会话已被声明 hand_distilled skip，未入池"
+                    ),
+                    payload={
+                        "mistakes": mistakes_left_out,
+                        "dissents": dissents_left_out,
+                        "taken_out_session_keys": sorted(taken_out_sessions),
+                        "admitted_session_keys": list(run.admitted_sessions),
+                    },
+                )
             approved_physical_paths = self._validate_p04_knowledge_scope(approved_items)
             persisted_observations: list[dict[str, Any]] = []
             index_error: Exception | None = None
@@ -1585,6 +1832,28 @@ class WorkflowOrchestrator(RecoveryMixin):
                     )
                 for item in approved_items:
                     self._ensure_lock(run)  # synchronous checkpoint before each write
+                    # The declaration is read once more, right before this item is written.
+                    # A session may have been declared hand-distilled while the items ahead
+                    # of it were being written: what was left out on entering P04 was read
+                    # then, and this item has been approved for hours.
+                    late_plan, _ = self._leave_out_hand_distilled(
+                        run,
+                        [item],
+                        actor="p04_write",
+                        documents_summary="篇已批准笔记所属会话在写入前被声明手工沉淀，未写入",
+                        items_summary=(
+                            "项已批准计划所属会话在写入前被声明 hand_distilled skip（完全跳过），未写入"
+                        ),
+                        report_unknown_keys=False,
+                    )
+                    if not late_plan.kept:
+                        if late_plan.items_left_out:
+                            taken_out_skipped.extend(late_plan.items_left_out)
+                            write_receipts.append(left_out_item_receipt(late_plan.items_left_out[0]))
+                        else:
+                            governance_only_skipped.extend(late_plan.documents_left_out)
+                            write_receipts.append(governance_only_skip_receipt(late_plan.documents_left_out[0]))
+                        continue
                     if item.target_kind == "knowledge_doc":
                         if not item.relative_path:
                             raise ValueError(
@@ -1781,6 +2050,17 @@ class WorkflowOrchestrator(RecoveryMixin):
                         else ""
                     )
                     + (
+                        f"；{len(taken_out_skipped)} 项计划因所属会话已被声明 hand_distilled skip（完全跳过）"
+                        f"或本批未准入任何会话，未写入"
+                        if taken_out_skipped
+                        else ""
+                    )
+                    + (
+                        f"；{mistakes_left_out + dissents_left_out} 条审查候选因所属会话已被声明完全跳过，未入池"
+                        if mistakes_left_out or dissents_left_out
+                        else ""
+                    )
+                    + (
                         f"；错题观察池入池 {len(persisted_observations)} 条"
                         if persisted_observations
                         else ""
@@ -1810,6 +2090,21 @@ class WorkflowOrchestrator(RecoveryMixin):
                             "dissents": len(dissent_candidates),
                         },
                     },
+                    *(
+                        [
+                            {
+                                "name": "无送审会话或已声明完全跳过会话的写入排除",
+                                "status": "PASS",
+                                "detail": {
+                                    "items": len(taken_out_skipped),
+                                    "mistakes": mistakes_left_out,
+                                    "dissents": dissents_left_out,
+                                },
+                            }
+                        ]
+                        if taken_out_skipped or mistakes_left_out or dissents_left_out
+                        else []
+                    ),
                     *(
                         [
                             {
@@ -1854,6 +2149,19 @@ class WorkflowOrchestrator(RecoveryMixin):
                         if governance_only_skipped
                         else {}
                     ),
+                    # Approved items of every kind not written: their sessions were taken out of
+                    # distillation entirely, or the batch admitted nothing. Each says why.
+                    **({"items_left_out": taken_out_skipped} if taken_out_skipped else {}),
+                    **(
+                        {
+                            "review_candidates_left_out": {
+                                "mistakes": mistakes_left_out,
+                                "dissents": dissents_left_out,
+                            }
+                        }
+                        if mistakes_left_out or dissents_left_out
+                        else {}
+                    ),
                     **({"merged_domain_pages": merged_domain_pages} if merged_domain_pages else {}),
                     "persisted_observation_ids": [
                         str(o.get("obs_id")) for o in persisted_observations if o.get("obs_id")
@@ -1885,15 +2193,38 @@ class WorkflowOrchestrator(RecoveryMixin):
             else:
                 reviewed_keys = set(run.admitted_sessions)
             # Settle the queue items P01 claimed: reviewed -> processed (and the
-            # consumption watermark moves), everything else returns to the queue.
+            # consumption watermark moves), everything else returns to the queue. A session
+            # taken out of distillation is a third case: its item is neither settled as
+            # distilled nor left waiting. It ends `excluded (HAND_DISTILLED_SKIP)`, the
+            # state the declaration gives every other unconsumed item of the session.
+            taken_out_sessions = {
+                key
+                for key, mode in self._distill_modes(run.admitted_sessions).items()
+                if mode == DISTILL_MODE_SKIPPED
+            }
             settled_queue_ids: list[str] = []
             requeued_queue_ids: list[str] = []
+            excluded_queue_ids: list[str] = []
             for qid in dict.fromkeys(self._claimed_queue_ids(run)):
                 self._ensure_lock(run)  # synchronous checkpoint before each settlement
                 item = self.db.get_queue_item(qid)
                 if item is None or item.status is not QueueStatus.PROCESSING:
                     continue
-                if item.session_key in reviewed_keys:
+                if item.session_key in taken_out_sessions:
+                    self.db.update_queue_item_status(
+                        qid,
+                        QueueStatus.EXCLUDED,
+                        run_id=run.run_id,
+                        actor="p05_settle",
+                        exclude_reason_code=HAND_DISTILLED_SKIP,
+                        exclude_reason_detail=(
+                            "hand-distilled by the client while the batch ran: nothing was distilled"
+                        ),
+                        reason_code=HAND_DISTILLED_SKIP,
+                        summary="session taken out of distillation before this item was settled",
+                    )
+                    excluded_queue_ids.append(qid)
+                elif item.session_key in reviewed_keys:
                     self.db.update_queue_item_status(
                         qid,
                         QueueStatus.PROCESSED,
@@ -1925,13 +2256,21 @@ class WorkflowOrchestrator(RecoveryMixin):
                     )
                     requeued_queue_ids.append(qid)
             self._publish_queue_update(
-                "p05_settle", run.run_id, settled_queue_ids + requeued_queue_ids
+                "p05_settle", run.run_id, settled_queue_ids + requeued_queue_ids + excluded_queue_ids
             )
             settled_sessions: list[str] = []
             returned_sessions: list[str] = []
             deferred_sessions: list[str] = []
+            # A session taken out of distillation is not settled as distilled — that status
+            # says the flywheel reviewed it and wrote up what it found. It is closed: nothing
+            # more will be distilled from it unless the client enqueues it again.
+            skipped_sessions = [sk for sk in run.admitted_sessions if sk in taken_out_sessions]
             for sk in run.admitted_sessions:
                 self._ensure_lock(run)  # synchronous checkpoint before each settlement
+                if sk in taken_out_sessions:
+                    self.db.update_session_status(sk, SessionStatus.ARCHIVED)
+                    # Not counted as settled: the flywheel did not review it and write up what it found.
+                    continue
                 if sk not in reviewed_keys:
                     self.db.update_session_status(sk, SessionStatus.PENDING)
                     returned_sessions.append(sk)
@@ -1965,7 +2304,8 @@ class WorkflowOrchestrator(RecoveryMixin):
             queue_settle_note = (
                 f"，队列结算 {len(settled_queue_ids)} 条"
                 + (f"、退回 {len(requeued_queue_ids)} 条" if requeued_queue_ids else "")
-                if settled_queue_ids or requeued_queue_ids
+                + (f"、排除 {len(excluded_queue_ids)} 条（会话已声明完全跳过）" if excluded_queue_ids else "")
+                if settled_queue_ids or requeued_queue_ids or excluded_queue_ids
                 else ""
             )
             deferred_note = (
@@ -1973,6 +2313,27 @@ class WorkflowOrchestrator(RecoveryMixin):
                 if deferred_sessions
                 else ""
             )
+            taken_out_note = (
+                f"、{len(skipped_sessions)} 个会话已声明 hand_distilled skip（未沉淀，队列项标记 excluded）"
+                if skipped_sessions
+                else ""
+            )
+            if skipped_sessions:
+                self.db.append_audit_event(
+                    entity_type="workflow_run",
+                    entity_id=run.run_id,
+                    event_type="hand_distilled_skip_settled",
+                    actor="p05_settle",
+                    summary=(
+                        f"{len(skipped_sessions)} 个会话已声明 hand_distilled skip（完全跳过），"
+                        f"未按沉淀结算；{len(excluded_queue_ids)} 条队列项标记 excluded"
+                    ),
+                    payload={
+                        "session_keys": list(skipped_sessions),
+                        "excluded_queue_ids": list(excluded_queue_ids),
+                        "reason_code": HAND_DISTILLED_SKIP,
+                    },
+                )
             self._finish_node(
                 run,
                 "P05_SETTLE",
@@ -1985,6 +2346,7 @@ class WorkflowOrchestrator(RecoveryMixin):
                         else ""
                     )
                     + deferred_note
+                    + taken_out_note
                     + f"，关闭 {settled_retros} 条待复盘项"
                     + f"，核心索引卡已刷新（{core_card_info['lines']} 行）{queue_settle_note}{dream_note}"
                 ),
@@ -1996,6 +2358,7 @@ class WorkflowOrchestrator(RecoveryMixin):
                         "detail": {
                             "settled": len(settled_queue_ids),
                             "requeued": len(requeued_queue_ids),
+                            **({"excluded": len(excluded_queue_ids)} if excluded_queue_ids else {}),
                         },
                     },
                     {"name": "待复盘项结算", "status": "PASS", "detail": {"resolved_retros": settled_retros}},
@@ -2008,6 +2371,9 @@ class WorkflowOrchestrator(RecoveryMixin):
                     "deferred_sessions": deferred_sessions,
                     "settled_queue_ids": settled_queue_ids,
                     "requeued_queue_ids": requeued_queue_ids,
+                    "excluded_queue_ids": excluded_queue_ids,
+                    # Admitted sessions the client took out of distillation while the batch ran.
+                    "hand_distilled_skipped_sessions": skipped_sessions,
                     "settled_retro_count": settled_retros,
                     "created_rules": created_rules,
                     "core_card": {"path": core_card_info["path"], "lines": core_card_info["lines"]},
@@ -2027,6 +2393,11 @@ class WorkflowOrchestrator(RecoveryMixin):
                 + (
                     f"（{len(returned_sessions)} 段未审查，退回队列）"
                     if returned_sessions
+                    else ""
+                )
+                + (
+                    f"（另 {len(skipped_sessions)} 段已声明 hand_distilled skip，未沉淀）"
+                    if skipped_sessions
                     else ""
                 ),
                 f"- **沉淀笔记**：{', '.join(f'`{p}`' for p in written_paths) if written_paths else '无新增'}",

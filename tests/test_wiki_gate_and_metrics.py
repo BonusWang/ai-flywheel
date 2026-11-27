@@ -1249,6 +1249,117 @@ def test_a_section_the_page_lacks_takes_its_place_in_template_order():
     assert (stranger.ok, stranger.problems) == (False, ["小节「性能备注」不在目标页中，也不是页面模板声明的小节"])
 
 
+# One page, two environments, each with a parameter table of its own.
+ENV_PAGE = textwrap.dedent(
+    """\
+    ---
+    title: 迁移参数
+    description: SIT 与 UAT 的迁移任务参数
+    type: project-config
+    project_id: alpha
+    created: 2026-11-20
+    updated: 2026-11-20
+    status: active
+    ---
+
+    # 迁移参数
+
+    ## SIT
+
+    | 参数 | 值 |
+    | --- | --- |
+    | timeout | 30 |
+    | host | sit-db |
+
+    ## UAT
+
+    | 参数 | 值 |
+    | --- | --- |
+    | retries | 3 |
+
+    ## 坑与边界
+
+    - 迁移窗口内停止写入。
+    """
+)
+ENV_SECTIONS = ["SIT", "UAT", "坑与边界"]
+ENV_TIMEOUT_ROW = "## UAT\n\n| timeout | 30 |\n"
+
+
+def test_a_row_another_section_holds_is_still_added_to_its_own_section():
+    """SIT and UAT share a parameter. A row SIT's table holds is not one UAT's table holds: reading the whole page as one table would swallow it for UAT."""
+    merge = merge_domain_increment(ENV_PAGE, ENV_TIMEOUT_ROW, template_sections=ENV_SECTIONS, today="2026-11-28")
+    again = merge_domain_increment(merge.merged, ENV_TIMEOUT_ROW, template_sections=ENV_SECTIONS, today="2026-11-28")
+
+    assert (merge.ok, merge.has_additions, merge.duplicates) == (True, True, 0)
+    assert merge.merged == ENV_PAGE.replace(
+        "| retries | 3 |\n", "| retries | 3 |\n| timeout | 30 |\n"
+    ).replace("updated: 2026-11-20", "updated: 2026-11-28")
+    sit, uat = merge.merged.split("## SIT\n")[1].split("## UAT\n")
+    assert sit.count("| timeout | 30 |") == 1 and uat.count("| timeout | 30 |") == 1
+    # Merging the same increment again changes nothing: the row is one UAT now holds.
+    assert (again.ok, again.has_additions, again.duplicates) == (True, False, 1)
+    assert again.merged == merge.merged
+
+
+@pytest.mark.parametrize(
+    "held",
+    [
+        pytest.param("- 迁移前先停写入。\n", id="list-item"),
+        pytest.param("迁移前先停写入。\n", id="paragraph"),
+        pytest.param("```bash\nflyway migrate\n```\n", id="code-block"),
+    ],
+)
+def test_a_line_another_section_holds_is_still_added_to_its_own_section(held: str):
+    page = ENV_PAGE.replace(
+        "## 坑与边界\n\n- 迁移窗口内停止写入。\n", f"## 坑与边界\n\n- 迁移窗口内停止写入。\n\n{held}"
+    )
+    increment = f"## UAT\n\n{held}"
+
+    merge = merge_domain_increment(page, increment, template_sections=ENV_SECTIONS)
+    again = merge_domain_increment(merge.merged, increment, template_sections=ENV_SECTIONS)
+
+    assert (merge.ok, merge.has_additions, merge.duplicates) == (True, True, 0)
+    assert held.strip() in merge.merged.split("## UAT\n")[1].split("## 坑与边界")[0]
+    assert merge.merged.count(held.strip()) == 2  # once where it was, once in UAT
+    assert (again.ok, again.has_additions, again.duplicates) == (True, False, 1)
+    assert again.merged == merge.merged
+
+
+def test_what_the_target_section_itself_holds_is_still_not_written_twice():
+    row = merge_domain_increment(ENV_PAGE, "## SIT\n\n| timeout | 30 |\n", template_sections=ENV_SECTIONS)
+    pitfall = merge_domain_increment(ENV_PAGE, "## 坑与边界\n\n- 迁移窗口内停止写入。\n", template_sections=ENV_SECTIONS)
+    block_page = ENV_PAGE.replace(
+        "## 坑与边界\n\n- 迁移窗口内停止写入。\n",
+        "## 坑与边界\n\n- 迁移窗口内停止写入。\n\n```bash\nflyway migrate\n```\n",
+    )
+    block = merge_domain_increment(block_page, "## 坑与边界\n\n```bash\nflyway migrate\n```\n", template_sections=ENV_SECTIONS)
+
+    for merge in (row, pitfall, block):
+        assert (merge.ok, merge.has_additions, merge.added, merge.duplicates) == (True, False, 0, 1)
+
+
+def test_a_row_is_read_against_the_table_it_joins():
+    """A section with a request table and a response table: a field the request table holds is still news for the response table."""
+    page = ENV_PAGE.replace(
+        "## UAT\n\n| 参数 | 值 |\n| --- | --- |\n| retries | 3 |\n",
+        "## UAT\n\n### 请求\n\n| 字段 | 类型 |\n| --- | --- |\n| id | string |\n\n"
+        "### 响应\n\n| 字段 | 类型 |\n| --- | --- |\n| ok | boolean |\n",
+    )
+    increment = "## UAT\n\n| 字段 | 类型 |\n| --- | --- |\n| id | string |\n"
+
+    merge = merge_domain_increment(page, increment, template_sections=ENV_SECTIONS)
+    again = merge_domain_increment(merge.merged, increment, template_sections=ENV_SECTIONS)
+
+    assert (merge.ok, merge.has_additions, merge.duplicates) == (True, True, 0)
+    assert merge.merged.split("## UAT\n")[1].split("## 坑与边界")[0] == (
+        "\n### 请求\n\n| 字段 | 类型 |\n| --- | --- |\n| id | string |\n\n"
+        "### 响应\n\n| 字段 | 类型 |\n| --- | --- |\n| ok | boolean |\n| id | string |\n\n"
+    )
+    assert (again.ok, again.has_additions, again.duplicates) == (True, False, 1)
+    assert again.merged == merge.merged
+
+
 def test_preserves_existing_reads_every_meaningful_line_in_order():
     page = "---\ntitle: orders\nupdated: 2026-11-20\n---\n\n## 字段语义表\n\n| id | bigint |\n\n## 坑与边界\n\n无\n"
 
@@ -1333,6 +1444,37 @@ def test_rows_the_page_already_holds_are_not_written_twice(tmp_path: Path):
     assert (result["merge"]["duplicates_removed"], result["merge"]["added_lines"]) == (1, 1)
 
 
+def test_a_row_another_section_of_the_page_holds_is_written_into_its_own_section(tmp_path: Path):
+    """The 关联键 table already names customer_id. The 字段语义表 does not: its increment is real news there, and must be written, not read as a duplicate of the other table's row."""
+    rt = _deposit_runtime(tmp_path)
+    target = rt.knowledge.root / ORDERS_REL
+    keys_table = (
+        "## 关联键\n\n| 字段 | 类型 | 含义 | 备注 |\n| --- | --- | --- | --- |\n"
+        "| customer_id | bigint | 下单客户 | 关联 customers.customer_id |\n\n"
+    )
+    _put(target, ORDERS_PAGE.replace("## 坑与边界", keys_table + "## 坑与边界"))
+
+    result = rt.knowledge.write_document_verified(
+        ORDERS_REL, CUSTOMER_ROW, action="update", merge_increment=True
+    )
+
+    lines = target.read_text(encoding="utf-8").splitlines()
+    assert result["verified"] is True
+    assert (result["merge"]["added_lines"], result["merge"]["duplicates_removed"]) == (1, 0)
+    semantics = [line for line in lines[lines.index("## 字段语义表") : lines.index("## 关联键")] if line.strip()]
+    assert semantics[-2:] == [
+        "| id | bigint | 主键 | 自增 |",
+        "| customer_id | bigint | 下单客户 | 关联 customers.customer_id |",
+    ]
+    keys = lines[lines.index("## 关联键") : lines.index("## 坑与边界")]
+    assert keys.count("| customer_id | bigint | 下单客户 | 关联 customers.customer_id |") == 1
+    replay = rt.knowledge.write_document_verified(
+        ORDERS_REL, CUSTOMER_ROW, action="update", merge_increment=True
+    )
+    assert (replay["status"], replay["written"]) == (UPDATE_NO_NEW_CONTENT, False)
+    assert target.read_text(encoding="utf-8").splitlines() == lines
+
+
 def test_an_increment_the_page_already_holds_writes_nothing(tmp_path: Path):
     rt = _deposit_runtime(tmp_path)
     target = rt.knowledge.root / ORDERS_REL
@@ -1411,6 +1553,186 @@ def test_the_sink_merges_again_and_stops_when_the_result_cannot_be_trusted(
 
     assert str(exc.value).startswith(message)
     assert target.read_bytes() == before
+
+
+# ---- a page that changes under the merge
+
+
+STATUS_ROW = "## 字段语义表\n\n| status | varchar(32) | 订单状态 | PAID / CLOSED |\n"
+CUSTOMER_ROW = "## 字段语义表\n\n| customer_id | bigint | 下单客户 | 关联 customers.customer_id |\n"
+# Somebody else's edit of the same page: a row the table gains and the first pitfall.
+EXTERNAL_EDIT = (
+    "## 字段语义表\n\n| channel | varchar(16) | 下单渠道 | mini / h5 |\n\n"
+    "## 坑与边界\n\n- 分库键只认 customer_id。\n"
+)
+
+
+def _page_after(text: str, increment: str) -> str:
+    return merge_domain_increment(text, increment, template_sections=TABLE_SECTIONS, today=shanghai_today_ymd()).merged
+
+
+def test_a_page_edited_after_the_merge_was_computed_is_merged_again_never_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The merge is computed, and before the page is replaced somebody else edits it (a person, an editor that rewrites files, another process). The write must not put a merge of the older page over that edit: it merges again into the page that is there now, so the edit and the increment both land."""
+    import hashlib
+
+    from ai_flywheel.adapters import knowledge as knowledge_module
+
+    rt = _deposit_runtime(tmp_path)
+    target = rt.knowledge.root / ORDERS_REL
+    real_merge = knowledge_module.merge_domain_increment
+    merged_on: list[str] = []
+    gated: list[str] = []
+    real_validate = rt.knowledge.wiki_gate.validate_document
+
+    def merge_while_someone_edits(existing: str, increment: str, **kwargs: object):
+        merge = real_merge(existing, increment, **kwargs)
+        if not merged_on:  # once: the edit lands after the first merge and before its write
+            merged_on.append(existing)
+            target.write_bytes(_page_after(ORDERS_PAGE, EXTERNAL_EDIT).encode("utf-8"))
+        return merge
+
+    def validate(rel: str, content: str, *args: object, **kwargs: object):
+        gated.append(content)
+        return real_validate(rel, content, *args, **kwargs)
+
+    monkeypatch.setattr(knowledge_module, "merge_domain_increment", merge_while_someone_edits)
+    monkeypatch.setattr(rt.knowledge.wiki_gate, "validate_document", validate)
+
+    result = rt.knowledge.write_document_verified(ORDERS_REL, STATUS_ROW, action="update", merge_increment=True)
+
+    edited = _page_after(ORDERS_PAGE, EXTERNAL_EDIT)
+    edited_bytes = edited.encode("utf-8")
+    final = target.read_text(encoding="utf-8")
+    # The first merge was computed on the page as it was before the edit.
+    assert merged_on == [ORDERS_PAGE]
+    assert len(gated) == 2 and "| channel | varchar(16) | 下单渠道 | mini / h5 |" in gated[-1]
+    assert (result["verified"], result["merge"]["remerged"]) == (True, 1)
+    assert (result["merge"]["added_lines"], result["merge"]["duplicates_removed"]) == (1, 0)
+    # The write was made against the edited page, and the page holds the edit and the increment.
+    assert result["preimage_sha256"] == hashlib.sha256(edited_bytes).hexdigest()
+    assert final.count("| channel | varchar(16) | 下单渠道 | mini / h5 |") == 1
+    assert "- 分库键只认 customer_id。" in final
+    assert final.count("| status | varchar(32) | 订单状态 | PAID / CLOSED |") == 1
+    assert preserves_existing(edited, final) is True
+    assert preserves_existing(ORDERS_PAGE, final) is True
+
+
+def test_a_page_that_keeps_changing_under_the_merge_is_left_as_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Every merge is overtaken by another edit. None of them is written: the page ends as the last edit left it, and the write fails."""
+    from ai_flywheel.adapters import knowledge as knowledge_module
+    from ai_flywheel.adapters.knowledge import MERGE_ATTEMPTS
+
+    rt = _deposit_runtime(tmp_path)
+    target = rt.knowledge.root / ORDERS_REL
+    real_merge = knowledge_module.merge_domain_increment
+    merged_on: list[str] = []
+
+    def merge_while_someone_keeps_editing(existing: str, increment: str, **kwargs: object):
+        merge = real_merge(existing, increment, **kwargs)
+        merged_on.append(existing)
+        edited = existing.rstrip("\n") + f"\n- 外部备注 {len(merged_on)}：重建索引要避开高峰。\n"
+        target.write_bytes(edited.encode("utf-8"))
+        return merge
+
+    monkeypatch.setattr(knowledge_module, "merge_domain_increment", merge_while_someone_keeps_editing)
+
+    with pytest.raises(KnowledgeWriteError) as exc:
+        rt.knowledge.write_document_verified(ORDERS_REL, STATUS_ROW, action="update", merge_increment=True)
+
+    assert "kept changing under the merge" in str(exc.value)
+    assert len(merged_on) == MERGE_ATTEMPTS
+    final = target.read_text(encoding="utf-8")
+    assert final == merged_on[-1].rstrip("\n") + "\n- 外部备注 3：重建索引要避开高峰。\n"
+    assert [final.count(f"外部备注 {number}：") for number in (1, 2, 3)] == [1, 1, 1]
+    assert "| status | varchar(32) | 订单状态 | PAID / CLOSED |" not in final  # no stale merge reached the page
+
+
+def test_a_remerge_whose_result_cannot_be_trusted_leaves_the_edited_page_as_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The gates run again on the page as it is now. A second merge that cannot be trusted fails closed: the other person's edit stays, the increment is not written."""
+    from dataclasses import replace
+
+    from ai_flywheel.adapters import knowledge as knowledge_module
+
+    rt = _deposit_runtime(tmp_path)
+    target = rt.knowledge.root / ORDERS_REL
+    real_merge = knowledge_module.merge_domain_increment
+    calls: list[str] = []
+
+    def merge_then_an_edit_then_a_defect(existing: str, increment: str, **kwargs: object):
+        merge = real_merge(existing, increment, **kwargs)
+        calls.append(existing)
+        if len(calls) == 1:
+            target.write_bytes(_page_after(ORDERS_PAGE, EXTERNAL_EDIT).encode("utf-8"))
+            return merge
+        return replace(merge, merged=merge.merged.replace("| id | bigint | 主键 | 自增 |\n", ""))
+
+    monkeypatch.setattr(knowledge_module, "merge_domain_increment", merge_then_an_edit_then_a_defect)
+
+    with pytest.raises(KnowledgeWriteError) as exc:
+        rt.knowledge.write_document_verified(ORDERS_REL, STATUS_ROW, action="update", merge_increment=True)
+
+    assert str(exc.value).startswith("Domain merge would not preserve the existing page:")
+    assert len(calls) == 2  # the second merge read the edited page
+    assert target.read_text(encoding="utf-8") == _page_after(ORDERS_PAGE, EXTERNAL_EDIT)
+    assert "| status | varchar(32) | 订单状态 | PAID / CLOSED |" not in target.read_text(encoding="utf-8")
+
+
+def test_two_increments_for_the_same_page_written_at_once_both_land(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Two writes merge the same page from two threads. The first has computed its merge and not yet written; the second starts. Each must merge into the page the other left, or the later write silently drops the earlier one."""
+    import threading
+
+    from ai_flywheel.adapters import knowledge as knowledge_module
+
+    rt = _deposit_runtime(tmp_path)
+    target = rt.knowledge.root / ORDERS_REL
+    real_merge = knowledge_module.merge_domain_increment
+    first_computed = threading.Event()
+    second_computing = threading.Event()
+    release_first = threading.Event()
+
+    def gated_merge(existing: str, increment: str, **kwargs: object):
+        merge = real_merge(existing, increment, **kwargs)
+        if "customer_id" in increment:
+            first_computed.set()
+            assert release_first.wait(10)
+        else:
+            second_computing.set()
+        return merge
+
+    monkeypatch.setattr(knowledge_module, "merge_domain_increment", gated_merge)
+    outcomes: dict[str, object] = {}
+
+    def write(name: str, increment: str) -> None:
+        try:
+            outcomes[name] = rt.knowledge.write_document_verified(
+                ORDERS_REL, increment, action="update", merge_increment=True, sync_fts=False
+            )["merge"]["added_lines"]
+        except Exception as exc:  # reported by the assertions below
+            outcomes[name] = exc
+
+    first = threading.Thread(target=write, args=("first", CUSTOMER_ROW))
+    second = threading.Thread(target=write, args=("second", STATUS_ROW))
+    first.start()
+    assert first_computed.wait(10)
+    second.start()
+    second_computing.wait(0.5)  # without the page lock the second merge runs here, on the page as it was
+    release_first.set()
+    first.join(30)
+    second.join(30)
+
+    assert outcomes == {"first": 1, "second": 1}
+    final = target.read_text(encoding="utf-8")
+    assert final.count("| customer_id | bigint | 下单客户 | 关联 customers.customer_id |") == 1
+    assert final.count("| status | varchar(32) | 订单状态 | PAID / CLOSED |") == 1
+    assert preserves_existing(ORDERS_PAGE, final) is True
 
 
 def test_d2_postflight_failure_rolls_back_a_domain_increment_and_a_new_page(tmp_path: Path):

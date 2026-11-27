@@ -3802,28 +3802,35 @@ def test_a_closed_ledger_refuses_a_declared_incident_card_and_leaves_a_trace(tmp
 
 
 @pytest.mark.parametrize(
-    "approval_mode, valve, expected",
+    "approval_mode, valve, effective_mode",
     [
-        pytest.param("smart", False, RunStatus.AWAITING_APPROVAL, id="smart"),
-        pytest.param("always", False, RunStatus.AWAITING_APPROVAL, id="always"),
-        pytest.param("auto", False, RunStatus.AWAITING_APPROVAL, id="auto-vetoed-by-the-valve"),
-        pytest.param("auto", True, RunStatus.PASS, id="auto-with-the-valve-open"),
+        pytest.param("smart", False, "smart", id="smart"),
+        pytest.param("always", False, "always", id="always"),
+        pytest.param("auto", False, "smart", id="auto-vetoed-by-the-valve"),
+        pytest.param("auto", True, "auto", id="auto-with-the-valve-open"),
     ],
 )
 def test_an_incident_card_takes_the_gate_every_sensitive_write_takes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, approval_mode: str, valve: bool, expected: RunStatus
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    approval_mode: str,
+    valve: bool,
+    effective_mode: str,
 ):
-    """Under `smart` and `always` the card waits for a human; `auto` is the maintainer's explicit choice, with the valve's consent."""
+    """The card waits for a human under `smart`, `always` and `auto` alike.
+
+    The valve only decides which mode `auto` runs as; it never lets an incident card through.
+    """
     rt, _runner, key = _incident_run(
         tmp_path, monkeypatch, lambda key: [_incident_item(key)], approval_mode=approval_mode, valve=valve
     )
 
     run = rt.orchestrator.start_run(trigger="test", phase="daily", session_keys=[key])
 
-    assert run.status == expected, run.error
-    written = expected == RunStatus.PASS
-    assert ("awaiting_approval" in _audit_by_type(rt, run)) is not written
-    assert (_ledger_files(rt) == [_incident_rel()]) is written
-    if not written:
-        (reason,) = _audit_by_type(rt, run)["awaiting_approval"]["payload"]["reasons"]
-        assert reason == ("事故卡属于敏感写入，需人工确认后才会落盘" if approval_mode != "always" else "当前为每次人工审批模式（共 1 项）")
+    assert run.status == RunStatus.AWAITING_APPROVAL, run.error
+    assert run.approval_mode == effective_mode
+    assert _ledger_files(rt) == []
+    (reason,) = _audit_by_type(rt, run)["awaiting_approval"]["payload"]["reasons"]
+    assert reason == (
+        "当前为每次人工审批模式（共 1 项）" if approval_mode == "always" else "事故卡属于敏感写入，需人工确认后才会落盘"
+    )

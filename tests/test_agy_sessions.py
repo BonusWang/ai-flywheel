@@ -5,7 +5,10 @@
 2. 身份与标题：会话身份归一化为 `antigravity:<uuid>`，标题取第一条有效请求；
 3. 工作区：`Active Document` / 工作区声明与请求里写下的本地路径，未命中留空；
 4. 静默窗口：仍在写入的 transcript 不登记、不入队，静默之后由后续扫描补上；显式入队不受限；
-5. 兼容联调：Codex / Claude Code 解析不变，`read_full_transcript` → `prepare_queue_chunks` 可用。
+5. 兼容联调：Codex / Claude Code 解析不变，`read_full_transcript` → `prepare_queue_chunks` 可用；
+6. 容错：合法却不是一条记录的行（`null` / `[]` / 数字 / 截断的半行）被三个读取器一致跳过；
+7. 续聊：同一个 UUID 的 transcript 在消费之后继续增长，再次静默后只把新增的轮次补进队列，
+   会话既有的 opt_out / hand_distilled 意图不变。
 
 会话、项目、技能与模型名全部是虚构示例；路径全部由 pytest 的临时目录派生。
 """
@@ -24,6 +27,7 @@ import pytest
 from ai_flywheel.adapters.sessions import SessionAdapter, _extract_jsonl_text, read_transcript_excerpt
 from ai_flywheel.config import FlywheelConfig, ScanSourceConfig, SessionTriageConfig
 from ai_flywheel.core.queue_service import (
+    HAND_DISTILLED_SKIP,
     MAX_CHUNKS_PER_SESSION,
     QUIET_WINDOW_ACTIVE,
     prepare_queue_chunks,
@@ -42,7 +46,14 @@ from ai_flywheel.core.triage import (
     transcript_is_active,
     triage_session,
 )
-from ai_flywheel.models import IngressChannel, QueueStatus, SessionRecord, SessionStatus
+from ai_flywheel.models import (
+    IngressChannel,
+    QueueStatus,
+    RunStatus,
+    SessionRecord,
+    SessionStatus,
+    WorkflowRunRecord,
+)
 from ai_flywheel.runtime import FlywheelRuntime
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +67,10 @@ CLAUDE_TITLE = "部署报错排查"
 
 #: Antigravity 把每个会话记在 ``<brain>/<uuid>/.system_generated/logs/transcript.jsonl``。
 TRANSCRIPT_GLOB = "*/.system_generated/logs/transcript.jsonl"
+
+#: 扫盘采集一段 transcript 时在会话 metadata 里记下的标记：文件当时的修改时间与大小。
+SCANNED_MTIME = "scanned_mtime"
+SCANNED_SIZE = "scanned_size"
 
 ASK = "排查部署报错：连接池超时，请定位根因并给出修复方案。"
 ANSWER = "先看日志，再核对连接池上限；修复后重新部署，测试验收通过。"
@@ -971,3 +986,328 @@ def test_the_passive_flow_queues_the_quiet_conversation_and_never_sees_the_activ
     assert rt.db.get_session(active_key) is None
     assert rt.db.list_session_queue_items(active_key) == []
     assert rt.db.get_latest_queue_revision(active_key) == 0
+
+
+# ---------------------------------------------------------------- 6. 合法却不是记录的行
+
+#: 合法的 JSON，却不是一条对话记录：写到一半被截断的行、别的进程写进来的内容，或者就是一个空值。
+JUNK_LINES: tuple[tuple[str, str], ...] = (
+    ("truncated", '{"timestamp": "2026-01-01T09:00:00Z", "type": "message", "message": {"role": "user"'),
+    ("null", "null"),
+    ("empty-list", "[]"),
+    ("number-list", "[1, 2, 3]"),
+    ("number", "123"),
+    ("float", "4.5"),
+    ("true", "true"),
+    ("numeric-string", '"456"'),
+    ("empty-object", "{}"),
+    ("blank", "   "),
+)
+
+#: 三种 transcript：各自的干净记录、所在的目录与会话标识。
+TRANSCRIPTS = {
+    "antigravity": (_conversation(), Path("brain") / AGY_UUID_QUIET / ".system_generated" / "logs", AGY_UUID_QUIET),
+    "claude-code": (_claude_code_turns(Path("projects") / "demo"), Path("projects") / "demo", CLAUDE_UUID),
+    "codex": (_codex_lines(), Path("codex") / "archived_sessions", CODEX_UUID),
+}
+
+
+def _write_lines(path: Path, lines: Sequence[dict[str, Any] | str]) -> Path:
+    """Write ``lines`` as JSONL; a line that is already text is written as it is."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(
+            (line if isinstance(line, str) else json.dumps(line, ensure_ascii=False)) + "\n"
+            for line in lines
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    return path
+
+
+def _with_junk(lines: Sequence[dict[str, Any]], junk: str) -> list[dict[str, Any] | str]:
+    """``lines`` with one junk line first, one in the middle and one last."""
+    middle = len(lines) // 2
+    return [junk, *lines[:middle], junk, *lines[middle:], junk]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, [], [1, 2, 3], 123, 4.5, True, "456", {}, {"message": None}, {"message": []}],
+    ids=["none", "list", "list-of-numbers", "int", "float", "bool", "string", "object", "null-message", "list-message"],
+)
+def test_a_json_value_that_is_not_a_record_reads_as_no_text(value: Any):
+    """`json.loads` 认这些值，它们却不是一条记录：读出来是空文本，不是异常。"""
+    assert _extract_jsonl_text(value) == ""
+
+
+@pytest.mark.parametrize("client", sorted(TRANSCRIPTS))
+@pytest.mark.parametrize("junk", [line for _, line in JUNK_LINES], ids=[name for name, _ in JUNK_LINES])
+def test_a_valid_json_line_that_is_not_a_record_changes_no_reading(tmp_path: Path, client: str, junk: str):
+    """夹着这种行的 transcript，三个读取器读出来与干净的逐字相同，入队的也是同一份对话。"""
+    rt = _runtime(tmp_path)
+    lines, folder, session_id = TRANSCRIPTS[client]
+    clean = _write_lines(tmp_path / folder / "clean.jsonl", lines)
+    mixed = _write_lines(tmp_path / folder / "mixed.jsonl", _with_junk(lines, junk))
+    _age(clean, 901)
+    _age(mixed, 901)
+
+    expected = read_full_transcript(clean)
+    assert ASK in expected and ANSWER in expected
+    assert "TOOL-DUMP-LINE" not in expected
+
+    assert read_full_transcript(mixed) == expected
+    assert read_transcript_excerpt(mixed) == read_transcript_excerpt(clean)
+    metadata = extract_jsonl_metadata(mixed, client=client)
+    assert metadata == extract_jsonl_metadata(clean, client=client)
+    assert metadata["canonical_session_id"] == session_id
+
+    result = rt.queue.on_archive(client, session_id, transcript_path=str(mixed))
+    assert result["action"] == "enqueued", result
+    (item,) = result["items"]
+    # The queue reads the dialogue through the same excerpt reader: one turn per line, under the title.
+    session = rt.db.get_session(item.session_key)
+    assert rt.queue.load_queue_item_text(item) == "\n\n".join([f"Title: {session.title}", *expected.split("\n")])
+
+
+# ---------------------------------------------------------------- 7. 续聊后的再次采集
+
+APPENDED_ASK = "追加：回滚之后异常没有再出现，请把回滚预案也补进经验卡。"
+APPENDED_ANSWER = "已补充：回滚预案写进经验卡，并补一条回归用例。"
+HAND_WRITTEN_NOTE = "projects/demo/deploy-rollback.md"
+
+
+def _grown_conversation() -> list[dict[str, Any]]:
+    """同一段对话在第一轮消费之后又多了两轮。"""
+    return [*_conversation(), _user_step(APPENDED_ASK, 10), _planner_step(11, APPENDED_ANSWER)]
+
+
+def _consume(rt: FlywheelRuntime, queue_id: str) -> WorkflowRunRecord:
+    """Run one batch over the given queue item; the batch must settle it."""
+    run = rt.orchestrator.start_run(trigger="test", queue_ids=[queue_id], auto_approve_override=True)
+    assert run.status == RunStatus.PASS, run.error
+    return run
+
+
+def _first_pass(tmp_path: Path) -> tuple[FlywheelRuntime, Path, str, float]:
+    """扫盘 → 入队 → 消费完：返回运行时、transcript、会话键，以及采集时它的修改时间。"""
+    rt = _runtime(tmp_path)
+    brain = tmp_path / "brain"
+    path = _write_transcript(brain, AGY_UUID_QUIET, _conversation())
+    scanned = _age(path, 7200)
+    rt.cfg.sessions.scan_sources = [_agy_source(brain)]
+    key = f"antigravity:{AGY_UUID_QUIET}"
+
+    scan = rt.sessions.reconcile_scan_sources()
+    assert (scan["scanned"], scan["newly_registered"], scan["regrown"]) == (1, 1, 0)
+    assert _marks(rt, key) == (scanned, path.stat().st_size)
+    rt.sessions.sweep_pending_triage()
+    assert rt.queue.bridge_pending_sessions_to_queue() == 1
+    (first,) = rt.db.list_session_queue_items(key)
+    assert (first.revision, first.consumed_from_turn, first.consumed_to_turn) == (1, 0, 5)
+    _consume(rt, first.queue_id)
+
+    session = rt.db.get_session(key)
+    assert session.status is SessionStatus.PROCESSED
+    assert (session.last_consumed_turn, session.last_consumed_hash) == (5, first.content_hash)
+    assert _marks(rt, key) == (scanned, path.stat().st_size)
+    return rt, path, key, scanned
+
+
+def _marks(rt: FlywheelRuntime, key: str) -> tuple[float, int]:
+    """会话上记下的采集标记：``(修改时间, 大小)``。"""
+    meta = rt.db.get_session(key).metadata
+    return (meta[SCANNED_MTIME], meta[SCANNED_SIZE])
+
+
+def test_a_conversation_that_continues_after_it_was_consumed_is_picked_up_again(tmp_path: Path):
+    """首次静默入队并消费完 → 同一个 UUID 的 transcript 又多了两轮 → 再次静默：只有新增的轮次以修订 2 入队。"""
+    rt, path, key, _ = _first_pass(tmp_path)
+
+    # 还在写入：这一轮扫描不碰它，队列也不多出任何东西。
+    _write_jsonl_lines(path, _grown_conversation())
+    _age(path, 60)
+    scan = rt.sessions.reconcile_scan_sources()
+    assert (scan["scanned"], scan["skipped_active"], scan["regrown"]) == (0, 1, 0)
+    assert rt.queue.bridge_pending_sessions_to_queue() == 0
+    assert rt.sessions.take_grown_transcripts() == []
+
+    # 再次静默：扫盘认出它比上次采集时长了，队列只取消费水位线之后的部分。
+    grown = _age(path, 3600)
+    scan = rt.sessions.reconcile_scan_sources()
+    assert (scan["scanned"], scan["skipped_active"], scan["regrown"]) == (1, 0, 1)
+    assert rt.queue.bridge_pending_sessions_to_queue() == 1
+    assert rt.sessions.take_grown_transcripts() == []
+
+    revisions = rt.db.list_session_queue_items(key)
+    assert [(item.revision, item.status) for item in revisions] == [
+        (2, QueueStatus.QUEUED),
+        (1, QueueStatus.PROCESSED),
+    ]
+    second, first = revisions
+    assert second.ingress_channel is IngressChannel.LEGACY_SCAN
+    assert second.client == "antigravity"
+    assert (second.consumed_from_turn, second.consumed_to_turn) == (5, 7)
+    assert second.content_hash != first.content_hash
+    text = rt.queue.load_queue_item_text(second)
+    assert f"[user] {APPENDED_ASK}" in text
+    assert f"[assistant] {APPENDED_ANSWER}" in text
+    assert ASK not in text and FOLLOW_UP not in text
+    assert "TOOL-DUMP-LINE" not in text
+
+    # The marks moved with what was taken; the watermark waits for the batch that settles it.
+    session = rt.db.get_session(key)
+    assert _marks(rt, key) == (grown, path.stat().st_size)
+    assert (session.last_consumed_turn, session.status) == (5, SessionStatus.PROCESSED)
+
+    # The new revision settles like any other, on its own.
+    _consume(rt, second.queue_id)
+    assert rt.db.get_session(key).last_consumed_turn == 7
+
+    # Nothing grew since: a third pass has nothing to take and makes no third revision.
+    scan = rt.sessions.reconcile_scan_sources()
+    assert (scan["scanned"], scan["regrown"]) == (1, 0)
+    assert rt.queue.bridge_pending_sessions_to_queue() == 0
+    assert [item.revision for item in rt.db.list_session_queue_items(key)] == [2, 1]
+    assert _marks(rt, key) == (grown, path.stat().st_size)
+
+
+def test_a_normal_batch_takes_what_was_appended_on_its_own(tmp_path: Path):
+    """不靠人工触发：一个普通批次的 P00 自己扫出增长并桥接入队，随后审查、结算新增的轮次。"""
+    rt, path, key, _ = _first_pass(tmp_path)
+    _age(_write_jsonl_lines(path, _grown_conversation()), 3600)
+
+    run = rt.orchestrator.start_run(trigger="test", auto_approve_override=True)
+
+    assert run.status == RunStatus.PASS, run.error
+    assert run.admitted_sessions == [key]
+    p00 = next(node for node in run.nodes if node.node_id == "P00_PREPARE")
+    assert "桥接入队 1 条" in p00.summary
+    assert [(item.revision, item.status) for item in rt.db.list_session_queue_items(key)] == [
+        (2, QueueStatus.PROCESSED),
+        (1, QueueStatus.PROCESSED),
+    ]
+    assert rt.db.get_session(key).last_consumed_turn == 7
+    assert rt.sessions.take_grown_transcripts() == []
+
+
+def test_a_transcript_touched_without_growing_makes_no_revision(tmp_path: Path):
+    """修改时间变了、对话没变：队列判定内容未变，不出版本；采集标记跟着前移，下次不再重复送。"""
+    rt, path, key, _ = _first_pass(tmp_path)
+    touched = _age(path, 3600)
+
+    scan = rt.sessions.reconcile_scan_sources()
+    assert scan["regrown"] == 1
+    assert rt.queue.bridge_pending_sessions_to_queue() == 0
+    assert [item.revision for item in rt.db.list_session_queue_items(key)] == [1]
+    assert _marks(rt, key) == (touched, path.stat().st_size)
+
+    scan = rt.sessions.reconcile_scan_sources()
+    assert (scan["scanned"], scan["regrown"]) == (1, 0)
+    assert rt.queue.bridge_pending_sessions_to_queue() == 0
+
+
+def test_a_transcript_that_kept_its_modification_time_but_not_its_size_is_taken_too(tmp_path: Path):
+    """修改时间没变、文件变长了（时钟回拨，或保留时间的同步）：同样算增长。"""
+    rt, path, key, scanned = _first_pass(tmp_path)
+    _write_jsonl_lines(path, _grown_conversation())
+    os.utime(path, (scanned, scanned))
+    assert path.stat().st_mtime == scanned
+
+    scan = rt.sessions.reconcile_scan_sources()
+    assert (scan["scanned"], scan["regrown"]) == (1, 1)
+    assert rt.queue.bridge_pending_sessions_to_queue() == 1
+    (second, first) = rt.db.list_session_queue_items(key)
+    assert (second.revision, second.status, first.revision) == (2, QueueStatus.QUEUED, 1)
+    assert (second.consumed_from_turn, second.consumed_to_turn) == (5, 7)
+    assert _marks(rt, key) == (scanned, path.stat().st_size)
+
+
+def test_a_session_registered_before_the_marks_existed_counts_from_now(tmp_path: Path):
+    """升级前登记的会话没有采集标记：第一次扫盘只补上标记，此后的增长照常被采到。"""
+    rt, path, key, _ = _first_pass(tmp_path)
+    session = rt.db.get_session(key)
+    # What a registration of an older build left behind: the session, without any mark.
+    session.metadata = {
+        name: value for name, value in session.metadata.items() if name not in (SCANNED_MTIME, SCANNED_SIZE)
+    }
+    rt.db.upsert_session(session)
+    assert SCANNED_MTIME not in rt.db.get_session(key).metadata
+
+    # It differs from nothing on record: the scan only starts counting from what it sees now.
+    _age(path, 3600)
+    scan = rt.sessions.reconcile_scan_sources()
+    assert (scan["scanned"], scan["regrown"]) == (1, 0)
+    assert _marks(rt, key) == (path.stat().st_mtime, path.stat().st_size)
+    assert rt.queue.bridge_pending_sessions_to_queue() == 0
+
+    _age(_write_jsonl_lines(path, _grown_conversation()), 1800)
+    scan = rt.sessions.reconcile_scan_sources()
+    assert scan["regrown"] == 1
+    assert rt.queue.bridge_pending_sessions_to_queue() == 1
+    assert [item.revision for item in rt.db.list_session_queue_items(key)] == [2, 1]
+
+
+@pytest.mark.parametrize("intent", ["none", "governance_only", "opt_out", "skipped"])
+def test_a_grown_transcript_keeps_the_intent_the_session_is_under(tmp_path: Path, intent: str):
+    """续聊只是对话变长了：它不改变这个会话被冻结、被整体跳过，或只做治理的决定。"""
+    rt, path, key, scanned = _first_pass(tmp_path)
+    if intent == "governance_only":
+        declared = rt.queue.handle_session_intent(
+            "hand_distilled", session_key=key, governance_only=True, wiki_paths=[HAND_WRITTEN_NOTE]
+        )
+        assert declared["distill_mode"] == "governance_only"
+        _consume(rt, declared["queue_ids"][0])
+    elif intent == "opt_out":
+        vetoed = rt.queue.handle_session_intent("opt_out", session_key=key, reason="会话内容不再参与沉淀。")
+        assert vetoed["reason_code"] == "USER_OPT_OUT"
+    elif intent == "skipped":
+        skipped = rt.queue.handle_session_intent(
+            "hand_distilled", session_key=key, governance_only=False, wiki_paths=[HAND_WRITTEN_NOTE]
+        )
+        assert skipped["reason_code"] == HAND_DISTILLED_SKIP
+    before = [
+        (item.revision, item.status, item.exclude_reason_code)
+        for item in rt.db.list_session_queue_items(key)
+    ]
+    if intent == "opt_out":
+        assert before == [(2, QueueStatus.EXCLUDED, "USER_OPT_OUT"), (1, QueueStatus.PROCESSED, "")]
+    elif intent == "skipped":
+        assert before == [(2, QueueStatus.EXCLUDED, HAND_DISTILLED_SKIP), (1, QueueStatus.PROCESSED, "")]
+
+    grown = _age(_write_jsonl_lines(path, _grown_conversation()), 3600)
+    scan = rt.sessions.reconcile_scan_sources()
+    bridged = rt.queue.bridge_pending_sessions_to_queue()
+    session = rt.db.get_session(key)
+    items = rt.db.list_session_queue_items(key)
+    shape = [(item.revision, item.status, item.exclude_reason_code) for item in items]
+    queued = [item for item in items if item.status is QueueStatus.QUEUED]
+
+    if intent == "opt_out":
+        # 冻结的会话连看都不看：没有增长可报，没有新的队列项，标记停在原地。
+        assert (scan["regrown"], bridged) == (0, 0)
+        assert session.opt_out is True
+        assert shape == before
+        assert session.metadata[SCANNED_MTIME] == scanned
+        return
+
+    assert scan["regrown"] == 1
+    assert session.metadata[SCANNED_MTIME] == grown
+    if intent == "none":
+        assert bridged == 1
+        assert shape == [(2, QueueStatus.QUEUED, ""), *before]
+        assert "distill_mode" not in queued[0].payload
+    elif intent == "governance_only":
+        # 新增的轮次沿用治理专属模式与已登记的路径，不会再排一次知识文档的写入。
+        assert bridged == 1
+        assert shape == [(3, QueueStatus.QUEUED, ""), *before]
+        assert queued[0].payload["distill_mode"] == "governance_only"
+        assert queued[0].payload["hand_distilled_paths"] == [HAND_WRITTEN_NOTE]
+        assert rt.queue.distill_mode_of(session) == "governance_only"
+    else:
+        # 整体跳过：对话再长也不重新入队，已有的可见记录原样保留。
+        assert (bridged, queued) == (0, [])
+        assert shape == before
+        assert rt.queue.distill_mode_of(session) == "skipped"
+        assert session.metadata["hand_distilled_skip"] is True

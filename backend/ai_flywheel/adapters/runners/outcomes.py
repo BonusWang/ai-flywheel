@@ -4,6 +4,10 @@ A model or CLI reply is untrusted input. This module decides whether it is usabl
 all: a reply that carries no plan fails the node (it never falls back to the local
 heuristic planner), and a reply whose items are all unusable fails it too, with the
 per-item reason codes that explain why.
+
+It also answers the question a runner asks before it caches a reply: does anything in
+it carry a credential? The privacy gate refuses items one by one, so the item it refused
+is still in the reply a usable plan came from.
 """
 from __future__ import annotations
 
@@ -34,11 +38,93 @@ from ai_flywheel.adapters.runners.normalizers import (
     normalize_review_events,
 )
 from ai_flywheel.adapters.wiki.router import RoutingCandidates
+from ai_flywheel.core.privacy import find_secret_shape, mask_credential_shapes
 from ai_flywheel.models import PlannedWrite
 
 logger = logging.getLogger(__name__)
 
 _SOURCE_NOUN = {PLAN_SOURCE_MODEL: "模型", PLAN_SOURCE_CLI: "本地 CLI "}
+
+# The reason code the normalizer gives a plan item the privacy gate refused.
+SECRET_REJECTION_REASON = "SECRET_LEAK_BLOCKED"
+# Every reason code that means the privacy gate — and not a field, a cap or a target —
+# kept the item out. A code that joins this family later is read the same way.
+PRIVACY_REJECTION_PREFIXES = ("SECRET_", "PRIVACY_")
+
+
+def _is_privacy_rejection(reason: Any) -> bool:
+    code = str(reason or "").split(":")[0].strip().upper()
+    return code == SECRET_REJECTION_REASON or code.startswith(PRIVACY_REJECTION_PREFIXES)
+
+
+def plan_rejected_a_secret(diagnostics: PlanDiagnostics) -> bool:
+    """Whether the privacy gate refused at least one item of the reply a plan came from.
+
+    The refused item is not in the plan, so the plan alone cannot tell: this is what a
+    runner reads before it writes that reply to a cache.
+    """
+    return any(
+        _is_privacy_rejection(reason)
+        for item in diagnostics.dropped_items
+        if isinstance(item, dict)
+        for reason in item.get("reasons") or []
+    )
+
+
+def reply_carries_secret(reply: Any) -> str | None:
+    """The kind of the first credential shape in any text of a reply, or None when there is none.
+
+    Read with the strict eye the configuration pages are held to: a password, a token or
+    a key has no business in a cached reply in any spelling. Every string is read, down
+    to the one nested in an item's routing declaration. The return value names the kind
+    of credential, never the credential itself.
+    """
+    if isinstance(reply, str):
+        return find_secret_shape(reply, strict=True)
+    if isinstance(reply, dict):
+        for key, value in reply.items():
+            found = reply_carries_secret(key)
+            if found is None:
+                found = reply_carries_secret(value)
+            if found is not None:
+                return found
+        return None
+    if isinstance(reply, (list, tuple)):
+        for value in reply:
+            found = reply_carries_secret(value)
+            if found is not None:
+                return found
+    return None
+
+
+def plan_reply_refused_a_credential(outcome: PlanOutcome, reply: Any) -> str | None:
+    """Why the reply behind a usable plan must not be cached, or None when it may be.
+
+    Any one of three readings is enough. The privacy gate refused an item of the reply:
+    that item is still in it. A credential shape is in any text of the reply. Or one is
+    in the drafts the plan kept — their titles and summaries are not gated when a plan is
+    normalised, and they were copied from the reply. What comes back names the kind of
+    credential (the privacy gate's reason code for the first case), never the credential.
+    """
+    if plan_rejected_a_secret(outcome.diagnostics):
+        return SECRET_REJECTION_REASON
+    return reply_carries_secret(reply) or reply_carries_secret(
+        [write.model_dump() for write in outcome.planned_writes]
+    )
+
+
+def _masked_brief(raw_item: Any) -> dict[str, Any]:
+    """Identifies a plan item for diagnostics without carrying a credential its title may hold.
+
+    Diagnostics reach the node payload and the audit trail. The item's body is left out
+    by `_item_brief`; its title and path are not, and an item the privacy gate refused
+    can well quote the credential in its title too.
+    """
+    brief = _item_brief(raw_item)
+    return {
+        key: mask_credential_shapes(value) if isinstance(value, str) else value
+        for key, value in brief.items()
+    }
 
 
 def _apply_reply_trace(diagnostics: PlanDiagnostics, reply_trace: dict[str, Any] | None) -> None:
@@ -145,7 +231,7 @@ def _plan_from_items(
             # The quota counts the writes that were kept, not the items that were read:
             # an invalid item must not use up the slot of a valid one behind it.
             diagnostics.over_limit_count += 1
-            brief = _item_brief(raw_item)
+            brief = _masked_brief(raw_item)
             diagnostics.dropped_items.append({"index": index, **brief, "reasons": ["OVER_LIMIT"]})
             logger.info("P03 plan item not planned: index=%s kind=%s action=%s reasons=%s", index, brief["target_kind"], brief["action"], ["OVER_LIMIT"])
             continue
@@ -155,7 +241,7 @@ def _plan_from_items(
         for name in completed:
             diagnostics.completed_fields[name] = diagnostics.completed_fields.get(name, 0) + 1
         if pw is None:
-            brief = _item_brief(raw_item)
+            brief = _masked_brief(raw_item)
             diagnostics.dropped_items.append({"index": index, **brief, "reasons": reasons})
             logger.warning(
                 "P03 plan item dropped: index=%s kind=%s action=%s reasons=%s",

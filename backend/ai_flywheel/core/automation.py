@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import threading
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -29,15 +30,23 @@ logger = logging.getLogger("ai_flywheel.automation")
 DAILY_JOB_ID = "daily_flywheel"
 SHANGHAI_TZ_NAME = "Asia/Shanghai"
 
-#: Audit trail of a scheduled fire that passed without a batch (at most one a day).
+#: Audit trail of a scheduled fire that passed without a batch (at most one per fire).
 MISFIRE_AUDIT_EVENT = "schedule_misfire_detected"
 #: Where that audit event lives: one entity, the daily job itself.
 MISFIRE_AUDIT_ENTITY = ("automation", DAILY_JOB_ID)
+#: How many of those events are read to tell whether one fire is already on record.
+#: Each check records at most the newest fire, so the one asked about is near the top.
+MISFIRE_AUDIT_LOOKBACK = 20
+#: Where a scheduled fire is claimed. The cron job and the catch-up both write and read
+#: it, so a fire is started at most once however the two of them race: one row of
+#: ``system_settings`` whose value maps each claimed fire — ISO 8601 in Shanghai time —
+#: to the batch that took it.
+FIRE_CLAIMS_KEY = f"{DAILY_JOB_ID}:fire_claims"
+FIRE_CLAIMS_CATEGORY = "automation"
+FIRE_CLAIMS_ACTOR = "automation"
 #: How rarely the recovery loop looks for a missed fire. The window it may catch a
 #: fire up in is measured in hours, so a few minutes change nothing.
 CATCHUP_CHECK_INTERVAL_SECONDS = 300.0
-#: A cron expression fires at most once a minute, so one day holds at most this many fires.
-MAX_FIRES_PER_DAY = 1440
 
 _DOW_LABELS: dict[str, str] = {
     "0": "周日",
@@ -142,17 +151,43 @@ def _parse_utc(value: str | None) -> datetime | None:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
-def _latest_fire_by(trigger: CronTrigger, current: datetime) -> datetime | None:
-    """The latest time at or before ``current`` at which ``trigger`` should have fired today."""
-    start_of_day = current.replace(hour=0, minute=0, second=0, microsecond=0)
-    fire = trigger.get_next_fire_time(None, start_of_day)
-    latest: datetime | None = None
-    for _ in range(MAX_FIRES_PER_DAY + 1):
-        if fire is None or fire > current:
+def _fire_key(fired_at: datetime) -> str:
+    """The one text a fire is known by: ISO 8601 in Shanghai time, the same in the claim
+    store and in the audit trail for the cron job and for the catch-up."""
+    return fired_at.astimezone(SHANGHAI_TZ).isoformat()
+
+
+def _latest_fire_within(trigger: CronTrigger, earliest: datetime, latest: datetime) -> datetime | None:
+    """The last time in ``[earliest, latest]`` at which ``trigger`` fires."""
+    if earliest > latest:
+        return None
+    fire = trigger.get_next_fire_time(None, earliest)
+    found: datetime | None = None
+    # A cron expression fires at most once a minute, so the span bounds the loop.
+    for _ in range(int((latest - earliest).total_seconds() // 60) + 2):
+        if fire is None or fire > latest:
             break
-        latest = fire
+        found = fire
         fire = trigger.get_next_fire_time(fire, fire)
-    return latest
+    return found
+
+
+def _latest_fire_by(
+    trigger: CronTrigger, current: datetime, *, window_opens: datetime | None = None
+) -> datetime | None:
+    """The latest time at or before ``current`` at which ``trigger`` should have fired.
+
+    Today's (Shanghai). A day that has no fire of its own yet looks back to the latest
+    fire of the day before, but only from ``window_opens`` on — the moment the grace
+    window reaches back to. A 23:00 fire is as lost at 00:30 the next day as it was at
+    23:05 while its window is open; one whose window closed before midnight is not
+    looked back at. Without ``window_opens`` it is today's fires alone.
+    """
+    start_of_day = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    latest = _latest_fire_within(trigger, start_of_day, current)
+    if latest is not None or window_opens is None or window_opens >= start_of_day:
+        return latest
+    return _latest_fire_within(trigger, window_opens, start_of_day - timedelta(microseconds=1))
 
 
 class AutomationManager:
@@ -186,13 +221,18 @@ class AutomationManager:
         # When this process came up. /health and the automation snapshot report it, so
         # "was the service running at the scheduled time?" can be answered from outside.
         self.started_at: str = self._now().isoformat()
-        # One misfire audit and one catch-up batch a day (per process). A busy lock
-        # does not count as that attempt.
-        self._misfire_audited_on = ""
-        self._catchup_started_on = ""
+        # One misfire audit and one catch-up batch per scheduled fire (per process). A
+        # busy lock does not count as that attempt.
+        self._misfire_audited_fire = ""
         self._catchup_run_id: str | None = None
         # What starts the catch-up batch for a run id (replaced in tests).
         self._catchup_runner = catchup_runner or self._run_catchup_batch
+        # The claims on scheduled fires. ``None`` until the row in ``system_settings`` is
+        # first read; from then on this process's own view of it, kept current by its
+        # writes. A claim carries the id of the process that made it, so a restarted
+        # process can tell its own from one it inherited.
+        self._instance = uuid.uuid4().hex
+        self._fire_claims: dict[str, dict[str, Any]] | None = None
 
         # Recovery watchdog telemetry (updated by the serve recovery thread & manual trigger)
         self._recovery_interval = float(os.environ.get("FLYWHEEL_RECOVERY_INTERVAL", "30"))
@@ -295,7 +335,7 @@ class AutomationManager:
             logger.info("scheduled daily run skipped: safety_valves.workflow_enabled is false")
             return
         try:
-            self.orchestrator.start_run(trigger="scheduled", phase="auto")
+            self._start_cron_batch()
         except WorkflowLockError as exc:
             logger.warning("scheduled daily run skipped (workflow lock busy): %s", exc)
         except Exception:
@@ -303,18 +343,57 @@ class AutomationManager:
         finally:
             self.broker.publish("automation_updated", {"reason": "scheduled_run_finished"})
 
+    def _start_cron_batch(self) -> str | None:
+        """Start the batch of the fire the scheduler woke the daily job for (its run id).
+
+        The fire is named the way the catch-up names it and claimed in the same store,
+        so whichever of the two reaches a fire first, the other leaves it: the recovery
+        loop may have caught a fire up moments before the scheduler thread woke for it.
+        A fire that cannot be named — the cron expression is invalid by now — is run
+        without a claim rather than not run. Nothing is started for a fire already taken,
+        and a busy lock raises ``WorkflowLockError`` with no claim made.
+        """
+        current = self._now()
+        fired_at: datetime | None = None
+        try:
+            _, trigger = validate_cron(self.cfg.workflow.daily_cron)
+        except ValueError as exc:
+            logger.warning("cannot name the fire of the daily job, running it unclaimed: %s", exc)
+        else:
+            fired_at = self._fire_to_look_at(trigger, current)
+        if fired_at is not None and self._fire_answered(fired_at, now=current):
+            logger.info("scheduled daily run skipped: the fire at %s is already taken", _fire_key(fired_at))
+            return None
+        return self._claim_and_start(
+            fired_at,
+            source="cron",
+            now=current,
+            start=lambda run_id: self.orchestrator.start_run(
+                trigger="scheduled", phase="auto", run_id=run_id
+            ),
+        )
+
     # ---------------- missed fire: detect, record, catch up ----------------
 
-    def scheduled_today(self, now: datetime | None = None) -> datetime | None:
-        """The latest time today (Shanghai) at which the daily schedule should have fired.
+    def _fire_to_look_at(self, trigger: CronTrigger, current: datetime) -> datetime | None:
+        """The scheduled fire a batch may still owe at ``current``: today's latest one, or
+        — until today has one of its own — the latest one of the day before, for as long
+        as the grace window reaches back to it."""
+        window = timedelta(seconds=int(self.cfg.workflow.misfire_grace_seconds))
+        return _latest_fire_by(trigger, current, window_opens=current - window)
 
-        ``None`` when today's fire is still ahead, or when the cron expression is invalid.
+    def scheduled_today(self, now: datetime | None = None) -> datetime | None:
+        """The latest scheduled fire (Shanghai time) that a batch may still owe.
+
+        Today's latest one; before today has one, the latest one of the day before while
+        its grace window is open — a 23:00 batch is as lost at 00:30 the next day as it
+        was at 23:05. ``None`` when there is no such fire or the cron expression is invalid.
         """
         try:
             _, trigger = validate_cron(self.cfg.workflow.daily_cron)
         except ValueError:
             return None
-        return _latest_fire_by(trigger, self._now(now))
+        return self._fire_to_look_at(trigger, self._now(now))
 
     def _scheduled_run_since(self, fired_at: datetime) -> bool:
         """Whether a scheduled batch has started at or after ``fired_at`` (a catch-up counts).
@@ -337,12 +416,148 @@ class AutomationManager:
             or self.db.count_sessions(status=SessionStatus.PENDING.value) > 0
         )
 
-    def _last_misfire_audit_day(self) -> str:
-        """The Shanghai date of the newest misfire audit event (``""`` when there is none)."""
+    def _misfire_audit_on_record(self, fire: str) -> bool:
+        """Whether the lost fire ``fire`` (its key) is already in the audit trail."""
         entity_type, entity_id = MISFIRE_AUDIT_ENTITY
-        rows = self.db.list_audit_events(entity_type=entity_type, entity_id=entity_id, limit=1)
-        created = _parse_utc(str(rows[0].get("created_at"))) if rows else None
-        return created.astimezone(SHANGHAI_TZ).strftime("%Y-%m-%d") if created else ""
+        for row in self.db.list_audit_events(
+            entity_type=entity_type, entity_id=entity_id, limit=MISFIRE_AUDIT_LOOKBACK
+        ):
+            payload = row.get("payload")
+            payload = payload if isinstance(payload, dict) else {}
+            if row.get("event_type") == MISFIRE_AUDIT_EVENT and payload.get("scheduled_today") == fire:
+                return True
+        return False
+
+    # ---------------- the claim on a scheduled fire ----------------
+
+    def _read_fire_claims(self) -> dict[str, dict[str, Any]]:
+        """The claim row as it is stored; what cannot be read or understood is no claim."""
+        try:
+            rows = self.db.list_system_settings()
+        except Exception:
+            logger.warning("could not read the claims on scheduled fires", exc_info=True)
+            return {}
+        for row in rows:
+            if row.get("key") != FIRE_CLAIMS_KEY:
+                continue
+            value = row.get("value")
+            if not isinstance(value, dict):
+                return {}
+            return {
+                str(fire): claim
+                for fire, claim in value.items()
+                if isinstance(claim, dict) and claim.get("run_id")
+            }
+        return {}
+
+    def _write_fire_claims(self, claims: dict[str, dict[str, Any]]) -> None:
+        try:
+            self.db.set_system_setting(
+                FIRE_CLAIMS_KEY, FIRE_CLAIMS_CATEGORY, claims, updated_by=FIRE_CLAIMS_ACTOR
+            )
+        except Exception:
+            # This process still knows its own claims. What is lost is the record of them
+            # for a later one, and a later one follows a claim only through the run
+            # record of its batch anyway.
+            logger.warning("could not store the claims on scheduled fires", exc_info=True)
+
+    def _live_fire_claims(self, now: datetime) -> dict[str, dict[str, Any]]:
+        """The claims that still count, by fire; the stored row is trimmed to match.
+
+        Two things end a claim. The grace window of its fire closes: nothing catches that
+        fire up any more. Or it turns out never to have come to a batch: a claim left by
+        an earlier process counts only through the run record of the batch it started.
+        A batch that is not on record after a restart never really started — its fire is
+        to be caught up again, not written off.
+        """
+        window = timedelta(seconds=int(self.cfg.workflow.misfire_grace_seconds))
+        with self._lock:
+            if self._fire_claims is None:
+                self._fire_claims = self._read_fire_claims()
+            live: dict[str, dict[str, Any]] = {}
+            for fire, claim in self._fire_claims.items():
+                fired_at = _parse_utc(fire)
+                if fired_at is None or fired_at + window < now:
+                    continue
+                inherited = claim.get("process") != self._instance
+                if inherited and self.db.get_workflow_run(str(claim.get("run_id"))) is None:
+                    continue
+                live[fire] = claim
+            if live != self._fire_claims:
+                self._fire_claims = live
+                self._write_fire_claims(live)
+            return live
+
+    def _fire_answered(self, fired_at: datetime, *, now: datetime) -> bool:
+        """Whether a batch was started for ``fired_at``: one is on record, or the fire is claimed."""
+        if self._scheduled_run_since(fired_at):
+            return True
+        return _fire_key(fired_at) in self._live_fire_claims(now)
+
+    def _record_fire_claim(
+        self, fired_at: datetime, run_id: str, *, source: str, now: datetime
+    ) -> None:
+        """Write down that the batch ``run_id`` took the fire at ``fired_at``.
+
+        The caller holds the workflow lock, which makes the claim exclusive: no other
+        start can be between its lock and its claim at the same time.
+        """
+        with self._lock:
+            claims = dict(self._live_fire_claims(now))
+            claims[_fire_key(fired_at)] = {
+                "run_id": run_id,
+                "source": source,
+                "claimed_at": now.isoformat(),
+                "process_started_at": self.started_at,
+                "process": self._instance,
+            }
+            self._fire_claims = claims
+            self._write_fire_claims(claims)
+
+    def _withdraw_fire_claim(self, run_id: str) -> None:
+        """Take back the claim a start that failed left: its fire is not answered."""
+        with self._lock:
+            if self._fire_claims is None:
+                return
+            claims = {
+                fire: claim
+                for fire, claim in self._fire_claims.items()
+                if claim.get("run_id") != run_id
+            }
+            if claims == self._fire_claims:
+                return
+            self._fire_claims = claims
+            self._write_fire_claims(claims)
+
+    def _claim_and_start(
+        self,
+        fired_at: datetime | None,
+        *,
+        source: str,
+        now: datetime,
+        start: Callable[[str], Any],
+    ) -> str:
+        """Take the lock, claim ``fired_at`` and start its batch; the batch's run id.
+
+        The order is the point. The lock comes first, in the calling thread: when it is
+        busy, ``WorkflowLockError`` is raised and nothing has been claimed, so the fire
+        is left for a later pass. The claim goes on record once the lock is held and the
+        batch is started under it — by the cron job with the pipeline itself, by the
+        catch-up with a thread. A start that fails gives both back, the claim and the
+        lock: that attempt is not the fire's.
+        """
+        run_id = self.orchestrator.new_run_id()
+        if not self.db.acquire_workflow_lock(run_id):
+            raise WorkflowLockError(f"the workflow lock is held: {self.db.get_workflow_lock()}")
+        if fired_at is not None:
+            self._record_fire_claim(fired_at, run_id, source=source, now=now)
+        try:
+            start(run_id)
+        except Exception:
+            self._withdraw_fire_claim(run_id)
+            self.db.release_workflow_lock(run_id)
+            raise
+        return run_id
 
     def check_missed_schedule_catchup(self, now: datetime | None = None) -> dict[str, Any]:
         """Find the scheduled fire the service was not awake for, record it, catch it up.
@@ -354,16 +569,18 @@ class AutomationManager:
         check gets it back. The ``serve`` recovery loop calls it now and then; it is safe
         to call as often as that loop runs.
 
-        A miss is confirmed when today's (Shanghai) fire time has passed, no scheduled
-        batch has started since, the grace window is still open and there is work
-        queued. It is then written to the audit trail once a day and — when
-        ``catchup_missed_schedule`` is on — one catch-up batch is started, also once a
-        day. A busy lock is not that one attempt: the batch is left for a later pass.
-        A process that is not in the ``serve`` role never starts a batch.
+        A miss is confirmed when the latest fire has passed — today's, or yesterday's
+        while its grace window is still open — no batch has been started for it, the
+        window is still open and there is work queued. It is then written to the audit
+        trail once per fire and — when ``catchup_missed_schedule`` is on — one catch-up
+        batch is started for it, also once. What makes it once is the claim the cron job
+        shares (``_claim_and_start``). A busy lock is not that one attempt: the batch is
+        left for a later pass. A process that is not in the ``serve`` role never starts
+        a batch.
         """
         current = self._now(now)
-        day = current.strftime("%Y-%m-%d")
         grace = int(self.cfg.workflow.misfire_grace_seconds)
+        window = timedelta(seconds=grace)
         result: dict[str, Any] = {
             "checked_at": current.isoformat(),
             "scheduled_today": None,
@@ -382,13 +599,19 @@ class AutomationManager:
         except ValueError as exc:
             result["reason"] = f"invalid_cron: {exc}"
             return result
-        fired_at = _latest_fire_by(trigger, current)
+        fired_at = self._fire_to_look_at(trigger, current)
         if fired_at is None:
             result["reason"] = "not_due_yet"
             return result
-        result["scheduled_today"] = fired_at.isoformat()
-        result["catchup_window_until"] = (fired_at + timedelta(seconds=grace)).isoformat()
+        fire = _fire_key(fired_at)
+        result["scheduled_today"] = fire
+        result["catchup_window_until"] = (fired_at + window).isoformat()
         if self._scheduled_run_since(fired_at):
+            result["reason"] = "already_ran_today"
+            return result
+        claim = self._live_fire_claims(current).get(fire)
+        if claim is not None and claim.get("source") != "catchup":
+            # The cron job of this process took the fire; its batch is not on record yet.
             result["reason"] = "already_ran_today"
             return result
         result["missed_today"] = True
@@ -398,7 +621,7 @@ class AutomationManager:
         if not self.cfg.safety_valves.workflow_enabled:
             result["reason"] = "workflow_disabled"
             return result
-        if current > fired_at + timedelta(seconds=grace):
+        if current > fired_at + window:
             result["reason"] = "outside_grace_window"
             return result
         if not self._has_backlog():
@@ -406,10 +629,10 @@ class AutomationManager:
             return result
 
         # Confirmed: a fire was lost and there is work it should have done. It is recorded
-        # once a day — in this process, and (after a restart) by the audit trail itself.
+        # once per fire — in this process, and (after a restart) by the audit trail itself.
         with self._lock:
-            audited_before = self._misfire_audited_on == day
-        if not audited_before and self._last_misfire_audit_day() == day:
+            audited_before = self._misfire_audited_fire == fire
+        if not audited_before and self._misfire_audit_on_record(fire):
             audited_before = True
         if audited_before:
             result["misfire_audited"] = True
@@ -420,13 +643,13 @@ class AutomationManager:
                 event_type=MISFIRE_AUDIT_EVENT,
                 actor="automation",
                 summary=(
-                    f"当日 {fired_at.strftime('%H:%M')} 的定时沉淀未运行：应触发时间已过、"
+                    f"{fired_at.strftime('%Y-%m-%d %H:%M')} 的定时沉淀未运行：应触发时间已过、"
                     f"此后没有计划批次，而待处理工作存在；宽限窗口至 "
-                    f"{(fired_at + timedelta(seconds=grace)).strftime('%H:%M')}"
+                    f"{(fired_at + window).strftime('%Y-%m-%d %H:%M')}"
                 ),
                 reason_code="SCHEDULE_MISFIRE",
                 payload={
-                    "scheduled_today": fired_at.isoformat(),
+                    "scheduled_today": fire,
                     "catchup_window_until": result["catchup_window_until"],
                     "misfire_grace_seconds": grace,
                     "catchup_missed_schedule": bool(self.cfg.workflow.catchup_missed_schedule),
@@ -435,37 +658,32 @@ class AutomationManager:
                 },
             )
             with self._lock:
-                self._misfire_audited_on = day
+                self._misfire_audited_fire = fire
             result["misfire_audited"] = True
         if not self.cfg.workflow.catchup_missed_schedule:
             result["reason"] = "catchup_disabled"
             return result
-        with self._lock:
-            already_started = self._catchup_started_on == day
-        if already_started:
+        if claim is not None:
+            # This process already started its catch-up for this fire.
             result["reason"] = "catchup_already_started"
             return result
 
-        # The lock is taken here, in the calling thread, so that a busy lock is a clean
-        # "not now" and not a failure nobody sees.
-        run_id = self.orchestrator.new_run_id()
-        if not self.db.acquire_workflow_lock(run_id):
+        try:
+            run_id = self._claim_and_start(
+                fired_at, source="catchup", now=current, start=self._catchup_runner
+            )
+        except WorkflowLockError:
+            # A busy lock is a clean "not now", not a failure nobody sees.
             logger.warning(
                 "scheduled catch-up for %s skipped: the workflow lock is busy; "
                 "it is retried while the grace window is open",
-                fired_at.isoformat(),
+                fire,
             )
             result["reason"] = "lock_busy"
             return result
-        try:
-            self._catchup_runner(run_id)
-        except Exception:
-            self.db.release_workflow_lock(run_id)
-            raise
         with self._lock:
-            self._catchup_started_on = day
             self._catchup_run_id = run_id
-        logger.info("scheduled catch-up run %s started for the missed fire at %s", run_id, fired_at.isoformat())
+        logger.info("scheduled catch-up run %s started for the missed fire at %s", run_id, fire)
         result["catchup_started"] = True
         result["run_id"] = run_id
         result["reason"] = "catchup_started"
@@ -479,13 +697,19 @@ class AutomationManager:
         portal's background trigger uses — the lock is taken by the caller, the
         pipeline runs elsewhere.
         """
+
         def _runner() -> None:
             try:
                 self.orchestrator.start_run(trigger="scheduled", phase="auto", run_id=run_id)
             except Exception:
                 logger.exception("scheduled catch-up run %s failed", run_id)
-                # The batch never took ownership: the lock this process took must not stay.
+                # The batch never took ownership: the lock this process took must not
+                # stay, and the fire it was claimed for is not answered.
+                self._withdraw_fire_claim(run_id)
                 self.db.release_workflow_lock(run_id)
+                with self._lock:
+                    if self._catchup_run_id == run_id:
+                        self._catchup_run_id = None
             finally:
                 self.broker.publish("automation_updated", {"reason": "scheduled_run_finished"})
 
@@ -539,8 +763,8 @@ class AutomationManager:
         except ValueError as exc:
             cron_error = cron_error or str(exc)
 
-        # Today's fire: whether it has passed, whether it was lost, and until when the
-        # recovery loop may still catch it up.
+        # The fire to look at: whether it has passed, whether it was lost, and until when
+        # the recovery loop may still catch it up.
         grace = int(self.cfg.workflow.misfire_grace_seconds)
         scheduled_today: datetime | None = None
         catchup_window_until: datetime | None = None
@@ -551,10 +775,10 @@ class AutomationManager:
             except ValueError:
                 trigger = None
             if trigger is not None:
-                scheduled_today = _latest_fire_by(trigger, current)
+                scheduled_today = self._fire_to_look_at(trigger, current)
                 if scheduled_today is not None:
                     catchup_window_until = scheduled_today + timedelta(seconds=grace)
-                    missed_today = not self._scheduled_run_since(scheduled_today)
+                    missed_today = not self._fire_answered(scheduled_today, now=current)
 
         with self._lock:
             live_next: str | None = None
@@ -638,7 +862,8 @@ class AutomationManager:
                 "cron_error": cron_error,
                 # When this process came up, and how a scheduled fire it was not awake
                 # for is handled: how late a batch may still run, whether the recovery
-                # loop catches a lost one up, and whether today's is still outstanding.
+                # loop catches a lost one up, and whether the latest one — today's, or
+                # yesterday's inside its grace window — is still outstanding.
                 "started_at": self.started_at,
                 "misfire_grace_seconds": grace,
                 "catchup_missed_schedule": bool(self.cfg.workflow.catchup_missed_schedule),

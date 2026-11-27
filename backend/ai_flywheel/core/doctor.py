@@ -17,7 +17,7 @@ from typing import Any
 
 from ai_flywheel import __version__
 from ai_flywheel.adapters.lark_cli import LarkCliRunner, LarkCliUnavailableError
-from ai_flywheel.adapters.runners.clients import resolve_runner_mode
+from ai_flywheel.adapters.runners.clients import api_model_label, resolve_runner_mode
 from ai_flywheel.adapters.wiki.schema import SCHEMA_FILE_NAME
 from ai_flywheel.config import FlywheelConfig
 
@@ -222,11 +222,11 @@ def _check_runner(cfg: FlywheelConfig) -> dict[str, str]:
     valve = cfg.safety_valves.effective_model_execution_enabled
 
     if requested == "api":
-        missing = [
-            name
-            for name in ("base_url", "model")
-            if not getattr(cfg.runner.api, name).strip()
-        ]
+        missing: list[str] = []
+        if not cfg.runner.api.base_url.strip():
+            missing.append("base_url")
+        if not api_model_label(cfg.runner.api):
+            missing.append("model")
         if missing:
             return _check(
                 "runner",

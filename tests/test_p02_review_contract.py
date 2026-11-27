@@ -9,6 +9,11 @@
 再往后的三节覆盖高保真输入、事件拆分与分阶段模型（feat-agy-ingest-and-high-fidelity-distill）：
 16000 字会话预算、置顶的结构化摘要、`events` 契约，以及 P02 / P03 各自的 `review_model`、
 `plan_model` 与推理强度。模型网关用记录请求体的桩代替，不发出任何真实请求。
+
+末尾三节覆盖发版前整改的三条：引用了凭据的审查照常可用，但回包在 API 与 CLI 两条通道上都不写
+缓存；`model` 留空、只给两个阶段各配模型时仍是 API 配置，P02 / P03 各问各的模型；两个批次在同一个
+Runner 上交错进入、退出 P02 与 P03 时，每次调用的模型、推理强度与调用统计都只属于自己那个阶段。
+合成密钥在运行时拼出，文件里不出现完整形状。
 """
 from __future__ import annotations
 
@@ -17,6 +22,7 @@ import json
 import logging
 import shutil
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -43,7 +49,9 @@ from ai_flywheel.adapters.runners import (
     ModelCallError,
     OpenAICompatibleRunner,
     PlanDiagnostics,
+    PLAN_SOURCE_MODEL,
     PlanOutcome,
+    PlanUnavailableError,
     ReviewUnavailableError,
     _build_p02_prompt,
     build_runner,
@@ -1579,3 +1587,386 @@ def test_a_run_reviews_on_the_review_model_and_plans_on_the_plan_model(tmp_path:
     # The batch's runner mode names the configured runner; which model answered is on the nodes.
     assert run.runner_mode == "api:mock-model"
     assert rt.db.get_session("codex:s1").status == SessionStatus.PROCESSED
+
+
+# ---------------------------------------------------------------- the cache and the privacy gate
+# A review quotes the sessions it read. One that quotes a credential is still a usable review —
+# and its reply stays off the disk, where the next identical batch would read it back verbatim.
+# The synthetic credential is built here, so its shape never appears whole in this file.
+
+
+SYNTHETIC_KEY = "sk-" + "9" * 32
+
+REFUSED_TAIL = "): a credential shape is in the reply (OpenAI/Anthropic API Key). The next identical batch asks again."
+
+
+def _review_quoting_a_credential() -> str:
+    """A usable review: one finding, whose fact quotes a credential the session held."""
+    finding = _finding("s1")
+    finding["facts"] = [f"联调时把密钥贴进了对话：{SYNTHETIC_KEY}"]
+    return json.dumps({"findings": [finding], "mistakes": [], "dissents": [], "repeated_workflows": []}, ensure_ascii=False)
+
+
+def _files_under(root: Path) -> list[str]:
+    return sorted(path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()) if root.is_dir() else []
+
+
+def test_a_review_that_quotes_a_credential_is_usable_but_never_cached(tmp_path: Path, caplog: pytest.LogCaptureFixture):
+    runner = _api_runner(tmp_path)
+    fake = _FakeModel(_review_quoting_a_credential())
+    runner._call_chat_completion = fake
+
+    with caplog.at_level(logging.WARNING, logger=RUN_LOGGER):
+        first = runner.review_sessions(_sessions("s1"), [])
+        second = runner.review_sessions(_sessions("s1"), [])
+
+    # The review itself is unaffected: the finding is there, with nothing wrong to report ...
+    assert [finding["session_key"] for finding in first["findings"]] == ["codex:s1"]
+    assert first["review_source"] == REVIEW_SOURCE_MODEL
+    assert first["review_diagnostics"]["reason_code"] is None
+    assert second["findings"] == first["findings"]
+    # ... but its reply was never written, so the next identical batch asks the model again.
+    assert len(fake.prompts) == 2
+    for review in (first, second):
+        assert (review["review_diagnostics"]["cache_hit"], review["review_diagnostics"]["cache_file"]) == (False, None)
+    assert _files_under(tmp_path / "receipts") == []
+    refusals = [record.getMessage() for record in caplog.records if record.getMessage().startswith("Reply not cached (p02_review-")]
+    assert len(refusals) == 2
+    assert all(message.endswith(REFUSED_TAIL) for message in refusals)
+    # The log and the diagnostics name the kind of credential, never the credential.
+    assert SYNTHETIC_KEY not in caplog.text
+    assert SYNTHETIC_KEY not in json.dumps(first["review_diagnostics"], ensure_ascii=False)
+
+
+def test_the_cli_channel_caches_no_such_review_either(tmp_path: Path, caplog: pytest.LogCaptureFixture):
+    base = tmp_path / "cli"
+    base.mkdir()
+    cfg = FlywheelConfig(base_dir=base)
+    cfg.runner.mode = "cli"
+    reply_file = base / "reply.json"
+    reply_file.write_text(json.dumps(json.loads(_review_quoting_a_credential()), ensure_ascii=True), encoding="ascii")
+    calls = base / "calls.log"
+    script = (
+        "import sys, pathlib; "
+        "pathlib.Path(%r).open('a', encoding='ascii').write(sys.stdin.read()[:1]); "
+        "sys.stdout.write(pathlib.Path(%r).read_text(encoding='ascii'))"
+    ) % (str(calls), str(reply_file))
+    cfg.runner.cli.command = sys.executable
+    cfg.runner.cli.args = ["-c", script]
+    cli = CliSubprocessRunner(cfg, ImmutableFileStore(base / "receipts"))
+
+    with caplog.at_level(logging.WARNING, logger=RUN_LOGGER):
+        first = cli.review_sessions(_sessions("s1"), [])
+        second = cli.review_sessions(_sessions("s1"), [])
+
+    assert [finding["session_key"] for finding in first["findings"]] == ["codex:s1"]
+    assert len(calls.read_text(encoding="ascii")) == 2  # the "CLI" really ran, once per batch
+    for review in (first, second):
+        assert (review["review_diagnostics"]["cache_hit"], review["review_diagnostics"]["cache_file"]) == (False, None)
+    assert _files_under(base / "receipts") == []
+    refusals = [record.getMessage() for record in caplog.records if record.getMessage().startswith("Reply not cached (p02_review-")]
+    assert len(refusals) == 2
+    assert all(message.endswith(REFUSED_TAIL) for message in refusals)
+    assert SYNTHETIC_KEY not in caplog.text
+
+
+def test_a_cached_review_that_carries_a_credential_is_discarded_not_served(tmp_path: Path, caplog: pytest.LogCaptureFixture):
+    runner = _api_runner(tmp_path)
+    runner._call_chat_completion = _FakeModel(_review("s1"))
+    clean = runner.review_sessions(_sessions("s1"), [])
+    (cached,) = _api_cache_dir(tmp_path).glob("p02_review-*.json")
+    clean_file = cached.read_text(encoding="utf-8")
+    assert SYNTHETIC_KEY not in clean_file
+    assert runner.review_sessions(_sessions("s1"), [])["review_diagnostics"]["cache_hit"] is True
+
+    # A file from before the cache refused such replies.
+    cached.write_text(_review_quoting_a_credential(), encoding="utf-8")
+    asked = _FakeModel(_review("s1"))
+    runner._call_chat_completion = asked
+
+    with caplog.at_level(logging.WARNING, logger=RUN_LOGGER):
+        result = runner.review_sessions(_sessions("s1"), [])
+
+    assert len(asked.prompts) == 1  # asked again
+    assert result["review_diagnostics"]["cache_hit"] is False
+    assert result["findings"] == clean["findings"]
+    assert cached.read_text(encoding="utf-8") == clean_file  # and the clean reply took its place
+    assert [message for message in caplog.messages if message.startswith("Cached reply discarded (")] == [
+        f"Cached reply discarded ({cached.name}): a credential shape is in it (OpenAI/Anthropic API Key). The run asks again."
+    ]
+
+
+# ---------------------------------------------------------------- a model for each stage, and no common one
+# `model` may be left empty when each of the two stages names its own model. Such a
+# configuration is an API configuration: it selects the API runner, and each stage asks its
+# own model. It used to select the dry-run planner without a word.
+
+
+def _channel(**keys: str) -> FlywheelConfig:
+    """An API configuration with an endpoint and no model, plus the `runner.api` keys given."""
+    cfg = FlywheelConfig()
+    cfg.runner.mode = "api"
+    cfg.runner.api.base_url = "http://127.0.0.1:9999/v1"
+    for key, value in keys.items():
+        setattr(cfg.runner.api, key, value)
+    return cfg
+
+
+def test_a_model_for_each_stage_and_no_common_one_selects_the_api_runner(tmp_path: Path):
+    cfg = _channel(model="", review_model=" r-model ", plan_model="p-model")
+    receipts = ImmutableFileStore(tmp_path / "receipts")
+
+    assert clients_mod.api_model_label(cfg.runner.api) == "r-model/p-model"
+    assert clients_mod.resolve_runner_mode(cfg) == "api:r-model/p-model"
+    assert isinstance(clients_mod.build_runner(cfg, receipts), OpenAICompatibleRunner)
+    runner = OpenAICompatibleRunner(cfg, receipts)
+    assert [runner._resolve_stage_api_params(stage)[0] for stage in (P02_STAGE, P03_STAGE)] == ["r-model", "p-model"]
+
+
+@pytest.mark.parametrize(
+    ("model", "keys", "label", "runner"),
+    [
+        pytest.param("", {"review_model": "r-model"}, "", DryRunHeuristicRunner, id="review-model-alone"),
+        pytest.param("", {"plan_model": "p-model"}, "", DryRunHeuristicRunner, id="plan-model-alone"),
+        pytest.param("", {"review_model": "r-model", "plan_model": "  "}, "", DryRunHeuristicRunner, id="plan-model-blank"),
+        pytest.param("", {}, "", DryRunHeuristicRunner, id="nothing-configured"),
+        pytest.param("common-model", {"review_model": "r-model", "plan_model": "p-model"}, "common-model", OpenAICompatibleRunner, id="the-common-model-is-the-label"),
+    ],
+)
+def test_the_api_channel_is_ready_only_when_every_stage_has_a_model(tmp_path: Path, model: str, keys: dict[str, str], label: str, runner: type):
+    cfg = _channel(model=model, **keys)
+
+    assert clients_mod.api_model_label(cfg.runner.api) == label
+    assert clients_mod.resolve_runner_mode(cfg) == (f"api:{label}" if label else "dry_run")
+    assert type(clients_mod.build_runner(cfg, ImmutableFileStore(tmp_path / "receipts"))) is runner
+
+
+@pytest.mark.parametrize("blocked", ["the-valve", "the-endpoint"])
+def test_two_stage_models_do_not_get_past_the_valve_or_a_missing_endpoint(tmp_path: Path, blocked: str):
+    cfg = _channel(review_model="r-model", plan_model="p-model")
+    if blocked == "the-valve":
+        cfg.safety_valves.model_execution_enabled = False
+    else:
+        cfg.runner.api.base_url = ""
+
+    assert clients_mod.resolve_runner_mode(cfg) == "dry_run"
+    assert isinstance(clients_mod.build_runner(cfg, ImmutableFileStore(tmp_path / "receipts")), DryRunHeuristicRunner)
+
+
+def test_a_stage_without_a_model_fails_instead_of_asking_with_a_blank_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Only the review names a model. The plan fails and names the cause: no request goes out with a blank model name, and no dry-run plan takes its place."""
+    runner = _staged_runner(tmp_path, model="", review_model="strong-review-model")
+    gateway = _Gateway([_review("s1")])
+    monkeypatch.setattr(httpx, "post", gateway)
+
+    with pytest.raises(PlanUnavailableError) as refused:
+        runner.plan_writes_detailed({"findings": []}, [], 8)
+
+    assert "缺少 planned_writes 列表" in str(refused.value)
+    assert "本批不写入" in str(refused.value)
+    assert refused.value.diagnostics.source == PLAN_SOURCE_MODEL
+    assert gateway.bodies == []
+
+    # The review has its model: it runs on it.
+    result = runner.review_sessions(_sessions("s1"), [])
+    assert [(request["model"], request["reasoning_effort"]) for request in gateway.bodies] == [("strong-review-model", "medium")]
+    assert [finding["session_key"] for finding in result["findings"]] == ["codex:s1"]
+
+
+def test_a_run_on_a_model_for_each_stage_and_no_common_one_is_an_api_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, heuristic_reviewer_forbidden: None
+):
+    rt, _ = _runtime(tmp_path)
+    rt.cfg.runner.api.model = ""
+    rt.cfg.runner.api.reasoning_effort = "medium"
+    rt.cfg.runner.api.review_model = "strong-review-model"
+    rt.cfg.runner.api.plan_model = "strong-plan-model"
+    _register(rt)
+    gateway = _Gateway([_review("s1"), '{"planned_writes": []}'])
+    monkeypatch.setattr(httpx, "post", gateway)
+
+    run = rt.orchestrator.start_run(trigger="test", phase="daily", session_keys=["codex:s1"], auto_approve_override=True)
+
+    assert run.status == RunStatus.PASS, run.error
+    assert run.runner_mode == "api:strong-review-model/strong-plan-model"
+    assert [(request["model"], request["reasoning_effort"]) for request in gateway.bodies] == [
+        ("strong-review-model", "medium"),
+        ("strong-plan-model", "medium"),
+    ]
+    p02, p03 = _node(run, "P02_REVIEW"), _node(run, "P03_ROUTE_PLAN")
+    assert p02.status == NodeStatus.PASS and p03.status == NodeStatus.PASS
+    assert p02.payload["review_source"] == REVIEW_SOURCE_MODEL
+    assert p02.payload["review_diagnostics"]["call_telemetry"]["model"] == "strong-review-model"
+    assert p03.payload["plan_source"] == PLAN_SOURCE_MODEL
+    assert p03.payload["plan_diagnostics"]["call_telemetry"]["model"] == "strong-plan-model"
+    assert rt.db.get_session("codex:s1").status == SessionStatus.PROCESSED
+
+
+# ---------------------------------------------------------------- one runner, two batches in flight
+# One runner serves more than one batch. A second batch is reviewed while the first is being
+# planned, on the same object from another thread: every call asks for the model and the effort
+# of its own stage, every batch keeps the telemetry of its own call, and neither batch leaves
+# its stage behind on the runner.
+
+
+WAIT = 10.0
+
+
+class _ScriptedGateway:
+    """Stands in for the model gateway and answers by the prompt's first line.
+
+    A review gets a review of the session it asks about; the plan gets malformed JSON first and
+    an empty plan after the format repair. One call — `hold_call`, by ordinal — is held inside
+    the gateway until the test releases it, so another call can complete while it waits.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []  # (the calling thread's name, the request body)
+        self.hold_call: int | None = None
+        self.held = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(self, url: str, headers: Any = None, json: Any = None, timeout: Any = None) -> httpx.Response:
+        prompt = json["messages"][1]["content"]
+        ordinal = len(self.calls)
+        self.calls.append((threading.current_thread().name, json))
+        if ordinal == self.hold_call:
+            self.held.set()
+            assert self.release.wait(WAIT), "the test never released the held call"
+        if prompt.startswith(_RecordingModel.P02_LINE):
+            content = _review("s2" if "codex:s2" in prompt else "s1")
+        elif prompt.startswith(_RecordingModel.REPAIR_LINE):
+            content = '{"planned_writes": []}'
+        else:
+            content = '{"planned_writes": [ BROKEN JSON'
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", url),
+            json={"model": "served-model", "choices": [{"message": {"content": content}}]},
+        )
+
+
+def _batch(name: str, work: Any, failures: list[BaseException]) -> threading.Thread:
+    """A thread that makes one batch's model calls; what it raises is kept for the test to report."""
+
+    def run() -> None:
+        try:
+            work()
+        except BaseException as exc:
+            failures.append(exc)
+
+    return threading.Thread(target=run, name=name, daemon=True)
+
+
+def _reached(event: threading.Event, failures: list[BaseException]) -> bool:
+    """Whether a step was reached in time; a batch that already died fails the wait at once."""
+    return not failures and event.wait(WAIT)
+
+
+def _model_and_effort(call: dict[str, Any]) -> tuple[str, str]:
+    return call["model"], call["reasoning_effort"]
+
+
+def test_two_batches_in_flight_on_one_runner_each_keep_their_own_stage_and_telemetry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    runner = _staged_runner(
+        tmp_path,
+        review_model="strong-review-model",
+        review_reasoning_effort="high",
+        plan_model="strong-plan-model",
+        plan_reasoning_effort="low",
+    )
+    runner.cfg.runner.api.transport_retries = 0
+    gateway = _ScriptedGateway()
+    monkeypatch.setattr(httpx, "post", gateway)
+
+    # Every call stops before it is made until the test opens its gate. `seen` is the stage the
+    # calling thread finds itself in on arrival: the other batch's stage must not be in it.
+    arrived = [threading.Event() for _ in range(4)]
+    gates = [threading.Event() for _ in range(4)]
+    seen: list[tuple[str, str, str]] = []
+    real_call = runner._call_chat_completion
+
+    def gated(prompt: str, system_prompt: str) -> str:
+        step = len(seen)
+        seen.append((threading.current_thread().name, runner._active_stage_model, runner._active_stage_effort))
+        arrived[step].set()
+        assert gates[step].wait(WAIT), "the test never opened this call's gate"
+        return real_call(prompt, system_prompt)
+
+    runner._call_chat_completion = gated
+
+    first_review_returned, repair_in_flight, second_review_returned = threading.Event(), threading.Event(), threading.Event()
+    telemetry: dict[str, tuple[str, str]] = {}
+    failures: list[BaseException] = []
+
+    def review_two_batches() -> None:
+        first = runner.review_sessions(_sessions("s1"), [])
+        telemetry["review-1"] = _model_and_effort(first["review_diagnostics"]["call_telemetry"])
+        first_review_returned.set()
+        assert repair_in_flight.wait(WAIT), "the format repair never became in flight"
+        second = runner.review_sessions(_sessions("s2"), [])
+        telemetry["review-2"] = _model_and_effort(second["review_diagnostics"]["call_telemetry"])
+        second_review_returned.set()
+
+    def plan_a_batch() -> None:
+        outcome = runner.plan_writes_detailed({"findings": []}, [], 8)
+        telemetry["plan"] = _model_and_effort(outcome.diagnostics.call_telemetry)
+
+    review_batch = _batch("review-batch", review_two_batches, failures)
+    plan_batch = _batch("plan-batch", plan_a_batch, failures)
+
+    try:
+        review_batch.start()
+        assert _reached(arrived[0], failures), failures  # a review is in flight
+        plan_batch.start()
+        assert _reached(arrived[1], failures), failures  # a plan is in flight too, on the same runner
+
+        gateway.hold_call = 0
+        gates[1].set()  # the plan's call reaches the gateway and is held there
+        assert gateway.held.wait(WAIT)
+        gates[0].set()  # the review's call goes through meanwhile
+        assert _reached(first_review_returned, failures), failures
+        gateway.release.set()
+        assert _reached(arrived[2], failures), failures  # malformed: the plan asks for the format repair
+
+        repair_in_flight.set()
+        assert _reached(arrived[3], failures), failures  # a second batch is reviewed while the repair waits
+        gates[3].set()
+        assert _reached(second_review_returned, failures), failures
+        review_batch.join(WAIT)
+        gates[2].set()  # the repair goes through once the review batch has left both its stages
+        plan_batch.join(WAIT)
+    finally:
+        # A failed step must not leave the two batches parked on their gates.
+        for gate in gates:
+            gate.set()
+        gateway.release.set()
+        review_batch.join(WAIT)
+        plan_batch.join(WAIT)
+
+    assert failures == [], failures
+    assert not review_batch.is_alive() and not plan_batch.is_alive()
+    assert [(thread, *_model_and_effort(request)) for thread, request in gateway.calls] == [
+        ("plan-batch", "strong-plan-model", "low"),
+        ("review-batch", "strong-review-model", "high"),
+        ("review-batch", "strong-review-model", "high"),
+        ("plan-batch", "strong-plan-model", "low"),
+    ]
+    assert seen == [
+        ("review-batch", "strong-review-model", "high"),
+        ("plan-batch", "strong-plan-model", "low"),
+        ("plan-batch", "strong-plan-model", "low"),
+        ("review-batch", "strong-review-model", "high"),
+    ]
+    # The review's call completed while the plan's was still held: each batch read its own call.
+    assert telemetry == {
+        "review-1": ("strong-review-model", "high"),
+        "review-2": ("strong-review-model", "high"),
+        "plan": ("strong-plan-model", "low"),
+    }
+    # Neither batch left its stage, or its last call, behind on the runner.
+    assert (runner._active_stage_model, runner._active_stage_effort) == ("", "")
+    assert runner._last_call_telemetry == {}
+    gateway.hold_call = None
+    real_call("p", "s")  # from this thread, with no stage in flight: the configured pair
+    assert [(thread, *_model_and_effort(request)) for thread, request in gateway.calls][-1] == ("MainThread", "mock-model", "medium")

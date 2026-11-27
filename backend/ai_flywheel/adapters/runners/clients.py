@@ -4,10 +4,16 @@ Both turn an untrusted reply into a plan or a review through the same contract
 (`outcomes.py`): an unusable reply fails the node, it never falls back to the local
 heuristic planner. `resolve_runner_mode` is the single source of truth for which runner
 a configuration selects, and `build_runner` follows it.
+
+A reply is cached only once it proved usable — and never when any text of it carries a
+credential: the item the privacy gate refused is still in the reply, and the cache is a
+plain file on disk.
 """
 from __future__ import annotations
 
+import contextvars
 import json
+import logging
 import subprocess
 import time
 from contextlib import contextmanager
@@ -36,6 +42,8 @@ from ai_flywheel.adapters.runners.outcomes import (
     _plan_from_runner_output,
     _review_from_runner_output,
     deposit_page_types,
+    plan_reply_refused_a_credential,
+    reply_carries_secret,
 )
 from ai_flywheel.adapters.runners.prompts import (
     _build_p02_prompt,
@@ -43,13 +51,83 @@ from ai_flywheel.adapters.runners.prompts import (
     _existing_skill_sections,
 )
 from ai_flywheel.adapters.wiki.router import RoutingCandidates
-from ai_flywheel.config import FlywheelConfig
+from ai_flywheel.config import ApiRunnerConfig, FlywheelConfig
 from ai_flywheel.models import PlannedWrite, RetroItem, RuleRecord, SessionRecord
 from ai_flywheel.storage.fs_store import ImmutableFileStore, canonical_hash
+
+logger = logging.getLogger(__name__)
 
 # The two stages that call a model; their names also head their cache file names.
 P02_STAGE = "p02_review"
 P03_STAGE = "p03_plan"
+
+
+def _write_reply_cache(cache_file: Path, parsed: Any) -> bool:
+    """Write a validated reply to its cache file. Returns whether it was written.
+
+    Only a caller that found the reply usable may come here, and even then one reply is
+    refused: one that carries a credential anywhere in its text. The privacy gate reads
+    items one by one, so a reply may hold a usable item next to the one it refused — and
+    that refused item is still in the reply. The cache is a plain JSON file on disk, read
+    back verbatim by the next identical batch, so such a reply is never written: the next
+    run asks the model again instead. The log names the kind of credential, never the value.
+    """
+    if not isinstance(parsed, dict):
+        return False
+    shape = reply_carries_secret(parsed)
+    if shape is not None:
+        logger.warning(
+            "Reply not cached (%s): a credential shape is in the reply (%s). The next identical batch asks again.",
+            cache_file.name,
+            shape,
+        )
+        return False
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text(json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8")
+    return True
+
+
+def _read_cached_reply(cache_file: Path) -> Any | None:
+    """The cached reply for a prompt, or None when this run may not use one.
+
+    A file that is not JSON is ignored, as it always was. So is one that carries a
+    credential: the cache stopped writing such replies, and a file written before that is
+    not served — the run asks again — nor left on disk. It is the product's own cache
+    file, and a credential in it is plaintext at rest for as long as it exists.
+    """
+    try:
+        cached = json.loads(cache_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    shape = reply_carries_secret(cached)
+    if shape is None:
+        return cached
+    logger.warning(
+        "Cached reply discarded (%s): a credential shape is in it (%s). The run asks again.",
+        cache_file.name,
+        shape,
+    )
+    try:
+        cache_file.unlink()
+    except OSError as exc:
+        # Still not served; the name above tells the maintainer which file to remove by hand.
+        logger.warning("Cached reply (%s) could not be removed: %s", cache_file.name, type(exc).__name__)
+    return None
+
+
+def _cached_reply(cache_file: Path, reply_trace: dict[str, Any] | None) -> Any | None:
+    """The cached reply to serve for a prompt, or None when this run has to ask.
+
+    Says in ``reply_trace["cache_hit"]`` what became of a cache file that exists: served,
+    or discarded because it carries a credential. A run that asks the model after a
+    discarded file is not reported as a cache hit.
+    """
+    if not cache_file.exists():
+        return None
+    cached = _read_cached_reply(cache_file)
+    if reply_trace is not None:
+        reply_trace["cache_hit"] = cached is not None
+    return cached
 
 
 def _plan_write_caps(cfg: FlywheelConfig, routing_candidates: RoutingCandidates | None) -> tuple[int | None, int | None]:
@@ -79,12 +157,9 @@ class CliSubprocessRunner(BaseWorkflowRunner):
         return self.fs_store.root / "cli_cache" / f"{stage}-{prompt_hash[:16]}.json"
 
     @staticmethod
-    def _persist_cache(cache_file: Path, parsed: Any) -> None:
-        """Write a validated reply to the cache. Only called once the reply passed validation."""
-        if not isinstance(parsed, dict):
-            return
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text(json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8")
+    def _persist_cache(cache_file: Path, parsed: Any) -> bool:
+        """Write a validated reply to the cache — unless it carries a credential, see `_write_reply_cache`."""
+        return _write_reply_cache(cache_file, parsed)
 
     def _invoke_cli(
         self, stage: str, prompt: str, reply_trace: dict[str, Any] | None = None
@@ -100,11 +175,9 @@ class CliSubprocessRunner(BaseWorkflowRunner):
             return None
 
         cache_file = self._cache_file(stage, prompt)
-        if cache_file.exists():
-            try:
-                return json.loads(cache_file.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                pass
+        cached = _cached_reply(cache_file, reply_trace)
+        if cached is not None:
+            return cached
 
         cmd = [cli_cfg.command]
         used_placeholder = False
@@ -150,9 +223,9 @@ class CliSubprocessRunner(BaseWorkflowRunner):
             session_char_limit=self.cfg.runner.api.p02_session_char_limit,
         )
         cache_file = self._cache_file(P02_STAGE, prompt)
-        cache_hit = cache_file.exists()
         reply_trace: dict[str, Any] = {}
         parsed = self._invoke_cli(P02_STAGE, prompt, reply_trace=reply_trace)
+        cache_hit = reply_trace.get("cache_hit", cache_file.exists())
         review = _review_from_runner_output(
             parsed,
             source=REVIEW_SOURCE_CLI,
@@ -166,7 +239,7 @@ class CliSubprocessRunner(BaseWorkflowRunner):
             cache_file_present=cache_hit,
         )
         # The review is usable: now the reply may be cached for the next identical batch.
-        self._persist_cache(cache_file, parsed)
+        _cache_review_reply(self._persist_cache, cache_file, parsed, cache_hit)
         review["runner"] = f"cli:{self.cfg.runner.cli.command}"
         review["sent_session_keys"] = [s.session_key for s, _ in sessions[:P02_MAX_SESSIONS]]
         return review
@@ -197,9 +270,9 @@ class CliSubprocessRunner(BaseWorkflowRunner):
             total_write_set=total_write_set,
         )
         cache_file = self._cache_file(P03_STAGE, prompt)
-        cache_hit = cache_file.exists()
         reply_trace: dict[str, Any] = {}
         parsed = self._invoke_cli(P03_STAGE, prompt, reply_trace=reply_trace)
+        cache_hit = reply_trace.get("cache_hit", cache_file.exists())
         outcome = _plan_from_runner_output(
             parsed,
             source=PLAN_SOURCE_CLI,
@@ -214,13 +287,30 @@ class CliSubprocessRunner(BaseWorkflowRunner):
             max_domain_writes=max_domain_writes,
             total_write_set=total_write_set,
         )
-        # The plan is usable: now the reply may be cached for the next identical batch.
-        self._persist_cache(cache_file, parsed)
+        # The plan is usable: now the reply may be cached for the next identical batch —
+        # unless the privacy gate refused part of it, or a kept draft carries a credential.
+        _cache_plan_reply(self._persist_cache, cache_file, parsed, outcome)
         return outcome
 
     def plan_writes(self, *args: Any, **kwargs: Any) -> list[PlannedWrite]:
         """The plan alone; same contract and failures as `plan_writes_detailed`."""
         return self.plan_writes_detailed(*args, **kwargs).planned_writes
+
+
+def _cache_plan_reply(
+    persist: Any, cache_file: Path, parsed: Any, outcome: PlanOutcome
+) -> bool:
+    """Cache the reply behind a usable plan, when nothing in it carries a credential.
+
+    The item the privacy gate refused never reaches the plan, but it is still in the
+    reply; and the title and summary of a kept item are not gated when the plan is
+    normalised. Either is a reason to leave the whole reply out of the cache: the plan
+    itself is unaffected. A plan that was not cached names no cache file, so no later
+    message tells the maintainer to delete a file that does not exist.
+    """
+    if plan_reply_refused_a_credential(outcome, parsed) is not None:
+        outcome.diagnostics.cache_file = None
+    return persist(cache_file, parsed)
 
 
 class OpenAICompatibleRunner(BaseWorkflowRunner):
@@ -229,13 +319,37 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
     def __init__(self, cfg: FlywheelConfig, fs_store: ImmutableFileStore) -> None:
         self.cfg = cfg
         self.fs_store = fs_store
-        # What the last model call cost. Reset on every call; a stubbed call leaves it empty.
-        self._last_call_telemetry: dict[str, Any] = {}
-        # The model and the reasoning effort of the stage a call belongs to. `_invoke_api`
-        # sets them around its calls and restores them in `finally`; empty means that no
-        # stage is in flight and the configured `model` / `reasoning_effort` apply.
-        self._active_stage_model = ""
-        self._active_stage_effort = ""
+        # What the last model call cost, for the thread that made it. Reset on every call; a
+        # stubbed call leaves it empty.
+        self._call_telemetry: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
+            "flywheel_call_telemetry", default={}
+        )
+        # The model and the reasoning effort of the stage a call belongs to: `(model, effort)`
+        # while one is in flight, None when none is. A context variable rather than an
+        # attribute, because one runner is shared: two batches run it from two threads, and
+        # each thread's context is its own. An attribute would let one batch's exit restore
+        # the values it saw on entry over the stage the other batch entered meanwhile.
+        # Empty values mean that no stage is in flight and the configured pair applies.
+        self._stage_params: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
+            "flywheel_stage_params", default=None
+        )
+
+    @property
+    def _last_call_telemetry(self) -> dict[str, Any]:
+        """The telemetry of the last call made from this thread; empty before the first one."""
+        return self._call_telemetry.get()
+
+    @property
+    def _active_stage_model(self) -> str:
+        """The model of the stage in flight in this thread; empty when none is."""
+        params = self._stage_params.get()
+        return params[0] if params else ""
+
+    @property
+    def _active_stage_effort(self) -> str:
+        """The reasoning effort of the stage in flight in this thread; empty when none is."""
+        params = self._stage_params.get()
+        return params[1] if params else ""
 
     def _resolve_stage_api_params(self, stage: str) -> tuple[str, str]:
         """The model and the reasoning effort a stage really runs with.
@@ -261,15 +375,14 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
 
         The two-argument `_call_chat_completion(prompt, system_prompt)` keeps its signature —
         a sandbox replay replaces it with a stub that takes no stage — and reads the stage
-        off these attributes instead. Whatever happens inside, the previous values are back
-        afterwards.
+        off the context instead. Whatever happens inside, the stage that was in flight
+        before is back afterwards, in the thread that entered.
         """
-        previous = (self._active_stage_model, self._active_stage_effort)
-        self._active_stage_model, self._active_stage_effort = self._resolve_stage_api_params(stage)
+        token = self._stage_params.set(self._resolve_stage_api_params(stage))
         try:
             yield
         finally:
-            self._active_stage_model, self._active_stage_effort = previous
+            self._stage_params.reset(token)
 
     def _call_chat_completion(self, prompt: str, system_prompt: str) -> str:
         """One chat completion call.
@@ -290,9 +403,9 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
         # The model and the effort the call in flight asks for: the stage's own when one is
         # in flight (`_stage_call`), the configured pair otherwise.
         model, effort = api_cfg.model, (api_cfg.reasoning_effort or "").strip()
-        if (self._active_stage_model or "").strip():
-            model = self._active_stage_model
-            effort = (self._active_stage_effort or "").strip()
+        stage_params = self._stage_params.get()
+        if stage_params is not None and (stage_params[0] or "").strip():
+            model, effort = stage_params[0], (stage_params[1] or "").strip()
         body: dict[str, Any] = {
             "model": model,
             "messages": [
@@ -316,7 +429,7 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
             "completion_tokens": None,
             "reasoning_tokens": None,
         }
-        self._last_call_telemetry = telemetry
+        self._call_telemetry.set(telemetry)
         started = time.perf_counter()
         max_attempts = 1 + max(0, int(api_cfg.transport_retries or 0))
         attempts = 0
@@ -392,12 +505,9 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
         return self.fs_store.root / "api_cache" / f"{stage}-{prompt_hash[:16]}.json"
 
     @staticmethod
-    def _persist_cache(cache_file: Path, parsed: Any) -> None:
-        """Write a validated reply to the cache. Only called once the reply passed validation."""
-        if not isinstance(parsed, dict):
-            return
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text(json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8")
+    def _persist_cache(cache_file: Path, parsed: Any) -> bool:
+        """Write a validated reply to the cache — unless it carries a credential, see `_write_reply_cache`."""
+        return _write_reply_cache(cache_file, parsed)
 
     def _invoke_api(
         self,
@@ -415,19 +525,20 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
         unusable output never poisons the next run.
         """
         api_cfg = self.cfg.runner.api
+        # The model this stage really asks: its own when one is configured, the configured
+        # `model` otherwise. A blank one (and no valve, no endpoint) means there is no call to make.
+        effective_model = self._resolve_stage_api_params(stage)[0].strip()
         if (
             not self.cfg.safety_valves.effective_model_execution_enabled
             or not api_cfg.base_url
-            or not self._resolve_stage_api_params(stage)[0].strip()
+            or not effective_model
         ):
             return None
 
         cache_file = self._cache_file(stage, prompt)
-        if cache_file.exists():
-            try:
-                return json.loads(cache_file.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                pass
+        cached = _cached_reply(cache_file, reply_trace)
+        if cached is not None:
+            return cached
 
         sys_prompt = "You are an AI Flywheel workflow worker. Return strictly valid JSON with no markdown prose outside JSON."
         try:
@@ -488,7 +599,6 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
             session_char_limit=self.cfg.runner.api.p02_session_char_limit,
         )
         cache_file = self._cache_file(P02_STAGE, prompt)
-        cache_hit = cache_file.exists()
         reply_trace: dict[str, Any] = {}
         parsed = self._invoke_api(
             P02_STAGE,
@@ -496,6 +606,7 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
             repair_schema_hint='{"findings":[...],"events":[...],"mistakes":[...],"dissents":[...],"repeated_workflows":[...]}',
             reply_trace=reply_trace,
         )
+        cache_hit = reply_trace.get("cache_hit", cache_file.exists())
         review = _review_from_runner_output(
             parsed,
             source=REVIEW_SOURCE_MODEL,
@@ -512,7 +623,7 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
             cache_file_present=cache_hit,
         )
         # The review is usable: now the reply may be cached for the next identical batch.
-        self._persist_cache(cache_file, parsed)
+        _cache_review_reply(self._persist_cache, cache_file, parsed, cache_hit)
         review["runner"] = f"api:{model}"
         review["sent_session_keys"] = [s.session_key for s, _ in sessions[:P02_MAX_SESSIONS]]
         return review
@@ -553,6 +664,7 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
         )
         reply_trace: dict[str, Any] = {}
         parsed = self._invoke_api(P03_STAGE, prompt, repair_schema_hint=repair_hint, reply_trace=reply_trace)
+        cache_hit = reply_trace.get("cache_hit", cache_file.exists())
         outcome = _plan_from_runner_output(
             parsed,
             source=PLAN_SOURCE_MODEL,
@@ -568,13 +680,44 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
             total_write_set=total_write_set,
             model=model,
         )
-        # The plan is usable: now the reply may be cached for the next identical batch.
-        self._persist_cache(cache_file, parsed)
+        # The plan is usable: now the reply may be cached for the next identical batch —
+        # unless the privacy gate refused part of it, or a kept draft carries a credential.
+        _cache_plan_reply(self._persist_cache, cache_file, parsed, outcome)
         return outcome
 
     def plan_writes(self, *args: Any, **kwargs: Any) -> list[PlannedWrite]:
         """The plan alone; same contract and failures as `plan_writes_detailed`."""
         return self.plan_writes_detailed(*args, **kwargs).planned_writes
+
+
+def _cache_review_reply(persist: Any, cache_file: Path, parsed: Any, cache_hit: bool) -> None:
+    """Cache the reply behind a usable review, when nothing in it carries a credential.
+
+    A review quotes the sessions it read, so a credential one of them held can be in its
+    findings; such a reply stays out of the cache. The review itself is unaffected, and its
+    diagnostics stop naming a cache file that was never written.
+    """
+    if not persist(cache_file, parsed) and not cache_hit:
+        if isinstance(parsed, dict) and isinstance(parsed.get("review_diagnostics"), dict):
+            parsed["review_diagnostics"]["cache_file"] = None
+
+
+def api_model_label(api_cfg: ApiRunnerConfig) -> str:
+    """The model the API channel runs on; empty when the configuration names none.
+
+    The configured ``model`` serves every stage. A configuration may leave it empty and
+    name a model for each of the two stages instead; both are needed, because one stage
+    on its own would leave the other with nothing to ask. Such a channel is named
+    ``<review_model>/<plan_model>``.
+    """
+    model = (api_cfg.model or "").strip()
+    if model:
+        return model
+    review_model = (api_cfg.review_model or "").strip()
+    plan_model = (api_cfg.plan_model or "").strip()
+    if review_model and plan_model:
+        return f"{review_model}/{plan_model}"
+    return ""
 
 
 def resolve_runner_mode(cfg: FlywheelConfig) -> str:
@@ -583,14 +726,19 @@ def resolve_runner_mode(cfg: FlywheelConfig) -> str:
     The single source of truth for the runner-mode string: `build_runner` follows it, and
     the orchestrator records it on the run. A valve that forbids execution turns any mode
     into the local dry-run planner.
+
+    The API channel is ready when it names a model (`api_model_label`): the configured
+    one, or one for each stage. A configuration that names a model for each stage and no
+    common one is an API configuration, not a dry-run one.
     """
+    model = api_model_label(cfg.runner.api)
     if (
         cfg.runner.mode == "api"
         and cfg.runner.api.base_url
-        and cfg.runner.api.model
+        and model
         and cfg.safety_valves.effective_model_execution_enabled
     ):
-        return f"api:{cfg.runner.api.model}"
+        return f"api:{model}"
     if (
         cfg.runner.mode == "cli"
         and cfg.runner.cli.command

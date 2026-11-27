@@ -10,8 +10,12 @@ written once; it is completed over many sessions. It therefore has two write sha
 The merge is additive by construction. Every line of the page is kept, in its order, and
 only ``updated`` changes in the frontmatter. The one exception is the template's
 placeholder line 「无」: it stood for an empty section and gives way when that section
-receives its first content. Content the page already holds is not written twice: a row or
-a block that is already there is dropped and counted, never duplicated.
+receives its first content. Content the target already holds is not written twice: a row
+the target table already has, or a line or block the target section already has, is
+dropped and counted, never duplicated. The unit of "already there" is that target and
+nothing wider — two sections of one page may well hold the same row or the same line
+(a parameter every environment shares, a note two tables both need), so a line another
+section holds is never a reason to drop it here.
 
 Everything here is a pure function of its inputs: no model call, no clock, no file access.
 """
@@ -235,18 +239,32 @@ def _code_blocks(lines: list[str], mask: list[bool]) -> set[str]:
     return blocks
 
 
-def _page_index(lines: list[str], mask: list[bool]) -> tuple[set[str], set[str], set[str]]:
-    """(row keys, trimmed lines, fenced blocks) the page body already holds."""
-    rows: set[str] = set()
+@dataclass
+class _Scope:
+    """What one target already holds: the rows of its table, its own lines, its fenced blocks."""
+
+    rows: set[str]
+    text_lines: set[str]
+    code_blocks: set[str]
+
+
+def _scope(body: list[str], mask: list[bool], section: _Section | None, table: _Table | None) -> _Scope:
+    """What the place an increment section is merged into already holds.
+
+    That place is the target section, and for rows the table they join: the section's
+    last table. Nothing wider. A whole-page index would read a row another section holds
+    as one this section already has, and drop it.
+    """
+    rows = {_row_key(_cells(body[index])) for index in range(table.start, table.end)} if table is not None else set()
+    if section is None:
+        # A section the page does not have yet: whatever it will hold is new.
+        return _Scope(rows, set(), set())
     text_lines: set[str] = set()
-    for index, line in enumerate(lines):
-        if mask[index] or not line.strip():
-            continue
-        if _ROW_RE.match(line):
-            rows.add(_row_key(_cells(line)))
-        else:
-            text_lines.add(line.strip())
-    return rows, text_lines, _code_blocks(lines, mask)
+    for index in range(section.start + 1, section.end):
+        if not mask[index] and not _ROW_RE.match(body[index]) and body[index].strip():
+            text_lines.add(body[index].strip())
+    inside = mask[section.start + 1 : section.end]
+    return _Scope(rows, text_lines, _code_blocks(body[section.start + 1 : section.end], inside))
 
 
 def _trim_blank(lines: list[str]) -> list[str]:
@@ -420,7 +438,6 @@ def merge_domain_increment(
     body = lines[close + 1 :]
     mask = _fence_mask(body)
     page_sections = _sections(body, mask)
-    row_keys, text_lines, code_blocks = _page_index(body, mask)
     template_index = {_section_name(name): position for position, name in enumerate(template_sections or ())}
 
     result = MergeResult()
@@ -431,8 +448,12 @@ def merge_domain_increment(
     started_tables: dict[str, list[str]] = {}  # header of a table this merge starts, by section
     seen: set[str] = set()
 
-    def fresh_rows(chunk: _Chunk, table: _Table | None, label: str) -> list[str] | None:
-        """Rows of the chunk the page does not hold yet; None once a problem is recorded."""
+    def fresh_rows(chunk: _Chunk, table: _Table | None, label: str, held: set[str]) -> list[str] | None:
+        """Rows of the chunk the target table does not hold yet; None once a problem is recorded.
+
+        ``held`` is the set of row keys that table holds; a row kept here joins it, so a
+        later chunk of the same section cannot add the same row again.
+        """
         current = table.header if table is not None else started_tables.get(label)
         header = chunk.header if chunk.header is not None else current
         if header is None:
@@ -452,23 +473,25 @@ def merge_domain_increment(
                 )
                 return None
             key = _row_key(cells)
-            if key in row_keys:
+            if key in held:
                 result.duplicates += 1
                 continue
-            row_keys.add(key)
+            held.add(key)
             fresh.append(row)
         if fresh and chunk.header is not None and current is None:
             started_tables[label] = list(chunk.header)
         return fresh
 
-    def fresh_block(chunk: _Chunk) -> list[str]:
-        """The lines of the chunk the page does not hold yet; the ones it holds are counted."""
+    def fresh_block(chunk: _Chunk, held_text: set[str], held_code: set[str]) -> list[str]:
+        """The lines of the chunk the target section does not hold yet; the ones it holds are counted."""
         if chunk.kind == "code":
-            if "\n".join(line.strip() for line in chunk.lines) in code_blocks:
+            if "\n".join(line.strip() for line in chunk.lines) in held_code:
                 result.duplicates += 1
                 return []
             return list(chunk.lines)
-        fresh = [line for line in chunk.lines if line.strip() not in text_lines]
+        # A placeholder line in an increment states that the section has nothing; it is never
+        # content, so it is never added — a section the page lacks does not gain one either.
+        fresh = [line for line in chunk.lines if line.strip() != PLACEHOLDER and line.strip() not in held_text]
         result.duplicates += len(chunk.lines) - len(fresh)
         return fresh
 
@@ -483,6 +506,8 @@ def merge_domain_increment(
             break
         tables = _tables(body, mask, target.start + 1, target.end) if target is not None else []
         table = tables[-1] if tables else None
+        # Read per section, and for rows per table: what another section holds is not a duplicate here.
+        held = _scope(body, mask, target, table)
         head: list[str] = []  # header and separator when the merge starts the section's table
         rows: list[str] = []
         blocks: list[list[str]] = []
@@ -490,11 +515,11 @@ def merge_domain_increment(
             if not chunk.lines:
                 continue
             if chunk.kind != "rows":
-                block = fresh_block(chunk)
+                block = fresh_block(chunk, held.text_lines, held.code_blocks)
                 if block:
                     blocks.append(block)
                 continue
-            fresh = fresh_rows(chunk, table, section.name)
+            fresh = fresh_rows(chunk, table, section.name, held.rows)
             if result.problems:
                 break
             if table is None and fresh and not head and section.name in started_tables:

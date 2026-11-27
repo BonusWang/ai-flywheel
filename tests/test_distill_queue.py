@@ -4,7 +4,7 @@
 1. Codex 严格归档制：活跃目录不入队、归档入队、移出撤回、增长生成增量 revision；
 2. Claude Code 退出触发制：Stop 不入队、SessionEnd 入队、resume / 新提示撤回；
 3. MCP `flywheel_session_intent`：显式入队绕过初筛、opt_out 一票否决、withdraw 可再入队；
-4. 超大上下文 0-token 瘦身与分片：尾部结论不丢；
+4. 超大上下文 0-token 瘦身与分片：尾部结论不丢；装得下一个队列项的对话逐字入队；
 5. P00–P07 队列消费：认领、结算、水位线推进与轨迹查询；
 6. 失败重试、死信隔离与审批取消零惩罚退回；
 7. 规则重筛 dry_run 只读预览与实际应用；
@@ -19,14 +19,26 @@ import json
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
+from ai_flywheel.adapters.runners.clients import OpenAICompatibleRunner
+from ai_flywheel.adapters.runners.prompts import P02_MIDDLE_OMITTED
 from ai_flywheel.app import create_app
 from ai_flywheel.config import FlywheelConfig, ScanSourceConfig, SessionTriageConfig
 from ai_flywheel.core.pipeline.events import EventBroker
-from ai_flywheel.core.queue_service import compute_content_hash
+from ai_flywheel.core.queue_service import (
+    HAND_DISTILLED_SKIP,
+    MAX_BRIEF_DEPTH,
+    MAX_COMPACT_TURN_CHARS,
+    compact_turn_text,
+    compute_content_hash,
+    prepare_queue_chunks,
+    redact_structured_brief,
+    render_structured_brief,
+)
 from ai_flywheel.core.triage import is_controlled_write_dispatch, triage_session
 from ai_flywheel.models import (
     DistillQueueItem,
@@ -41,6 +53,10 @@ from ai_flywheel.runtime import FlywheelRuntime
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+#: What a structured brief carries in place of a credential, and of a value nested too deep.
+REDACTED = "[REDACTED]"
+TRUNCATED = "[TRUNCATED]"
+
 #: A realistic conversation: a deploy failure, its diagnosis and the verified fix.
 CONTENT = (
     "用户：部署时报错，连接池超时，请排查。"
@@ -51,7 +67,9 @@ CONTENT = (
 # ---------------------------------------------------------------- helpers
 
 
-def _runtime(tmp_path: Path, *, retries: int | None = None) -> FlywheelRuntime:
+def _runtime(
+    tmp_path: Path, *, retries: int | None = None, runner_mode: str | None = None
+) -> FlywheelRuntime:
     shutil.copytree(REPO_ROOT / "profile", tmp_path / "profile")
     skills = tmp_path / "skills"
     skills.mkdir()
@@ -63,7 +81,75 @@ def _runtime(tmp_path: Path, *, retries: int | None = None) -> FlywheelRuntime:
     cfg.sessions.triage.gray_workspace_min_chars = 40
     if retries is not None:
         cfg.sessions.queue_max_retries = retries
+    if runner_mode == "api":
+        # The model gateway is never asked: a test that selects `api` answers the
+        # runner's one call itself (`_CannedModel`), so the batch reaches the
+        # prompt the review would have sent without a model or a network.
+        cfg.runner.mode = "api"
+        cfg.runner.api.base_url = "http://127.0.0.1:9999/v1"
+        cfg.runner.api.model = "mock-model"
     return FlywheelRuntime(cfg, skip_fts_sync=True)
+
+
+class _CannedModel:
+    """Stands in for the model gateway and keeps every prompt it was asked.
+
+    P02 gets a review with one finding for ``session_key``, P03 an empty plan (so the
+    batch has nothing to write), and any other prompt is a failure of the test.
+    """
+
+    def __init__(self, session_key: str) -> None:
+        self.session_key = session_key
+        self.prompts: list[str] = []
+
+    def __call__(self, prompt: str, system_prompt: str) -> str:
+        self.prompts.append(prompt)
+        if prompt.startswith("You are the P02 Review Worker"):
+            client, _, session_id = self.session_key.partition(":")
+            return json.dumps(
+                {
+                    "findings": [
+                        {
+                            "session_key": self.session_key,
+                            "client": client,
+                            "project": "demo",
+                            "title": "部署报错修复",
+                            "worthy": True,
+                            "category": "project",
+                            "skip_reason": "",
+                            "facts": ["连接池上限过小导致超时"],
+                            "anomalies": [],
+                            "tags": ["demo"],
+                            "suggest_rule": False,
+                            "skill_route": {
+                                "hit": False,
+                                "action": "none",
+                                "target_skill": "",
+                                "reason": "单次任务",
+                            },
+                        }
+                    ],
+                    "events": [],
+                    "mistakes": [],
+                    "dissents": [],
+                    "repeated_workflows": [],
+                },
+                ensure_ascii=False,
+            )
+        if prompt.startswith("You are the P03 Route & Write-Plan Worker"):
+            return '{"planned_writes": []}'
+        raise AssertionError(f"the model gateway was asked an unexpected prompt: {prompt[:80]!r}")
+
+    def p02_prompt(self) -> str:
+        """The one P02 prompt of the batch."""
+        reviews = [p for p in self.prompts if p.startswith("You are the P02 Review Worker")]
+        assert len(reviews) == 1, [prompt.split("\n", 1)[0] for prompt in self.prompts]
+        return reviews[0]
+
+
+def _p02_entries(prompt: str) -> list[dict[str, str]]:
+    """The session entries of a P02 prompt's input."""
+    return json.loads(prompt.rsplit("\n\n", 1)[1])["sessions"]
 
 
 def _write_jsonl(path: Path, turns: list[tuple[str, str]]) -> None:
@@ -441,6 +527,107 @@ def test_oversized_transcript_is_compacted_and_split_without_losing_the_tail(tmp
     assert all(len(text) <= rt.cfg.sessions.queue_max_item_chars for text in loaded)
     # The final conclusion lives in the last chunk: nothing is silently truncated.
     assert conclusion in loaded[-1]
+
+
+# ---- 4.1 装得下一个队列项的对话逐字入队
+
+
+#: A fact in the middle of a long answer: exactly where the queue used to fold the turn.
+MID_FACT = "MID-FACT：根因是缓存失效策略缺失，过期时间加随机抖动后验收通过。"
+
+
+def _long_answer(chars: int = 12_000) -> str:
+    """One assistant turn of exactly ``chars`` characters, ``MID_FACT`` at its centre."""
+    lead = "[assistant] 先说明排查思路，再核对监控面板与发布记录。"
+    close = "结尾结论：修复已上线，压测与线上指标均已恢复。"
+    filler = "补充说明。"
+    room = chars - len(lead) - len(MID_FACT) - len(close)
+    half = room // 2
+    turn = lead + (filler * (half // len(filler) + 1))[:half] + MID_FACT
+    turn += (filler * (half // len(filler) + 1))[: room - half] + close
+    assert len(turn) == chars
+    return turn
+
+
+#: A 12,000-character answer to one question: far below one queue item, and below the budget
+#: the review allows one session, so nothing in it has to give way.
+LONG_DIALOGUE = "[user] 请排查这个报错并给出修复方案。\n\n" + _long_answer()
+
+
+def test_a_dialogue_that_fits_one_item_is_kept_word_for_word_however_long_one_turn_is():
+    """装得下一个队列项的对话逐字保留；只有整体放不下时，才折叠长轮次并分片。"""
+    answer = _long_answer()
+    assert len(answer) > MAX_COMPACT_TURN_CHARS
+
+    # The fold itself is unchanged: on its own, one long turn is still folded in the middle.
+    folded = compact_turn_text(answer)
+    assert MID_FACT not in folded
+    assert "chars compacted from the middle of this assistant turn" in folded
+    assert folded.startswith(answer[:1200]) and folded.endswith(answer[-800:])
+    assert compact_turn_text(MID_FACT) == MID_FACT
+
+    # A dialogue that fits the item is one chunk, and the chunk is the dialogue.
+    prepared = prepare_queue_chunks(LONG_DIALOGUE)
+    assert prepared["chunks"] == [
+        {
+            "chunk_index": 1,
+            "chunk_total": 1,
+            "chunk_text": LONG_DIALOGUE,
+            "turn_start": 0,
+            "turn_end": 2,
+        }
+    ]
+    assert (prepared["is_oversized"], prepared["omitted_middle_chunks"]) == (False, 0)
+    assert prepared["compacted_chars"] == len(LONG_DIALOGUE)
+
+    # At the limit itself it is still kept whole; one character over, folding begins.
+    exact = prepare_queue_chunks(LONG_DIALOGUE, max_item_chars=len(LONG_DIALOGUE))
+    assert exact["chunks"][0]["chunk_text"] == LONG_DIALOGUE
+    over = prepare_queue_chunks(LONG_DIALOGUE, max_item_chars=len(LONG_DIALOGUE) - 1)
+    (first,) = over["chunks"]
+    assert "chars compacted from the middle of this assistant turn" in first["chunk_text"]
+    assert MID_FACT not in first["chunk_text"]
+    assert len(first["chunk_text"]) <= len(LONG_DIALOGUE) - 1
+
+    # The part of a conversation that comes after a watermark is kept whole the same way.
+    delta = prepare_queue_chunks(LONG_DIALOGUE, from_turn=1)
+    assert delta["chunks"] == [
+        {"chunk_index": 1, "chunk_total": 1, "chunk_text": answer, "turn_start": 1, "turn_end": 2}
+    ]
+
+
+def test_the_middle_of_a_long_answer_reaches_the_p02_prompt_from_the_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """一条 12000 字的 assistant 回复：队列项原样保存，中段事实一路走到最终的 P02 prompt。"""
+    rt = _runtime(tmp_path, runner_mode="api")
+    assert rt.cfg.sessions.queue_max_item_chars == 24000
+    model = _CannedModel("claude-code:long-1")
+    monkeypatch.setattr(OpenAICompatibleRunner, "_call_chat_completion", model)
+
+    item = _enqueue(rt, "long-1", content=LONG_DIALOGUE)
+    assert (item.chunk_index, item.chunk_total, item.is_oversized) == (1, 1, False)
+    # An explicit enqueue carries the title as the opening turn.
+    queued_text = f"Title: 部署报错修复\n\n{LONG_DIALOGUE}"
+    assert (item.consumed_from_turn, item.consumed_to_turn) == (0, 3)
+    assert (item.compacted_chars, item.total_chars) == (len(queued_text),) * 2
+    assert item.payload["chunk_text"] == queued_text
+    assert rt.queue.load_queue_item_text(item) == queued_text
+
+    run = rt.orchestrator.start_run(
+        trigger="test", queue_ids=[item.queue_id], auto_approve_override=True
+    )
+    assert run.status == RunStatus.PASS, run.error
+    assert run.admitted_sessions == ["claude-code:long-1"]
+
+    prompt = model.p02_prompt()
+    (entry,) = _p02_entries(prompt)
+    assert entry["session_key"] == "claude-code:long-1"
+    assert entry["text"] == queued_text
+    assert MID_FACT in entry["text"]
+    assert P02_MIDDLE_OMITTED not in entry["text"]
+    assert "chars compacted" not in prompt
+    assert rt.db.get_queue_item(item.queue_id).status is QueueStatus.PROCESSED
 
 
 # ---------------------------------------------------------------- 5. P00–P07 队列消费
@@ -1853,6 +2040,102 @@ def test_hand_distilled_skip_on_a_session_that_was_never_queued_leaves_a_visible
     assert len(rt.db.list_session_queue_items("codex:k-2")) == 1
 
 
+@pytest.mark.parametrize("second", ["skipped", "governance_only"])
+def test_a_hand_distilled_declaration_is_judged_again_after_an_explicit_enqueue(
+    tmp_path: Path, second: str
+):
+    """幂等只看最新一次有效意图：整体跳过 → 显式入队并消费完 → 再声明一次，必须重新生效。"""
+    rt = _runtime(tmp_path)
+    key = "codex:k-3"
+    first = _enqueue(rt, "k-3", client="codex")
+    taken_out = _declare_hand_distilled(
+        rt, key, governance_only=False, wiki_paths=["projects/demo/first.md"]
+    )
+    assert (taken_out["status"], taken_out["distill_mode"]) == ("excluded", "skipped")
+    assert taken_out["queue_ids"] == [first.queue_id]
+    assert rt.queue.distill_mode_of(rt.db.get_session(key)) == "skipped"
+
+    # The person asks for the session explicitly: the newer revision distils it in full.
+    back = rt.queue.handle_session_intent(
+        "enqueue", session_key=key, project="demo", content=CONTENT
+    )
+    assert back["status"] == "queued"
+    assert rt.queue.distill_mode_of(rt.db.get_session(key)) == "full"
+    run = rt.orchestrator.start_run(
+        trigger="test", queue_ids=back["queue_ids"], auto_approve_override=True
+    )
+    assert run.status == RunStatus.PASS, run.error
+    assert _statuses(rt, key) == ["processed", "excluded"]
+    assert rt.db.get_session(key).status is SessionStatus.PROCESSED
+
+    # Said again: the skip on record is older than the explicit enqueue, so it is not
+    # this declaration. The newest revision has to say what was just said.
+    again = _declare_hand_distilled(
+        rt,
+        key,
+        governance_only=second == "governance_only",
+        wiki_paths=["projects/demo/second.md"],
+    )
+    assert again["distill_mode"] == second
+    assert len(again["queue_ids"]) == 1
+    newest = rt.db.get_queue_item(again["queue_ids"][0])
+    assert newest.queue_id != first.queue_id
+    assert newest.revision == first.revision + 2
+    assert newest.ingress_channel is IngressChannel.MCP_EXPLICIT
+    assert newest.payload["distill_mode"] == second
+    # The explicit enqueue started the record over: only what was reported since it counts.
+    assert newest.payload["hand_distilled_paths"] == ["projects/demo/second.md"]
+    if second == "skipped":
+        assert newest.status is QueueStatus.EXCLUDED
+        assert newest.exclude_reason_code == HAND_DISTILLED_SKIP
+        assert _statuses(rt, key) == ["excluded", "processed", "excluded"]
+    else:
+        assert newest.status is QueueStatus.QUEUED
+        assert _statuses(rt, key) == ["queued", "processed", "excluded"]
+
+    # The session says the same, and so does the audit trail of the new item.
+    session = rt.db.get_session(key)
+    assert rt.queue.distill_mode_of(session) == second
+    assert session.metadata["distill_mode"] == second
+    assert ("hand_distilled_skip" in session.metadata) is (second == "skipped")
+    assert session.metadata["hand_distilled_paths"] == ["projects/demo/second.md"]
+    declared = _declaration_events(rt, newest.queue_id)
+    assert len(declared) == 1
+    assert declared[0]["payload"]["distill_mode"] == second
+    assert declared[0]["to_status"] == ("excluded" if second == "skipped" else "queued")
+
+    # The declaration holds from here on, against the passive archive path alike.
+    grown = rt.queue.on_archive(
+        "codex", "k-3", project="demo", content=CONTENT + "\n用户：补充一轮结论。\n助手：已补充。"
+    )
+    if second == "skipped":
+        # Taken out again: however much the conversation grows, nothing is queued.
+        assert (grown["action"], grown["reason_code"]) == ("excluded", HAND_DISTILLED_SKIP)
+        assert not rt.db.list_session_queue_items(key, statuses=[QueueStatus.QUEUED])
+        assert len(rt.db.list_session_queue_items(key)) == 3
+        carrying = newest
+    else:
+        # Governed again: the conversation that follows stays governance-only.
+        assert grown["action"] == "enqueued"
+        carrying = grown["items"][0]
+        assert carrying.revision == newest.revision + 1
+        assert carrying.payload["distill_mode"] == "governance_only"
+        assert carrying.payload["hand_distilled_paths"] == newest.payload["hand_distilled_paths"]
+
+    # The same declaration once more is the same submission: no further revision, no audit.
+    latest = rt.db.get_latest_queue_revision(key)
+    events = len(rt.db.list_audit_events(entity_type="queue_item", entity_id=carrying.queue_id))
+    once_more = _declare_hand_distilled(
+        rt,
+        key,
+        governance_only=second == "governance_only",
+        wiki_paths=["projects/demo/second.md"],
+    )
+    assert once_more["queue_ids"] == [carrying.queue_id]
+    assert rt.db.get_latest_queue_revision(key) == latest
+    assert len(rt.db.list_audit_events(entity_type="queue_item", entity_id=carrying.queue_id)) == events
+
+
 # ---- 9.2 hand_distilled：被动归档不覆盖
 
 
@@ -2046,6 +2329,301 @@ async def test_ingest_session_persists_a_redacted_structured_brief_and_counts_it
         rt.db.get_session("claude:brief-2"), max_chars=500_000
     )
     assert plain_item.content_hash == compute_content_hash(plain_text)
+
+
+# ---- 9.3.1 结构化摘要：整棵树按键名与严格规则脱敏
+
+
+def _unshaped(tag: str) -> str:
+    """A value no shaped pattern knows, so only the rule named for it can catch it."""
+    return f"{tag}-7f3a9c"
+
+
+def test_a_structured_brief_is_redacted_as_one_tree_by_key_and_by_the_strict_rules():
+    """键名命中凭据：标量与它下面的列表、字典整体遮蔽；其余字符串走严格脱敏，中文的凭据赋值也在内。"""
+    listed, nested, deepest, typed, assigned, spoken = (
+        _unshaped(tag) for tag in ("listed", "nested", "deepest", "typed", "assigned", "spoken")
+    )
+    in_url = _unshaped("in-url")
+    brief = {
+        "password": [listed, "登录方式改为单点登录"],
+        "credentials": {"web": {"login": nested, "more": [{"deeper": deepest}]}},
+        "数据库密码": typed,
+        "accessToken": typed,
+        "facts": [
+            "连接池上限应大于并发工作线程数",
+            f"数据库密码={assigned}",
+            f"登录口令：{spoken}",
+            f"接口地址 https://example.test/api?token={in_url}",
+        ],
+        "decisions": [
+            {"what": "凭据改为环境变量注入", "db_password": "hunter2hunter2", "note": "仓库里不落明文"}
+        ],
+        "usage": {"input_tokens": 1200, "max_tokens": 4096, "token_count": 88},
+    }
+    submitted = json.loads(json.dumps(brief, ensure_ascii=False))
+
+    redacted = redact_structured_brief(brief)
+
+    assert redacted == {
+        "password": REDACTED,
+        "credentials": REDACTED,
+        "数据库密码": REDACTED,
+        "accessToken": REDACTED,
+        "facts": [
+            "连接池上限应大于并发工作线程数",
+            f"数据库密码={REDACTED}",
+            f"登录口令：{REDACTED}",
+            f"接口地址 https://example.test/api?token={REDACTED}",
+        ],
+        "decisions": [
+            {"what": "凭据改为环境变量注入", "db_password": REDACTED, "note": "仓库里不落明文"}
+        ],
+        "usage": {"input_tokens": 1200, "max_tokens": 4096, "token_count": 88},
+    }
+    # The brief that was handed in is read, not rewritten; a null under such a key stays null.
+    assert brief == submitted
+    assert redact_structured_brief({"password": None}) == {"password": None}
+    # What the review reads says the same, line by line.
+    rendered = render_structured_brief(redacted).splitlines()
+    assert "  - password: [REDACTED]" in rendered
+    assert "  - 数据库密码: [REDACTED]" in rendered
+    assert "  - facts: 数据库密码=[REDACTED]" in rendered
+    assert "  - facts: 连接池上限应大于并发工作线程数" in rendered
+
+
+@pytest.mark.parametrize(
+    ("key", "credential"),
+    [
+        # Names a credential, in either case, with any separator, and in Chinese.
+        ("password", True),
+        ("db_password", True),
+        ("DB-PASSWORD", True),
+        ("dbPassword", True),
+        ("passwords", True),
+        ("passwd", True),
+        ("passphrase", True),
+        ("passcode", True),
+        ("pwd", True),
+        ("secret", True),
+        ("client_secret", True),
+        ("clientSecret", True),
+        ("token", True),
+        ("auth_token", True),
+        ("access_token", True),
+        ("accessToken", True),
+        ("refresh-token", True),
+        ("credential", True),
+        ("credentials", True),
+        ("Authorization", True),
+        ("bearer", True),
+        ("jwt", True),
+        ("api_key", True),
+        ("apiKey", True),
+        ("API_KEY", True),
+        ("api_keys", True),
+        ("private_key", True),
+        ("privateKey", True),
+        ("ssh-key", True),
+        ("SSHKey", True),
+        ("access_key", True),
+        ("signing_key", True),
+        ("encryption_key", True),
+        ("license_key", True),
+        ("master_key", True),
+        ("密码", True),
+        ("数据库密码", True),
+        ("登录口令", True),
+        ("凭据", True),
+        ("访问令牌", True),
+        # … or does not: a figure about tokens, a key that is not a credential, a plain key,
+        # a word that only starts like one.
+        ("facts", False),
+        ("decisions", False),
+        ("key", False),
+        ("keys", False),
+        ("keyword", False),
+        ("monkey", False),
+        ("primary_key", False),
+        ("foreign_key", False),
+        ("partition_key", False),
+        ("sort_key", False),
+        ("session_key", False),
+        ("token_count", False),
+        ("max_tokens", False),
+        ("input_tokens", False),
+        ("output_tokens", False),
+        ("total_tokens", False),
+        ("tokens_used", False),
+        ("token_usage", False),
+        ("token_limit", False),
+        ("tokenizer", False),
+        ("secretary", False),
+    ],
+)
+def test_a_key_is_read_word_by_word_for_whether_it_names_a_credential(key: str, credential: bool):
+    from ai_flywheel.core.queue_service import _key_names_credential
+
+    value = _unshaped("under-the-key")
+    assert _key_names_credential(key) is credential
+    assert redact_structured_brief({"facts": [{key: value}]}) == {
+        "facts": [{key: REDACTED if credential else value}]
+    }
+
+
+def _nested(value: Any, levels: int) -> Any:
+    for _ in range(levels):
+        value = {"nested": value}
+    return value
+
+
+def test_a_structured_brief_is_read_six_levels_deep_and_no_further():
+    """摘要最多读到第 6 层；更深的内容以 `[TRUNCATED]` 占位，原文一个字都不落。"""
+    kept, lost = _unshaped("kept"), _unshaped("lost")
+    redacted = redact_structured_brief(
+        {
+            "facts": _nested(kept, MAX_BRIEF_DEPTH - 2),
+            "more": _nested(lost, MAX_BRIEF_DEPTH - 1),
+            "deepest": _nested({"password": "hunter2hunter2"}, MAX_BRIEF_DEPTH),
+        }
+    )
+    blob = json.dumps(redacted, ensure_ascii=False)
+    assert lost not in blob and "hunter2hunter2" not in blob
+
+    # The sixth level is the last one that is read…
+    node: Any = redacted["facts"]
+    for _ in range(MAX_BRIEF_DEPTH - 2):
+        node = node["nested"]
+    assert node == kept
+    # …what sits on the seventh is replaced, whatever it is — a credential no less.
+    node = redacted["more"]
+    for _ in range(MAX_BRIEF_DEPTH - 2):
+        node = node["nested"]
+    assert node == {"nested": TRUNCATED}
+    node = redacted["deepest"]
+    for _ in range(MAX_BRIEF_DEPTH - 2):
+        node = node["nested"]
+    assert node == {"nested": TRUNCATED}
+
+    # A credential key on the sixth level still masks what is under it, in so many words.
+    at_the_edge = redact_structured_brief({"facts": _nested({"password": kept}, MAX_BRIEF_DEPTH - 2)})
+    node = at_the_edge["facts"]
+    for _ in range(MAX_BRIEF_DEPTH - 2):
+        node = node["nested"]
+    assert node == {"password": REDACTED}
+
+
+def test_a_brief_string_is_masked_before_it_is_capped():
+    """先整体脱敏再按长度截断：截断不会把一个凭据切成任何模式都不认识的形状。"""
+    from ai_flywheel.core.queue_service import MAX_BRIEF_VALUE_CHARS
+
+    value = _unshaped("straddling")
+    # The assignment opens just before the cap, and its value runs past it: capped first,
+    # the text would keep the opening characters of the credential.
+    text = "背景说明。" * 396 + f"数据库密码={value} " + "。" * 50
+    assert len(text) > MAX_BRIEF_VALUE_CHARS
+    assert text.index(value) < MAX_BRIEF_VALUE_CHARS < text.index(value) + len(value)
+    assert value[:4] in text[:MAX_BRIEF_VALUE_CHARS]
+
+    (kept,) = redact_structured_brief({"facts": [text]})["facts"]
+
+    assert len(kept) == MAX_BRIEF_VALUE_CHARS
+    assert value[:4] not in kept
+    assert kept.endswith(f"数据库密码={REDACTED} " + "。" * 3)
+
+
+@pytest.mark.asyncio
+async def test_no_credential_of_a_structured_brief_reaches_the_queue_the_database_or_the_p02_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """队列项、会话、审计、运行节点、数据库文件与最终的 P02 prompt：结构化摘要里的凭据一处都不见明文。"""
+    rt = _runtime(tmp_path, runner_mode="api")
+    model = _CannedModel("claude:leak-1")
+    monkeypatch.setattr(OpenAICompatibleRunner, "_call_chat_completion", model)
+    listed, nested, typed, assigned, spoken = (
+        _unshaped(tag) for tag in ("listed", "nested", "typed", "assigned", "spoken")
+    )
+    secrets = (listed, nested, typed, assigned, spoken, "hunter2hunter2")
+    brief = {
+        "password": [listed, "登录方式改为单点登录"],
+        "credentials": {"web": {"login": nested}},
+        "数据库密码": typed,
+        "facts": [
+            "连接池上限应大于并发工作线程数",
+            f"数据库密码={assigned}",
+            f"登录口令：{spoken}",
+        ],
+        "decisions": [{"what": "凭据改为环境变量注入", "db_password": "hunter2hunter2"}],
+    }
+    ingest = {"client": "claude", "session_id": "leak-1", "title": "缓存击穿排查", "summary": CONTENT}
+
+    submitted = await _mcp(rt, "flywheel_ingest_session", {**ingest, "structured_brief": brief})
+    assert submitted["queue_ids"] and len(submitted["queue_ids"]) == 1
+    item = rt.db.get_queue_item(submitted["queue_ids"][0])
+    key = item.session_key
+    assert key == "claude:leak-1"
+
+    run = rt.orchestrator.start_run(
+        trigger="test", queue_ids=[item.queue_id], auto_approve_override=True
+    )
+    assert run.status == RunStatus.PASS, run.error
+
+    prompt = model.p02_prompt()
+    (entry,) = _p02_entries(prompt)
+    assert entry["session_key"] == key
+    assert CONTENT in entry["text"]
+    assert list(entry) == ["session_key", "client", "project", "title", "structured_brief", "text"]
+    # Everything the engine keeps about this session, and everything that left for the model.
+    surfaces = {
+        "queue payload": json.dumps(rt.db.get_queue_item(item.queue_id).payload, ensure_ascii=False),
+        "queue item text": rt.queue.load_queue_item_text(rt.db.get_queue_item(item.queue_id)),
+        "session": json.dumps(rt.db.get_session(key).model_dump(), ensure_ascii=False, default=str),
+        "audit trail": json.dumps(rt.db.list_audit_events(limit=500), ensure_ascii=False, default=str),
+        "run nodes": json.dumps([node.payload for node in run.nodes], ensure_ascii=False, default=str),
+        "P02 prompt": prompt,
+        "database file": "".join(
+            path.read_bytes().decode("utf-8", "ignore")
+            for path in (rt.db.db_path, rt.db.db_path.with_name(rt.db.db_path.name + "-wal"))
+            if path.exists()
+        ),
+    }
+    assert surfaces["database file"]
+    for surface, text in surfaces.items():
+        for secret in secrets:
+            assert secret not in text, (surface, secret)
+
+    # The review still gets the evidence: the fact, the decision, and where a credential was.
+    assert entry["structured_brief"].startswith("[structured_brief]\n")
+    for needle in (
+        '"连接池上限应大于并发工作线程数"',
+        '"凭据改为环境变量注入"',
+        '"password": "[REDACTED]"',
+        '"数据库密码": "[REDACTED]"',
+        '"数据库密码=[REDACTED]"',
+        '"登录口令：[REDACTED]"',
+        '"db_password": "[REDACTED]"',
+    ):
+        assert needle in entry["structured_brief"], needle
+    assert entry["structured_brief"].count(REDACTED) == 6
+    # The queue item, which the prompt is built from, carries the same brief in its own layout.
+    item_text = surfaces["queue item text"]
+    header = "flywheel-brief: structured brief submitted by the client "
+    assert item_text.index(CONTENT) < item_text.index(header)
+    assert item_text.endswith(
+        "\n".join(
+            [
+                f"{header}(evidence for the review, not dialogue)",
+                "  - password: [REDACTED]",
+                "  - credentials: [REDACTED]",
+                "  - 数据库密码: [REDACTED]",
+                "  - facts: 连接池上限应大于并发工作线程数",
+                "  - facts: 数据库密码=[REDACTED]",
+                "  - facts: 登录口令：[REDACTED]",
+                '  - decisions: {"db_password":"[REDACTED]","what":"凭据改为环境变量注入"}',
+            ]
+        )
+    )
+    assert item_text.count(REDACTED) == 6
 
 
 # ---- 9.4 受控写入派单：规则本身

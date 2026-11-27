@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,10 @@ def read_transcript_excerpt(path: Path, max_chars: int = 24000) -> str:
                     try:
                         obj = json.loads(raw)
                     except json.JSONDecodeError:
+                        continue
+                    # A line that parses but is not a record — ``null``, ``[]``, ``123`` —
+                    # has nothing to read, however valid it is as JSON.
+                    if not isinstance(obj, dict):
                         continue
                     text = _extract_jsonl_text(obj)
                     if not text:
@@ -92,7 +97,29 @@ _TRIAGE_EXCERPT_CHARS = 8000
 _FULL_TRANSCRIPT_CHARS = 500_000
 
 
-def _extract_jsonl_text(obj: dict[str, Any]) -> str:
+#: Session metadata that remembers a transcript as the scan last took it: its modification
+#: time (epoch seconds) and its size at that moment. Antigravity has no archive event — its
+#: transcript is a file that keeps growing under the same session id — so a file that differs
+#: from either mark changed afterwards. Whether anything of the dialogue is new is the
+#: queue's own judgement.
+SCANNED_MTIME_KEY = "scanned_mtime"
+SCANNED_SIZE_KEY = "scanned_size"
+
+
+def _scan_marks(meta: dict[str, Any]) -> tuple[Any, Any]:
+    """The marks of a transcript as the scan last took it: ``(modification time, size)``."""
+    return (meta.get(SCANNED_MTIME_KEY), meta.get(SCANNED_SIZE_KEY))
+
+
+def _is_scan_mark(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float))
+
+
+def _extract_jsonl_text(obj: Any) -> str:
+    # A line of a transcript is read by its keys. Whatever else a valid JSON line may
+    # be — ``null``, a list, a number, a string — it is not a record and reads as nothing.
+    if not isinstance(obj, dict):
+        return ""
     # Support common Codex rollout / Claude Code transcript JSONL shapes,
     # strictly skipping developer/system prompt boilerplate and raw tool outputs
     # so triage, compaction and P02 see real human/assistant dialogue.
@@ -151,12 +178,23 @@ def _flatten_content(content: Any) -> str:
     return ""
 
 
+def _is_same_file(left: str | None, right: Path) -> bool:
+    """Whether a session's transcript path and a scanned file name the same file."""
+    if not left:
+        return False
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+
 class SessionAdapter:
     """Dual-mode session ingestion: MCP-pushed content + local transcript file scan/read."""
 
     def __init__(self, cfg: FlywheelConfig, db: FlywheelDB) -> None:
         self.cfg = cfg
         self.db = db
+        #: Sessions whose registered transcript changed since the scan last took it, each with
+        #: the ``(modification time, size)`` that was seen. The queue takes them with
+        #: ``take_grown_transcripts``; until it has archived one, the next scan offers it again.
+        self._grown: dict[str, tuple[float, int]] = {}
 
     def reconcile_scan_sources(self, now_ts: float | None = None) -> dict[str, Any]:
         """Register the sessions a passive scan of the configured sources finds.
@@ -165,12 +203,16 @@ class SessionAdapter:
         (epoch seconds; the wall clock when omitted). Its report keeps
         ``scanned`` / ``newly_registered`` / ``filtered_fragments`` / ``gaps`` and
         adds ``skipped_active``: transcripts still being written, left out of this
-        pass and of ``scanned`` until they have gone quiet.
+        pass and of ``scanned`` until they have gone quiet — and ``regrown``:
+        transcripts the scan registered before that have grown since and gone
+        quiet again. Those are handed to the queue (``take_grown_transcripts```)
+        for the part of the conversation that is new.
         """
         scanned = 0
         registered = 0
         filtered_out = 0
         skipped_active = 0
+        regrown = 0
         gaps: list[str] = []
         triage_cfg = self.cfg.sessions.triage
         quiet_seconds = scan_quiet_window_seconds(self.cfg)
@@ -208,7 +250,12 @@ class SessionAdapter:
 
                 sid = meta.get("canonical_session_id") or fp.stem
                 skey = f"{src.client}:{sid}"
-                if self.db.get_session(skey):
+                existing = self.db.get_session(skey)
+                if existing is not None:
+                    seen = self._grown_since_last_scan(existing, fp, client=src.client)
+                    if seen is not None:
+                        self._grown[skey] = seen
+                        regrown += 1
                     continue
                 ws = meta.get("workspace") or extract_jsonl_workspace(fp)
                 title = derive_readable_title(
@@ -219,6 +266,10 @@ class SessionAdapter:
                     workspace=ws,
                 )
                 rec_meta: dict[str, Any] = {"discovered_by": "p00_reconcile_scan"}
+                if is_antigravity_client(src.client):
+                    stat = fp.stat()
+                    rec_meta[SCANNED_MTIME_KEY] = stat.st_mtime
+                    rec_meta[SCANNED_SIZE_KEY] = stat.st_size
                 if parent_skey:
                     rec_meta["parent_session_key"] = parent_skey
                 if is_sub:
@@ -245,8 +296,64 @@ class SessionAdapter:
             "newly_registered": registered,
             "filtered_fragments": filtered_out,
             "skipped_active": skipped_active,
+            "regrown": regrown,
             "gaps": gaps,
         }
+
+    def _grown_since_last_scan(
+        self, session: SessionRecord, path: Path, *, client: str
+    ) -> tuple[float, int] | None:
+        """``(modification time, size)`` of ``path`` when it changed since the scan last took it.
+
+        Antigravity has no archive directory and no archive event: a transcript is a file that
+        keeps growing under the same session id, and a pass archives it once it has gone quiet.
+        Without a mark of that look, the conversation could continue for the rest of the day and
+        nothing after the first archive would ever reach the queue. The marks are the file's
+        modification time (``scanned_mtime``) and size (``scanned_size``) as they were then; a
+        file that differs from either changed afterwards. The time alone would miss a file
+        written under a clock that went back, or one that kept its time and not its content.
+        The caller has already seen that it is quiet again, and whether anything of the dialogue
+        is new is the queue's own delta judgement.
+
+        Only a session this scan registered, read from the very file it was registered from, is
+        looked at: a session registered another way keeps being left alone as before. A session
+        registered before the marks existed starts counting from now. A session frozen by an
+        opt-out is not looked at: there is nothing in it the queue may take.
+        """
+        if not is_antigravity_client(client) or session.opt_out:
+            return None
+        meta = session.metadata if isinstance(session.metadata, dict) else {}
+        if meta.get("discovered_by") != "p00_reconcile_scan" or not _is_same_file(
+            session.transcript_path, path
+        ):
+            return None
+        stat = path.stat()
+        seen = (stat.st_mtime, stat.st_size)
+        if not all(_is_scan_mark(mark) for mark in _scan_marks(meta)):
+            self.mark_transcript_scanned(session.session_key, *seen)
+            return None
+        return None if seen == _scan_marks(meta) else seen
+
+    def take_grown_transcripts(self) -> list[tuple[str, float, int]]:
+        """``(session_key, modification time, size)`` of every transcript found changed and not
+        yet handed over, and forget them: the queue archives each as it was at that time."""
+        grown = sorted(self._grown.items(), key=lambda entry: (entry[1], entry[0]))
+        self._grown.clear()
+        return [(session_key, *seen) for session_key, seen in grown]
+
+    def mark_transcript_scanned(self, session_key: str, mtime: float, size: int) -> None:
+        """Record that the transcript of ``session_key`` was taken as it was at ``mtime``.
+
+        Nothing else about the session changes — not its lifecycle, nor an opt-out.
+        """
+        session = self.db.get_session(session_key)
+        if session is None:
+            return
+        meta = session.metadata if isinstance(session.metadata, dict) else {}
+        if _scan_marks(meta) == (mtime, size):
+            return
+        session.metadata = {**meta, SCANNED_MTIME_KEY: mtime, SCANNED_SIZE_KEY: size}
+        self.db.upsert_session(session, preserve_existing_lifecycle=True)
 
     def sweep_pending_triage(self, open_retro_session_keys: set[str] | None = None) -> dict[str, Any]:
         """Run Level-1 0-token triage over all pending sessions; archive obvious temp/noise chats."""

@@ -8,10 +8,11 @@ point. Each transition writes the structured ``audit_events`` trail
 ``reason_code``) and publishes ``queue_updated`` on the event broker.
 
 Oversized conversations are handled deterministically and without a model call:
-the transcript is read in full (never truncated at the 24k review limit), split
-into dialogue turns, compacted turn by turn (the tail of a long tool output is
-kept, so conclusions survive), and only then split into ordered chunks
-``1/N .. N/N`` when the compacted text still exceeds ``queue_max_item_chars``.
+the transcript is read in full (never truncated at the 24k review limit) and split
+into dialogue turns. A dialogue that fits one queue item is kept word for word;
+one that does not is compacted turn by turn first (the tail of a long tool output
+is kept, so conclusions survive) and only then split into ordered chunks
+``1/N .. N/N``.
 """
 from __future__ import annotations
 
@@ -60,7 +61,9 @@ logger = logging.getLogger("ai_flywheel.queue")
 #: item: truncating before compaction would silently drop the tail conclusions.
 MAX_FULL_TRANSCRIPT_CHARS = 500_000
 
-#: A long tool output / log block keeps its head and its tail; the middle folds.
+#: A long tool output / log block keeps its head and its tail; the middle folds. A turn is
+#: folded only when the whole dialogue will not fit one queue item (``prepare_queue_chunks``):
+#: one that fits is queued word for word, however long a single turn of it is.
 MAX_COMPACT_TURN_CHARS = 2500
 COMPACT_HEAD_CHARS = 1200
 COMPACT_TAIL_CHARS = 800
@@ -227,6 +230,9 @@ def split_dialogue_turns(text: str) -> list[str]:
 def compact_turn_text(turn: str, max_turn_chars: int = MAX_COMPACT_TURN_CHARS) -> str:
     """Deterministically shrink one long turn without losing its conclusion.
 
+    Called for a dialogue that has to be split (see ``prepare_queue_chunks``); a
+    turn is never folded on its own while the dialogue still fits one queue item.
+
     Ordinary ``[user]`` turns are kept verbatim up to ``MAX_USER_TURN_CHARS``;
     massive pasted logs inside a user turn still fold in the middle while
     keeping head and tail intact. Long assistant/tool turns fold above
@@ -289,12 +295,18 @@ def prepare_queue_chunks(
     max_item_chars: int = 24000,
     max_chunks: int = MAX_CHUNKS_PER_SESSION,
 ) -> dict[str, Any]:
-    """Compact, then pack the dialogue into one or more ordered queue chunks.
+    """Keep the dialogue whole, and only fold and pack it when it will not fit one item.
 
     ``from_turn`` slices the delta when the session was already consumed up to a
     watermark (``0 < from_turn < len(turns)``). Each chunk carries its
     ``chunk_text`` together with the global ``turn_start`` / ``turn_end``
     boundaries, and adjacent chunks share the last turn as overlap context.
+
+    A dialogue that fits ``max_item_chars`` is queued word for word, however long
+    one of its turns is: folding a turn is for a dialogue that has to be split —
+    the middle of a long answer is exactly where a root cause or a fix is explained.
+    Only past that size are long turns folded in the middle (``compact_turn_text``)
+    and the result packed into ordered chunks.
     """
     raw = text or ""
     turns = split_dialogue_turns(raw)
@@ -302,6 +314,27 @@ def prepare_queue_chunks(
     limit = max(1000, int(max_item_chars))
     requested = int(from_turn or 0)
     start = requested if 0 < requested < total_turns else 0
+
+    verbatim = "\n\n".join(turns[start:])
+    if len(verbatim) <= limit:
+        return {
+            "chunks": [
+                {
+                    "chunk_index": 1,
+                    "chunk_total": 1,
+                    "chunk_text": verbatim,
+                    "turn_start": start,
+                    "turn_end": total_turns,
+                }
+            ],
+            "total_turns": total_turns,
+            "total_chars": len(raw),
+            "compacted_chars": len(verbatim),
+            "is_oversized": False,
+            "omitted_middle_chunks": 0,
+            "from_turn": start,
+        }
+
     compacted = [compact_turn_text(turn) for turn in turns[start:]]
     compacted_chars = sum(len(turn) for turn in compacted)
 
@@ -373,23 +406,89 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-#: The words a dictionary key can name a credential by. Redacted one string at a time,
-#: ``{"db_password": "…"}`` would keep its value: the pair is read as the assignment
-#: ``<word>=<value>`` it stands for, and the same test decides whether it is a credential.
-_CREDENTIAL_KEY_WORD_RE = re.compile(
-    r"(?i)(?:^|[_\s-])(api[_-]?key|token|secret|password)(?:$|[_\s-])|密码|口令|私钥|密钥|令牌"
+#: What a value under a key that names a credential becomes, and what a value nested deeper
+#: than a brief is read becomes.
+BRIEF_REDACTED = "[REDACTED]"
+BRIEF_TRUNCATED = "[TRUNCATED]"
+
+#: The words by which a key of a structured brief names a credential. A key is read word by
+#: word, so ``db_password``, ``DB-PASSWORD``, ``dbPassword`` and ``passwords`` all say password.
+#: Redacted one string at a time, ``{"db_password": "…"}`` would keep its value: the pair is
+#: not the assignment ``password=…`` that the text patterns read.
+_CREDENTIAL_KEY_WORDS = frozenset(
+    {
+        "password",
+        "passwords",
+        "passwd",
+        "passphrase",
+        "passcode",
+        "pwd",
+        "secret",
+        "secrets",
+        "token",
+        "tokens",
+        "credential",
+        "credentials",
+        "authorization",
+        "bearer",
+        "jwt",
+        "apikey",
+        "privatekey",
+        "accesskey",
+    }
+)
+#: …and the same, spelled with a separator: ``api_key``, ``private-key``, ``access key``,
+#: ``signing key``. A primary key and a sort key are not among them.
+_CREDENTIAL_KEY_PREFIXES = frozenset(
+    {"api", "private", "access", "ssh", "signing", "encryption", "license", "master"}
+)
+#: ``token`` is also how a model's usage is spelled: these keys are figures, not credentials.
+_TOKEN_FIGURE_KEYS = frozenset(
+    {
+        "max tokens",
+        "min tokens",
+        "maximum tokens",
+        "minimum tokens",
+        "input tokens",
+        "output tokens",
+        "total tokens",
+        "prompt tokens",
+        "completion tokens",
+        "context tokens",
+        "cached tokens",
+        "reasoning tokens",
+        "token count",
+        "token usage",
+        "token limit",
+        "token budget",
+        "tokens used",
+    }
+)
+#: The same words in Chinese. Chinese does not separate its words, so they are read anywhere
+#: in the key: ``数据库密码`` and ``登录口令`` name a credential as clearly as ``password``.
+_CJK_CREDENTIAL_KEY_WORDS = ("密码", "口令", "私钥", "密钥", "秘钥", "令牌", "凭据", "凭证")
+
+#: A key as words: separators split, and so does the edge where a word starts with a capital.
+_KEY_WORDS_SPLIT_RE = re.compile(
+    r"[^0-9A-Za-z一-鿿]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])"
 )
 
 
-def _mask_credential_entry(key: str, entry: Any) -> Any:
-    """The value under a key that names a credential: ``[REDACTED]`` when it is one."""
-    if not isinstance(entry, str) or not entry.strip():
-        return entry
-    match = _CREDENTIAL_KEY_WORD_RE.search(key)
-    if match is None:
-        return entry
-    assignment = f"{match.group(1) or match.group(0)}={entry}"
-    return "[REDACTED]" if mask_credential_shapes(assignment) != assignment else entry
+def _key_names_credential(key: Any) -> bool:
+    """Whether a dictionary key names a credential: ``password``, ``api_key``, ``数据库密码`` …"""
+    text = str(key)
+    if any(word in text for word in _CJK_CREDENTIAL_KEY_WORDS):
+        return True
+    words = [word.lower() for word in _KEY_WORDS_SPLIT_RE.split(text) if word]
+    phrase = " ".join(words)
+    for index, word in enumerate(words):
+        if word in _CREDENTIAL_KEY_WORDS:
+            if word in {"token", "tokens"} and phrase in _TOKEN_FIGURE_KEYS:
+                continue
+            return True
+        if word in {"key", "keys"} and index and words[index - 1] in _CREDENTIAL_KEY_PREFIXES:
+            return True
+    return False
 
 
 def compute_content_hash(
@@ -409,10 +508,31 @@ def compute_content_hash(
     return digest.hexdigest()[:16]
 
 
-def _redact_brief_value(value: Any, *, depth: int) -> Any:
-    """One value of a structured brief, redacted and reduced to JSON-safe data."""
+def _mask_brief_text(text: str, limit: int = MAX_BRIEF_VALUE_CHARS) -> str:
+    """A string of a brief, capped: masked over the whole string first, so that the cap can
+    never cut a credential into a shape no pattern knows."""
+    return mask_credential_shapes(text)[:limit]
+
+
+def _redact_brief_value(value: Any, *, depth: int, credential: bool = False) -> Any:
+    """One value of a structured brief, redacted and reduced to JSON-safe data.
+
+    ``credential`` says the value sits under a key that names a credential — its
+    own, or one further up through any number of lists and dictionaries. A
+    credential is not one bit less of a credential for having been sent as a list
+    or a mapping, so everything under such a key is masked as a whole; only a null
+    stays null, as there is nothing in it to mask.
+
+    Every other string goes through ``mask_credential_shapes``, the strict redactor
+    the review itself uses: the credential shapes of ``SECRET_PATTERNS`` and a
+    credential assigned in Chinese (``数据库密码=…``, ``口令：…``) alike.
+    """
+    if credential:
+        return None if value is None else BRIEF_REDACTED
+    if depth > MAX_BRIEF_DEPTH:
+        return BRIEF_TRUNCATED
     if isinstance(value, str):
-        return redact_text(value)[:MAX_BRIEF_VALUE_CHARS]
+        return _mask_brief_text(value)
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, int):
@@ -420,28 +540,27 @@ def _redact_brief_value(value: Any, *, depth: int) -> Any:
     if isinstance(value, float):
         # NaN and infinity are not JSON: a number the transports cannot carry is dropped.
         return value if value == value and abs(value) != float("inf") else None
-    if depth > MAX_BRIEF_DEPTH:
-        return redact_text(str(value))[:MAX_BRIEF_VALUE_CHARS]
     if isinstance(value, (list, tuple)):
         return [_redact_brief_value(entry, depth=depth + 1) for entry in list(value)[:MAX_BRIEF_ITEMS]]
     if isinstance(value, dict):
         cleaned: dict[str, Any] = {}
         for raw_key, entry in list(value.items())[:MAX_BRIEF_ITEMS]:
-            key = redact_text(str(raw_key))[:120]
+            key = _mask_brief_text(str(raw_key), limit=120)
             cleaned[key] = _redact_brief_value(
-                _mask_credential_entry(str(raw_key), entry), depth=depth + 1
+                entry, depth=depth + 1, credential=_key_names_credential(raw_key)
             )
         return cleaned
-    return redact_text(str(value))[:MAX_BRIEF_VALUE_CHARS]
+    return _mask_brief_text(str(value))
 
 
 def redact_structured_brief(brief: Any) -> dict[str, Any]:
     """A client's structured brief as redacted, JSON-safe data (``{}`` when there is none).
 
-    Every string goes through ``redact_text`` — the keys too — because the brief
-    is persisted on the queue item and handed to the model-backed review. The value
-    of a key that names a credential (``password`` / ``token`` / ``密码`` …) is read
-    as the assignment it stands for, so ``{"password": "…"}`` keeps no secret either.
+    The whole brief is cleaned, as deep as it goes, because it is persisted on the
+    queue item and handed to the model-backed review. Every string goes through the
+    strict redactor — the keys too — and whatever sits under a key that names a
+    credential (``password`` / ``token`` / ``api_key`` / ``密码`` …) is masked as a
+    whole: a scalar, and every leaf of a list or a dictionary under that key.
     """
     if not isinstance(brief, dict):
         return {}
@@ -983,7 +1102,9 @@ class DistillQueueService:
         ):
             active = sorted(active, key=lambda item: item.chunk_index)
             if mode == DISTILL_MODE_GOVERNANCE_ONLY:
-                return self._merge_governance_paths(active, paths, actor=actor)
+                return self._merge_declared_paths(
+                    active, paths, mode=DISTILL_MODE_GOVERNANCE_ONLY, actor=actor
+                )
             return active
 
         superseded = self._supersede_queued_items(stored.session_key, actor=actor)
@@ -1118,10 +1239,11 @@ class DistillQueueService:
                 reason_code=HAND_DISTILLED_SKIP if mode == DISTILL_MODE_SKIPPED else "",
             )
 
-    def _merge_governance_paths(
-        self, items: list[DistillQueueItem], paths: list[str], *, actor: str
+    def _merge_declared_paths(
+        self, items: list[DistillQueueItem], paths: list[str], *, mode: str, actor: str
     ) -> list[DistillQueueItem]:
-        """A repeated ``hand_distilled`` for an unchanged session: merge the paths in place."""
+        """A repeated ``hand_distilled`` for a session whose newest revision already declares
+        ``mode``: merge the paths reported since into those items, in place."""
         merged = list(paths)
         for item in items:
             for path in self._item_paths(item):
@@ -1137,10 +1259,12 @@ class DistillQueueService:
             refreshed.append(updated or item)
         self._audit_hand_distilled(
             refreshed,
-            mode=DISTILL_MODE_GOVERNANCE_ONLY,
+            mode=mode,
             paths=merged,
             actor=actor,
-            declaration="governance_only",
+            declaration=(
+                DISTILL_MODE_GOVERNANCE_ONLY if mode == DISTILL_MODE_GOVERNANCE_ONLY else "skip"
+            ),
             summary="hand_distilled: reported knowledge paths updated",
         )
         return refreshed
@@ -1158,8 +1282,14 @@ class DistillQueueService:
         """Take the session out of distillation and keep the decision visible as ``excluded``.
 
         Like the opt-out veto, the decision stays in the inventory: the unconsumed
-        items become ``excluded (HAND_DISTILLED_SKIP)``, and a session that had none
-        gets one visible record instead of disappearing without a trace.
+        items become ``excluded (HAND_DISTILLED_SKIP)``, and a session whose newest
+        revision says otherwise — one that never had a queue item, or one an
+        explicit ``enqueue`` took back — gets one visible record as its newest
+        revision instead of disappearing without a trace.
+
+        It is the newest revision that is asked, never an older one. A skip on
+        record from before is not this skip: said again after an explicit
+        ``enqueue``, it takes the session out again.
         """
         key = session.session_key
         touched: list[DistillQueueItem] = []
@@ -1183,16 +1313,14 @@ class DistillQueueService:
                 },
             )
             touched.append(stamped or updated)
-        visible = [
-            item
-            for item in self.db.list_session_queue_items(key)
-            if self._item_distill_mode(item) == DISTILL_MODE_SKIPPED
-        ]
-        if not visible:
-            revision = self.db.get_latest_queue_revision(key) + 1
+
+        history = self.db.list_session_queue_items(key)
+        newest_revision = history[0].revision if history else 0
+        visible = [item for item in history if item.revision == newest_revision]
+        if not visible or any(self._item_distill_mode(item) != DISTILL_MODE_SKIPPED for item in visible):
             placeholder = self._build_item(
                 session,
-                revision=revision,
+                revision=newest_revision + 1,
                 chunk={"chunk_text": "", "turn_start": 0, "turn_end": 0},
                 chunk_index=1,
                 chunk_total=1,
@@ -1212,15 +1340,16 @@ class DistillQueueService:
                     "hand_distilled_paths": list(paths),
                 },
             )
-            touched.extend(
-                self._insert_items(
-                    [placeholder],
-                    actor=actor,
-                    reason_code=HAND_DISTILLED_SKIP,
-                    summary="hand_distilled skip",
-                )
+            visible = self._insert_items(
+                [placeholder],
+                actor=actor,
+                reason_code=HAND_DISTILLED_SKIP,
+                summary="hand_distilled skip",
             )
-            visible = list(touched)
+            touched.extend(visible)
+        visible = self._merge_declared_paths(
+            visible, paths, mode=DISTILL_MODE_SKIPPED, actor=actor
+        )
         if touched:
             self._audit_hand_distilled(
                 touched,
@@ -2163,10 +2292,12 @@ class DistillQueueService:
         Explicit user submissions (inline content / ``manual`` tag) bypass triage;
         disk-scanned or legacy hook sessions pass through the 3-tier archive gate
         so empty stubs and low-signal fragments never flood ``queued``.
+
+        It also archives what grew: see ``_bridge_grown_transcripts``.
         """
         from ai_flywheel.core.triage import _is_explicit_submission
 
-        created = 0
+        created = self._bridge_grown_transcripts(actor=actor)
         for session in self.db.list_pending_sessions_prioritized(limit=max(1, int(limit))):
             if self.db.get_latest_queue_revision(session.session_key) > 0:
                 continue
@@ -2197,6 +2328,52 @@ class DistillQueueService:
                 if res.get("action") == "enqueued":
                     created += len(res.get("items") or [])
         return created
+
+    def _bridge_grown_transcripts(self, *, actor: str) -> int:
+        """Archive the turns each registered transcript gained since it was last archived.
+
+        Antigravity has no archive directory and no archive event: a transcript is a file
+        that keeps growing under the same session id. The scan registers it once; without
+        this pass the conversation could continue for the rest of the day and nothing after
+        the first archive would reach the queue. ``SessionAdapter.reconcile_scan_sources``
+        hands over the transcripts it found quiet again and changed since. Each goes
+        through the archive gate like any archived conversation — opt-out veto,
+        hand-distilled declaration and the delta after the consumption watermark included —
+        so only the turns that are new are queued, as the next revision.
+
+        A transcript is marked as taken only once the queue has had it. One that was
+        not — written to again before this pass reached it, or failed — keeps its marks and
+        the next scan offers it again.
+        """
+        enqueued = 0
+        for session_key, mtime, size in self.sessions.take_grown_transcripts():
+            session = self.db.get_session(session_key)
+            if session is None or session.opt_out:
+                # Frozen since the scan looked: there is nothing in it the queue may take.
+                continue
+            try:
+                res = self.on_archive(
+                    client=session.client,
+                    session_id=session.session_id,
+                    title=session.title,
+                    project=session.project,
+                    workspace=session.workspace,
+                    transcript_path=session.transcript_path,
+                    summary=session.summary,
+                    content=session.content,
+                    tags=session.tags,
+                    channel=IngressChannel.LEGACY_SCAN,
+                    actor=actor,
+                )
+            except Exception:  # one bad transcript never stops the pass
+                logger.exception("failed to archive the grown transcript of %s", session_key)
+                continue
+            if res.get("reason_code") == QUIET_WINDOW_ACTIVE:
+                continue
+            self.sessions.mark_transcript_scanned(session_key, mtime, size)
+            if res.get("action") == "enqueued":
+                enqueued += len(res.get("items") or [])
+        return enqueued
 
     # ---------------- read helpers ----------------
 

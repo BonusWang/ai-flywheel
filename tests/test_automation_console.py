@@ -18,6 +18,7 @@ from pydantic import ValidationError
 
 from ai_flywheel.app import create_app
 from ai_flywheel.config import FlywheelConfig, WorkflowConfig
+from ai_flywheel.core import automation as automation_mod
 from ai_flywheel.core.automation import describe_cron, next_fire_time_iso, validate_cron
 from ai_flywheel.core.time_utils import SHANGHAI_TZ
 from ai_flywheel.models import (
@@ -648,6 +649,388 @@ def test_a_restarted_process_neither_repeats_todays_audit_nor_loses_the_catch_up
     assert done["reason"] == "already_ran_today"
     assert done["missed_today"] is False
     assert len(_misfire_audits(third)) == 1
+
+
+# ---------------------------------------------------------------- a fire from before midnight
+
+
+def _after_midnight_clock() -> FakeClock:
+    """Stopped at 00:30 Shanghai time on a Thursday (2026-11-26): last night's 23:00 fire never ran."""
+    return FakeClock(datetime(2026, 11, 25, 16, 30, tzinfo=timezone.utc))
+
+
+def _next_day(hour: int, minute: int = 0, second: int = 0) -> datetime:
+    """A moment on the day after that Wednesday, as an aware Shanghai time."""
+    return datetime(2026, 11, 26, hour, minute, second, tzinfo=SHANGHAI_TZ)
+
+
+LAST_NIGHTS_FIRE = "2026-11-25T23:00:00+08:00"
+
+
+@pytest.mark.parametrize(
+    ("cron", "grace", "now", "expected"),
+    [
+        # Last night's fire, half an hour into its four-hour window.
+        ("0 23 * * *", 14400, _next_day(0, 30), LAST_NIGHTS_FIRE),
+        # Three in the morning is its last moment; a second later it is not looked at any more.
+        ("0 23 * * *", 14400, _next_day(3, 0), LAST_NIGHTS_FIRE),
+        ("0 23 * * *", 14400, _next_day(3, 0, 1), None),
+        # A window of one hour had closed before midnight.
+        ("0 23 * * *", 3600, _next_day(0, 30), None),
+        # An earlier fire of the night before, and the latest of the night's several.
+        ("0 22 * * *", 14400, _next_day(1, 30), "2026-11-25T22:00:00+08:00"),
+        ("0 9,23 * * *", 14400, _next_day(0, 30), LAST_NIGHTS_FIRE),
+        # Once today has a fire of its own, that is the one to look at.
+        ("0 0,23 * * *", 14400, _next_day(0, 30), "2026-11-26T00:00:00+08:00"),
+        # A schedule that fires on other days only owes nothing.
+        ("0 23 26 * *", 14400, _next_day(0, 30), None),
+    ],
+)
+def test_a_fire_from_the_night_before_is_looked_at_while_its_window_is_open(
+    tmp_path: Path, cron: str, grace: int, now: datetime, expected: str | None
+):
+    rt = _make_runtime(tmp_path, process_role="serve")
+    rt.cfg.workflow.daily_cron = cron
+    rt.cfg.workflow.misfire_grace_seconds = grace
+
+    fired = rt.automation.scheduled_today(now=now)
+
+    assert (fired.isoformat() if fired else None) == expected
+
+
+def test_a_lost_fire_from_before_midnight_is_recorded_and_caught_up_after_it(tmp_path: Path):
+    clock = _after_midnight_clock()
+    rt = _make_runtime(tmp_path, clock=clock)
+    rt.cfg.workflow.daily_cron = "0 23 * * *"
+    started: list[str] = []
+    rt.automation._catchup_runner = _recording_runner(rt, started)
+    _backlog(rt)
+
+    # The console says it before the check does: last night's batch is outstanding.
+    scheduler = rt.automation.get_snapshot()["scheduler"]
+    assert scheduler["scheduled_today"] == LAST_NIGHTS_FIRE
+    assert scheduler["catchup_window_until"] == "2026-11-26T03:00:00+08:00"
+    assert scheduler["missed_today"] is True
+
+    result = rt.automation.check_missed_schedule_catchup()
+
+    assert result["missed_today"] is True
+    assert result["scheduled_today"] == LAST_NIGHTS_FIRE
+    assert result["catchup_window_until"] == "2026-11-26T03:00:00+08:00"
+    assert result["misfire_audited"] is True
+    assert result["reason"] == "catchup_started"
+    assert started == [result["run_id"]]
+    (audit,) = _misfire_audits(rt)
+    assert audit["event_type"] == "schedule_misfire_detected"
+    assert audit["payload"]["scheduled_today"] == LAST_NIGHTS_FIRE
+    assert audit["payload"]["catchup_window_until"] == "2026-11-26T03:00:00+08:00"
+    assert "2026-11-25 23:00" in audit["summary"]
+
+    # Every later pass that night finds the catch-up on record and starts no second batch,
+    # up to and including the last minute of the window.
+    for minutes in (5, 30, 114, 1):
+        clock.advance(minutes * 60)
+        again = rt.automation.check_missed_schedule_catchup()
+        assert again["reason"] == "catchup_already_started"
+        assert again["catchup_started"] is False
+    assert clock.now() == _next_day(3, 0)
+    assert len(started) == 1
+    assert len(_misfire_audits(rt)) == 1
+
+    # A second past three the fire can no longer be caught up: it is not looked at, and
+    # the next time the claims are read its claim is gone.
+    clock.advance(1)
+    closed = rt.automation.check_missed_schedule_catchup()
+    assert closed["reason"] == "not_due_yet"
+    assert closed["missed_today"] is False
+    assert rt.automation._live_fire_claims(clock.now()) == {}
+    assert _fire_claims(rt) == {}
+
+
+def test_catching_up_last_nights_fire_does_not_use_up_tonights(tmp_path: Path):
+    clock = _after_midnight_clock()
+    rt = _make_runtime(tmp_path, clock=clock)
+    rt.cfg.workflow.daily_cron = "0 23 * * *"
+    started: list[str] = []
+    rt.automation._catchup_runner = _recording_runner(rt, started)
+    _backlog(rt)
+    assert rt.automation.check_missed_schedule_catchup()["reason"] == "catchup_started"
+
+    # The next evening the same thing happens again: a second fire is lost.
+    clock.advance(int((_next_day(23, 15) - _next_day(0, 30)).total_seconds()))
+    tonight = rt.automation.check_missed_schedule_catchup()
+
+    # It is another fire, with a miss and a batch of its own — not "already started".
+    assert tonight["scheduled_today"] == "2026-11-26T23:00:00+08:00"
+    assert tonight["missed_today"] is True
+    assert tonight["misfire_audited"] is True
+    assert tonight["reason"] == "catchup_started"
+    assert len(started) == 2
+    assert sorted(a["payload"]["scheduled_today"] for a in _misfire_audits(rt)) == [
+        LAST_NIGHTS_FIRE,
+        "2026-11-26T23:00:00+08:00",
+    ]
+
+
+def test_the_serve_recovery_loop_catches_up_last_nights_fire_on_its_first_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("FLYWHEEL_RECOVERY_INTERVAL", "0.2")
+    rt = _make_runtime(tmp_path, process_role="serve")
+    rt.cfg.workflow.daily_cron = "0 23 * * *"
+    rt.cfg.workflow.friday_weekly_enabled = False
+    rt.cfg.workflow.approval_mode = "auto"
+    rt.cfg.safety_valves.auto_approve_writes = True
+    _backlog(rt)
+    # The service came up half an hour after midnight; last night's 23:00 batch never ran.
+    monkeypatch.setattr(rt.automation, "_clock", lambda: datetime(2026, 11, 25, 16, 30, tzinfo=timezone.utc))
+
+    app = create_app(runtime=rt, process_role="serve")
+    with TestClient(app) as client:
+        run = _await_scheduled_run(rt)
+        assert run.status == RunStatus.PASS, run.error
+        assert run.phase == "daily"
+        (audit,) = _misfire_audits(rt)
+        assert audit["payload"]["scheduled_today"] == LAST_NIGHTS_FIRE
+        scheduler = client.get("/api/site/automations").json()["scheduler"]
+        assert scheduler["catchup_run_id"] == run.run_id
+        assert scheduler["missed_today"] is False
+        assert len([r for r in rt.db.list_workflow_runs(limit=50) if r.trigger == "scheduled"]) == 1
+
+
+# ---------------------------------------------------------------- the claim on a fire, shared by the cron job and the catch-up
+
+
+def _fire_claims(rt: FlywheelRuntime) -> dict[str, Any]:
+    """The claims on scheduled fires as they are stored in ``system_settings``.
+
+    Read from the row itself, not through the manager's copy of it: this is what a
+    restarted process finds. A build that keeps no claim store has no row, so nothing
+    is on record.
+    """
+    key = getattr(automation_mod, "FIRE_CLAIMS_KEY", "")
+    rows = [row for row in rt.db.list_system_settings() if row["key"] == key]
+    assert len(rows) <= 1, rows
+    return rows[0]["value"] if rows else {}
+
+
+def _claim_of(rt: FlywheelRuntime, fire: str) -> dict[str, Any]:
+    """The claim on record for ``fire``, and that it is the only one."""
+    claims = _fire_claims(rt)
+    assert list(claims) == [fire], claims
+    return claims[fire]
+
+
+@pytest.mark.parametrize(
+    ("clock", "cron", "fire"),
+    [
+        (_lost_fire_clock, "0 20 * * *", "2026-11-25T20:00:00+08:00"),
+        (_after_midnight_clock, "0 23 * * *", LAST_NIGHTS_FIRE),
+    ],
+)
+def test_a_fire_the_cron_job_took_is_not_caught_up_again(
+    tmp_path: Path, clock: FakeClock, cron: str, fire: str
+):
+    rt = _make_runtime(tmp_path, clock=clock())
+    rt.cfg.workflow.daily_cron = cron
+    rt.cfg.workflow.friday_weekly_enabled = False
+    rt.cfg.workflow.approval_mode = "auto"
+    rt.cfg.safety_valves.auto_approve_writes = True
+    catchups: list[str] = []
+    rt.automation._catchup_runner = _recording_runner(rt, catchups)
+    _backlog(rt)
+
+    # The scheduler wakes for the fire — here well after it, as the recovery loop is about
+    # to look for it — and the batch runs to its end under the claim.
+    rt.automation._run_scheduled_daily()
+
+    (run,) = [r for r in rt.db.list_workflow_runs(limit=5) if r.trigger == "scheduled"]
+    assert run.status is RunStatus.PASS, run.error
+    claim = _claim_of(rt, fire)
+    assert claim["source"] == "cron"
+    assert claim["run_id"] == run.run_id
+
+    again = rt.automation.check_missed_schedule_catchup()
+
+    assert again["reason"] == "already_ran_today"
+    assert again["missed_today"] is False
+    assert again["catchup_started"] is False
+    assert catchups == []
+    # It was never a miss: the fire got its batch.
+    assert _misfire_audits(rt) == []
+
+
+def test_the_catch_up_leaves_a_fire_to_the_cron_batch_starting_for_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The moment a claim is for: the lock is taken, the batch is not on record yet."""
+    clock = _lost_fire_clock()
+    rt = _make_runtime(tmp_path, clock=clock)
+    _backlog(rt)
+    catchups: list[str] = []
+    rt.automation._catchup_runner = _recording_runner(rt, catchups)
+    fire = "2026-11-25T20:00:00+08:00"
+    cron_batches: list[str] = []
+
+    def _batch_starting(**kwargs: Any) -> None:
+        cron_batches.append(kwargs["run_id"])
+        assert rt.db.get_workflow_lock()["run_id"] == kwargs["run_id"]
+
+    monkeypatch.setattr(rt.orchestrator, "start_run", _batch_starting)
+    rt.automation._run_scheduled_daily()
+    assert len(cron_batches) == 1
+
+    again = rt.automation.check_missed_schedule_catchup()
+
+    # No run record says the fire is taken — only the claim the cron job made does.
+    assert rt.db.count_workflow_runs() == 0
+    assert again["reason"] == "already_ran_today"
+    assert again["missed_today"] is False
+    assert catchups == []
+    assert _misfire_audits(rt) == []
+    claim = _claim_of(rt, fire)
+    assert claim["source"] == "cron"
+    assert claim["run_id"] == cron_batches[0]
+    assert rt.automation.get_snapshot()["scheduler"]["missed_today"] is False
+
+
+def test_the_cron_job_leaves_a_fire_the_catch_up_already_took(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    clock = _lost_fire_clock()
+    rt = _make_runtime(tmp_path, clock=clock)
+    _backlog(rt)
+    catchups: list[str] = []
+    rt.automation._catchup_runner = _recording_runner(rt, catchups)
+    assert rt.automation.check_missed_schedule_catchup()["reason"] == "catchup_started"
+    cron_batches: list[dict[str, Any]] = []
+    monkeypatch.setattr(rt.orchestrator, "start_run", lambda **kwargs: cron_batches.append(kwargs))
+
+    # The scheduler wakes for the same fire a moment later.
+    rt.automation._run_scheduled_daily()
+
+    assert cron_batches == []
+    assert catchups and len(catchups) == 1
+    claim = _claim_of(rt, "2026-11-25T20:00:00+08:00")
+    assert claim["source"] == "catchup"
+    assert claim["run_id"] == catchups[0]
+    assert len(_misfire_audits(rt)) == 1
+
+
+def test_a_busy_lock_costs_the_cron_job_no_claim_and_the_catch_up_still_gets_the_fire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    clock = _lost_fire_clock()
+    rt = _make_runtime(tmp_path, clock=clock)
+    _backlog(rt)
+    cron_batches: list[dict[str, Any]] = []
+    monkeypatch.setattr(rt.orchestrator, "start_run", lambda **kwargs: cron_batches.append(kwargs))
+    assert rt.db.acquire_workflow_lock("run-in-progress") is True
+
+    # Another batch holds the lock when the scheduler wakes: a warning, not a failure.
+    rt.automation._run_scheduled_daily()
+
+    assert cron_batches == []
+    assert _fire_claims(rt) == {}
+    assert rt.db.get_workflow_lock()["run_id"] == "run-in-progress"
+
+    # The fire is still the catch-up's to take once the lock is free, inside the window.
+    clock.advance(300)
+    rt.db.release_workflow_lock("run-in-progress")
+    catchups: list[str] = []
+    rt.automation._catchup_runner = _recording_runner(rt, catchups)
+    taken = rt.automation.check_missed_schedule_catchup()
+
+    assert taken["reason"] == "catchup_started"
+    assert catchups == [taken["run_id"]]
+    claim = _claim_of(rt, "2026-11-25T20:00:00+08:00")
+    assert claim["source"] == "catchup"
+    assert claim["run_id"] == taken["run_id"]
+
+
+def test_a_cron_batch_that_cannot_start_gives_back_its_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    clock = _lost_fire_clock()
+    rt = _make_runtime(tmp_path, clock=clock)
+    _backlog(rt)
+
+    def _cannot_start(**kwargs: Any) -> None:
+        raise RuntimeError("the batch could not be started")
+
+    monkeypatch.setattr(rt.orchestrator, "start_run", _cannot_start)
+    with pytest.raises(RuntimeError, match="could not be started"):
+        rt.automation._start_cron_batch()
+    assert rt.db.get_workflow_lock() is None
+    assert _fire_claims(rt) == {}
+
+    clock.advance(60)
+    catchups: list[str] = []
+    rt.automation._catchup_runner = _recording_runner(rt, catchups)
+    assert rt.automation.check_missed_schedule_catchup()["reason"] == "catchup_started"
+    assert len(catchups) == 1
+
+
+def test_a_catch_up_batch_that_never_takes_ownership_does_not_keep_its_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    clock = _lost_fire_clock()
+    rt = _make_runtime(tmp_path, clock=clock)
+    _backlog(rt)
+
+    def _cannot_start(**kwargs: Any) -> None:
+        raise RuntimeError("the batch could not be started")
+
+    monkeypatch.setattr(rt.orchestrator, "start_run", _cannot_start)
+    failed = rt.automation.check_missed_schedule_catchup()
+    assert failed["reason"] == "catchup_started"
+
+    # The batch thread found it could not start, and undid what was done for it.
+    assert _wait_until(lambda: rt.db.get_workflow_lock() is None), "the lock of the failed batch stayed"
+    assert _fire_claims(rt) == {}
+    assert rt.automation.get_snapshot()["scheduler"]["catchup_run_id"] is None
+
+    # So the next pass starts the catch-up again, and does not record the miss twice.
+    clock.advance(300)
+    catchups: list[str] = []
+    rt.automation._catchup_runner = _recording_runner(rt, catchups)
+    retried = rt.automation.check_missed_schedule_catchup()
+    assert retried["reason"] == "catchup_started"
+    assert catchups == [retried["run_id"]]
+    assert retried["run_id"] != failed["run_id"]
+    assert len(_misfire_audits(rt)) == 1
+    assert _claim_of(rt, "2026-11-25T20:00:00+08:00")["run_id"] == retried["run_id"]
+
+
+def test_a_claim_counts_after_a_restart_only_through_the_batch_it_started(tmp_path: Path):
+    clock = _lost_fire_clock()
+    fire = "2026-11-25T20:00:00+08:00"
+    first = _make_runtime(tmp_path, clock=clock)
+    _backlog(first)
+    first_started: list[str] = []
+    first.automation._catchup_runner = _recording_runner(first, first_started)
+    assert first.automation.check_missed_schedule_catchup()["reason"] == "catchup_started"
+    assert _claim_of(first, fire)["run_id"] == first_started[0]
+
+    # The service restarts on the same data: the claim is still stored, but its batch
+    # never got on record, so the fire is caught up again rather than written off.
+    clock.advance(300)
+    second = _make_runtime(tmp_path, clock=clock)
+    second_started: list[str] = []
+    second.automation._catchup_runner = _recording_runner(second, second_started)
+    again = second.automation.check_missed_schedule_catchup()
+    assert again["reason"] == "catchup_started"
+    assert second_started != first_started
+    assert _claim_of(second, fire)["run_id"] == second_started[0]
+
+    # One whose batch did get on record before a restart is kept, and answered by that record.
+    _seed_scheduled_run(second, started_at="2026-11-25T13:21:00+00:00", run_id=second_started[0])
+    clock.advance(60)
+    third = _make_runtime(tmp_path, clock=clock)
+    done = third.automation.check_missed_schedule_catchup()
+    assert done["reason"] == "already_ran_today"
+    assert done["missed_today"] is False
+    assert _claim_of(third, fire)["run_id"] == second_started[0]
 
 
 def test_a_lost_fire_is_only_recorded_when_catch_up_is_off(tmp_path: Path):

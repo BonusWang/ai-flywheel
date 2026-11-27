@@ -72,8 +72,26 @@ def split_appended_brief(text: str) -> tuple[str, str]:
     return body[:start].rstrip("\n"), body[start:]
 
 
+def _mask_subtree(value: Any) -> Any:
+    """Mask every scalar leaf under a credential-named key, preserving container shape."""
+    if isinstance(value, dict):
+        return {k: _mask_subtree(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_mask_subtree(v) for v in value]
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return value
+    return "[REDACTED]"
+
+
+def _is_credential_named_key(key: Any) -> bool:
+    probe = f"{key}=placeholder_secret_value"
+    return mask_credential_shapes(probe) != probe
+
+
 def _mask_credential_named_value(key: Any, entry: Any) -> Any:
-    """The value under a key that names a credential, masked when it is one."""
+    """The value under a key that names a credential, masked across scalars and nested containers."""
+    if isinstance(entry, (dict, list)):
+        return _mask_subtree(entry) if _is_credential_named_key(key) else entry
     if not isinstance(entry, str) or not entry.strip():
         return entry
     assignment = f"{key}={entry}"
