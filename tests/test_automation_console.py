@@ -1159,3 +1159,30 @@ def test_a_process_that_is_not_serving_runs_neither_the_recovery_loop_nor_the_ch
         assert client.get("/api/site/automations").json()["daemons"]["recovery"]["last_pass_at"] is None
         assert rt.db.count_workflow_runs() == 0
         assert _misfire_audits(rt) == []
+
+
+def test_claim_and_start_rechecks_fire_answered_under_lock_to_prevent_duplicate_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """TOCTOU guard: if another caller answered `fired_at` between the pre-lock check and
+    acquiring the workflow lock, `_claim_and_start` releases the lock and starts nothing."""
+    rt = _make_runtime(tmp_path, process_role="serve")
+    fired_at = _evening(20, 0)
+    now = _evening(20, 15)
+    started: list[str] = []
+
+    # Simulate another winner recording its fire claim right as this caller acquires the lock.
+    real_acquire = rt.db.acquire_workflow_lock
+
+    def _acquire_after_peer_wins(run_id: str) -> bool:
+        rt.automation._record_fire_claim(fired_at, "run-peer-winner", source="cron", now=now)
+        return real_acquire(run_id)
+
+    monkeypatch.setattr(rt.db, "acquire_workflow_lock", _acquire_after_peer_wins)
+
+    result = rt.automation._claim_and_start(
+        fired_at, source="catchup", now=now, start=lambda rid: started.append(rid)
+    )
+    assert result is None
+    assert started == []
+    assert rt.db.get_workflow_lock() is None

@@ -364,7 +364,7 @@ class AutomationManager:
         if fired_at is not None and self._fire_answered(fired_at, now=current):
             logger.info("scheduled daily run skipped: the fire at %s is already taken", _fire_key(fired_at))
             return None
-        return self._claim_and_start(
+        run_id = self._claim_and_start(
             fired_at,
             source="cron",
             now=current,
@@ -372,6 +372,9 @@ class AutomationManager:
                 trigger="scheduled", phase="auto", run_id=run_id
             ),
         )
+        if run_id is None and fired_at is not None:
+            logger.info("scheduled daily run skipped: the fire at %s is already taken", _fire_key(fired_at))
+        return run_id
 
     # ---------------- missed fire: detect, record, catch up ----------------
 
@@ -536,20 +539,24 @@ class AutomationManager:
         source: str,
         now: datetime,
         start: Callable[[str], Any],
-    ) -> str:
-        """Take the lock, claim ``fired_at`` and start its batch; the batch's run id.
+    ) -> str | None:
+        """Take the lock, re-check & claim ``fired_at``, and start its batch; the batch's run id.
 
         The order is the point. The lock comes first, in the calling thread: when it is
         busy, ``WorkflowLockError`` is raised and nothing has been claimed, so the fire
-        is left for a later pass. The claim goes on record once the lock is held and the
-        batch is started under it — by the cron job with the pipeline itself, by the
-        catch-up with a thread. A start that fails gives both back, the claim and the
-        lock: that attempt is not the fire's.
+        is left for a later pass. Once the lock is held, ``_fire_answered`` is checked
+        again under the lock to close any TOCTOU window between cron and catch-up; if the
+        fire was already taken, the lock is released and ``None`` is returned. Otherwise
+        the claim goes on record and the batch is started under the lock. A start that
+        fails gives both back, the claim and the lock: that attempt is not the fire's.
         """
         run_id = self.orchestrator.new_run_id()
         if not self.db.acquire_workflow_lock(run_id):
             raise WorkflowLockError(f"the workflow lock is held: {self.db.get_workflow_lock()}")
         if fired_at is not None:
+            if self._fire_answered(fired_at, now=now):
+                self.db.release_workflow_lock(run_id)
+                return None
             self._record_fire_claim(fired_at, run_id, source=source, now=now)
         try:
             start(run_id)
@@ -680,6 +687,14 @@ class AutomationManager:
                 fire,
             )
             result["reason"] = "lock_busy"
+            return result
+        if run_id is None:
+            latest_claim = self._live_fire_claims(current).get(fire)
+            if latest_claim is not None and latest_claim.get("source") == "catchup":
+                result["reason"] = "catchup_already_started"
+            else:
+                result["missed_today"] = False
+                result["reason"] = "already_ran_today"
             return result
         with self._lock:
             self._catchup_run_id = run_id

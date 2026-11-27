@@ -36,9 +36,10 @@ from ai_flywheel.adapters.runners.normalizers import (
     _normalize_plan_item,
     normalize_domain_signals,
     normalize_review_events,
+    sanitize_review_payload,
 )
 from ai_flywheel.adapters.wiki.router import RoutingCandidates
-from ai_flywheel.core.privacy import find_secret_shape, mask_credential_shapes
+from ai_flywheel.core.privacy import find_secret_shape, has_private_tags, mask_credential_shapes
 from ai_flywheel.models import PlannedWrite
 
 logger = logging.getLogger(__name__)
@@ -80,7 +81,10 @@ def reply_carries_secret(reply: Any) -> str | None:
     of credential, never the credential itself.
     """
     if isinstance(reply, str):
-        return find_secret_shape(reply, strict=True)
+        found = find_secret_shape(reply, strict=True)
+        if found is not None:
+            return found
+        return "Private Block" if has_private_tags(reply) else None
     if isinstance(reply, dict):
         for key, value in reply.items():
             found = reply_carries_secret(key)
@@ -401,20 +405,29 @@ def _review_from_runner_output(
     if sessions_sent and not findings:
         # No session was reviewed. Letting it through would settle the sessions as if one had been.
         raise unavailable(REVIEW_EMPTY_FINDINGS)
-    # The reply is usable: the caller persists it right after, so the cache file exists.
+    # The reply is usable: construct a sanitized copy so raw `parsed` stays intact for the
+    # cache privacy check while receipts, SQLite nodes, observations and dissents never see
+    # plaintext credentials or `<private>` blocks.
     diagnostics = _diagnostics(None, finding_count=len(findings), usable=True)
+    review: dict[str, Any] = {
+        key: sanitize_review_payload(value)
+        for key, value in parsed.items()
+        if key not in {"events", "findings", "mistakes", "dissents", "repeated_workflows"}
+    }
+    review["findings"] = sanitize_review_payload(findings)
     for key in ("mistakes", "dissents", "repeated_workflows"):
-        parsed.setdefault(key, [])
+        raw_list = parsed.get(key)
+        review[key] = sanitize_review_payload(raw_list if raw_list is not None else [])
     # Optional in the review contract too: the things a session did that stand on their own
     # (a delivery, an incident, a decision, a domain fact). Absent means none was recorded.
-    parsed["events"] = normalize_review_events(parsed.get("events"))
-    for finding in findings:
+    review["events"] = normalize_review_events(parsed.get("events"))
+    for finding in review["findings"]:
         if isinstance(finding, dict):
             # Optional in the review contract, present afterwards: a planner reads one shape.
             finding["domain_signals"] = normalize_domain_signals(finding.get("domain_signals"))
-    parsed["phase"] = phase
-    parsed["sessions_reviewed"] = len(findings)
-    parsed["review_source"] = source
-    parsed["review_diagnostics"] = diagnostics.to_dict()
-    parsed["call_telemetry"] = dict(call_telemetry) if call_telemetry else None
-    return parsed
+    review["phase"] = phase
+    review["sessions_reviewed"] = len(review["findings"])
+    review["review_source"] = source
+    review["review_diagnostics"] = diagnostics.to_dict()
+    review["call_telemetry"] = dict(call_telemetry) if call_telemetry else None
+    return review

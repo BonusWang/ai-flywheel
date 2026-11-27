@@ -2340,3 +2340,63 @@ def test_a_card_and_four_table_pages_fill_the_two_quotas_and_still_ask_for_a_hum
     assert card.name.endswith("-连库排查复盘1.md")  # the card landed under the day it was written
     assert "连库排查复盘1" in (practice / "笔记索引.md").read_text(encoding="utf-8")  # and its entry joined the index
     assert rt.db.get_session("codex:plan-1").status == SessionStatus.PROCESSED
+
+
+def test_p03_drops_credential_in_metadata_and_never_calls_cache_persist_or_caches_private_blocks(
+    tmp_path: Path, heuristic_planner_forbidden: None
+):
+    """P03 must block secrets in PlannedWrite metadata (`title`/`summary`/`wiki_route`/`rule_payload`),
+    never invoke cache persist when refused, and never cache replies carrying `<private>`."""
+    from ai_flywheel.adapters.runners.clients import _cache_plan_reply
+
+    runner = _api_runner(tmp_path)
+    persist_calls: list[Path] = []
+    real_persist = runner._persist_cache
+
+    def _spy_persist(cache_file: Path, parsed: Any) -> bool:
+        persist_calls.append(cache_file)
+        return real_persist(cache_file, parsed)
+
+    runner._persist_cache = _spy_persist  # type: ignore[method-assign]
+    reply = {
+        "planned_writes": [
+            _doc(with_summary=True),
+            {**_doc(slug="leaky-title", with_summary=True), "title": f"标题含密钥 {SYNTHETIC_KEY}"},
+            {**_doc(slug="leaky-summary", with_summary=True), "summary": f"摘要含密钥 {SYNTHETIC_KEY}"},
+            {
+                "target_kind": "flywheel_rule",
+                "action": "register_rule",
+                "title": "规则标题",
+                "summary": "规则摘要",
+                "content_preview": "- 核对配置",
+                "rule_payload": {
+                    "title": "规则标题",
+                    "checklist": ["核对配置"],
+                    "forbidden_routes": [f"禁止 {SYNTHETIC_KEY}"],
+                },
+            },
+        ]
+    }
+    runner._call_chat_completion = _ReplyModel(reply)
+    outcome = runner.plan_writes_detailed(NO_FINDINGS, [], 8)
+    assert len(outcome.planned_writes) == 1
+    assert outcome.planned_writes[0].title == "接口超时排查复盘"
+    assert outcome.diagnostics.cache_file is None
+    assert persist_calls == []
+    assert _files_under(runner.fs_store.root) == []
+
+    # A reply with `<private>...</private>` is stripped in the planned write and never cached.
+    private_doc = {
+        **_doc(slug="with-private", with_summary=True),
+        "content_preview": "---\ntitle: t\n---\n\n# t\n\n正文 <private>绝密段</private>\n",
+    }
+    runner._call_chat_completion = _ReplyModel({"planned_writes": [private_doc]})
+    priv_outcome = runner.plan_writes_detailed(NO_FINDINGS, [], 8)
+    assert len(priv_outcome.planned_writes) == 1
+    assert "绝密段" not in priv_outcome.planned_writes[0].content_preview
+    assert priv_outcome.diagnostics.cache_file is None
+    assert persist_calls == []
+    assert _files_under(runner.fs_store.root) == []
+    # Direct unit guard: `_cache_plan_reply` short-circuits when diagnostics already refused a secret.
+    assert _cache_plan_reply(_spy_persist, tmp_path / "x.json", {"planned_writes": []}, outcome) is False
+    assert persist_calls == []

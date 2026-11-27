@@ -13,7 +13,7 @@ from typing import Any
 from ai_flywheel.adapters.runners.contracts import P02_MAX_SESSIONS
 from ai_flywheel.adapters.skills import inspect_skill_at
 from ai_flywheel.adapters.wiki.router import RoutingCandidates
-from ai_flywheel.core.privacy import mask_credential_shapes
+from ai_flywheel.core.privacy import mask_credential_shapes, redact_structured_brief, strip_private_tags
 from ai_flywheel.core.time_utils import shanghai_today_ymd
 from ai_flywheel.models import RetroItem, RuleRecord, SessionRecord
 
@@ -72,62 +72,25 @@ def split_appended_brief(text: str) -> tuple[str, str]:
     return body[:start].rstrip("\n"), body[start:]
 
 
-def _mask_subtree(value: Any) -> Any:
-    """Mask every scalar leaf under a credential-named key, preserving container shape."""
-    if isinstance(value, dict):
-        return {k: _mask_subtree(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_mask_subtree(v) for v in value]
-    if value is None or (isinstance(value, str) and not value.strip()):
-        return value
-    return "[REDACTED]"
-
-
-def _is_credential_named_key(key: Any) -> bool:
-    probe = f"{key}=placeholder_secret_value"
-    return mask_credential_shapes(probe) != probe
-
-
-def _mask_credential_named_value(key: Any, entry: Any) -> Any:
-    """The value under a key that names a credential, masked across scalars and nested containers."""
-    if isinstance(entry, (dict, list)):
-        return _mask_subtree(entry) if _is_credential_named_key(key) else entry
-    if not isinstance(entry, str) or not entry.strip():
-        return entry
-    assignment = f"{key}={entry}"
-    return "[REDACTED]" if mask_credential_shapes(assignment) != assignment else entry
-
-
-def _mask_brief_values(value: Any) -> Any:
-    """A brief with the value of every key that names a credential masked, at any depth."""
-    if isinstance(value, dict):
-        return {key: _mask_brief_values(_mask_credential_named_value(key, entry)) for key, entry in value.items()}
-    if isinstance(value, list):
-        return [_mask_brief_values(entry) for entry in value]
-    return value
-
-
 def _render_structured_brief(brief: Any) -> str:
     """A session's structured brief as the prompt carries it, or ``''`` when there is none.
 
-    A mapping is written as JSON, in the order the client gave its keys; a text is taken as
-    the brief itself. Either stands under one heading, and a credential is masked in it as
-    it is in every other text that leaves for the model. The queue redacts a brief when it
-    is submitted; this is the second net, on the same patterns: a value given as an
-    assignment inside a text, and the value of a key that names a credential — which JSON
-    writes as ``"key": "value"``, a shape no assignment pattern matches.
+    Shares the single-source-of-truth ``redact_structured_brief`` from ``core/privacy.py``
+    so a brief supplied via ``register_session`` gets the exact same credential-key, nested
+    container, non-string scalar, CJK assignment and ``<private>`` redaction as queue ingress.
     """
     if isinstance(brief, str):
-        content = brief.strip()
+        content = mask_credential_shapes(strip_private_tags(brief.strip()))
     elif isinstance(brief, dict) and brief:
-        content = json.dumps(_mask_brief_values(brief), ensure_ascii=False, indent=2, default=str)
+        cleaned = redact_structured_brief(brief)
+        content = json.dumps(cleaned, ensure_ascii=False, indent=2, default=str) if cleaned else ""
     else:
         return ""
     if not content:
         return ""
     if content.startswith(P02_BRIEF_MARKER):
         content = content[len(P02_BRIEF_MARKER) :].lstrip("\n")
-    return f"{P02_BRIEF_MARKER}\n{mask_credential_shapes(content)}"
+    return f"{P02_BRIEF_MARKER}\n{mask_credential_shapes(strip_private_tags(content))}"
 
 
 def _p02_session_entry(session: SessionRecord, text: str, limit: int) -> dict[str, str]:

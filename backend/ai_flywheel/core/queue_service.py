@@ -26,7 +26,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ai_flywheel.adapters.sessions import _extract_jsonl_text
-from ai_flywheel.core.privacy import mask_credential_shapes
+from ai_flywheel.core.privacy import (
+    BRIEF_REDACTED,
+    BRIEF_TRUNCATED,
+    MAX_BRIEF_DEPTH,
+    MAX_BRIEF_ITEMS,
+    MAX_BRIEF_VALUE_CHARS,
+    key_names_credential as _key_names_credential,
+    mask_credential_shapes,
+    redact_structured_brief,
+)
 from ai_flywheel.core.time_utils import SHANGHAI_TZ
 from ai_flywheel.core.triage import (
     _UUID_RE,
@@ -100,12 +109,6 @@ DISTILL_MODES = frozenset(
 HAND_DISTILLED_SKIP = "HAND_DISTILLED_SKIP"
 #: Audit trail of every queue item a ``hand_distilled`` declaration touched.
 HAND_DISTILLED_EVENT = "hand_distilled_declared"
-
-#: A structured brief is evidence for the review, not a second transcript: every
-#: string is capped, and so is each list.
-MAX_BRIEF_VALUE_CHARS = 2000
-MAX_BRIEF_ITEMS = 50
-MAX_BRIEF_DEPTH = 6
 
 #: How much of a session's opening a re-triage reads to recognise a write dispatch. A
 #: verdict taken on an excerpt this long is confirmed on the whole conversation.
@@ -406,91 +409,6 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-#: What a value under a key that names a credential becomes, and what a value nested deeper
-#: than a brief is read becomes.
-BRIEF_REDACTED = "[REDACTED]"
-BRIEF_TRUNCATED = "[TRUNCATED]"
-
-#: The words by which a key of a structured brief names a credential. A key is read word by
-#: word, so ``db_password``, ``DB-PASSWORD``, ``dbPassword`` and ``passwords`` all say password.
-#: Redacted one string at a time, ``{"db_password": "…"}`` would keep its value: the pair is
-#: not the assignment ``password=…`` that the text patterns read.
-_CREDENTIAL_KEY_WORDS = frozenset(
-    {
-        "password",
-        "passwords",
-        "passwd",
-        "passphrase",
-        "passcode",
-        "pwd",
-        "secret",
-        "secrets",
-        "token",
-        "tokens",
-        "credential",
-        "credentials",
-        "authorization",
-        "bearer",
-        "jwt",
-        "apikey",
-        "privatekey",
-        "accesskey",
-    }
-)
-#: …and the same, spelled with a separator: ``api_key``, ``private-key``, ``access key``,
-#: ``signing key``. A primary key and a sort key are not among them.
-_CREDENTIAL_KEY_PREFIXES = frozenset(
-    {"api", "private", "access", "ssh", "signing", "encryption", "license", "master"}
-)
-#: ``token`` is also how a model's usage is spelled: these keys are figures, not credentials.
-_TOKEN_FIGURE_KEYS = frozenset(
-    {
-        "max tokens",
-        "min tokens",
-        "maximum tokens",
-        "minimum tokens",
-        "input tokens",
-        "output tokens",
-        "total tokens",
-        "prompt tokens",
-        "completion tokens",
-        "context tokens",
-        "cached tokens",
-        "reasoning tokens",
-        "token count",
-        "token usage",
-        "token limit",
-        "token budget",
-        "tokens used",
-    }
-)
-#: The same words in Chinese. Chinese does not separate its words, so they are read anywhere
-#: in the key: ``数据库密码`` and ``登录口令`` name a credential as clearly as ``password``.
-_CJK_CREDENTIAL_KEY_WORDS = ("密码", "口令", "私钥", "密钥", "秘钥", "令牌", "凭据", "凭证")
-
-#: A key as words: separators split, and so does the edge where a word starts with a capital.
-_KEY_WORDS_SPLIT_RE = re.compile(
-    r"[^0-9A-Za-z一-鿿]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])"
-)
-
-
-def _key_names_credential(key: Any) -> bool:
-    """Whether a dictionary key names a credential: ``password``, ``api_key``, ``数据库密码`` …"""
-    text = str(key)
-    if any(word in text for word in _CJK_CREDENTIAL_KEY_WORDS):
-        return True
-    words = [word.lower() for word in _KEY_WORDS_SPLIT_RE.split(text) if word]
-    phrase = " ".join(words)
-    for index, word in enumerate(words):
-        if word in _CREDENTIAL_KEY_WORDS:
-            if word in {"token", "tokens"} and phrase in _TOKEN_FIGURE_KEYS:
-                continue
-            return True
-        if word in {"key", "keys"} and index and words[index - 1] in _CREDENTIAL_KEY_PREFIXES:
-            return True
-    return False
-
-
 def compute_content_hash(
     text: str, *, structured_brief: dict[str, Any] | None = None
 ) -> str:
@@ -506,66 +424,6 @@ def compute_content_hash(
         digest.update(b"\n\x00structured_brief\n")
         digest.update(_canonical_json(structured_brief).encode("utf-8"))
     return digest.hexdigest()[:16]
-
-
-def _mask_brief_text(text: str, limit: int = MAX_BRIEF_VALUE_CHARS) -> str:
-    """A string of a brief, capped: masked over the whole string first, so that the cap can
-    never cut a credential into a shape no pattern knows."""
-    return mask_credential_shapes(text)[:limit]
-
-
-def _redact_brief_value(value: Any, *, depth: int, credential: bool = False) -> Any:
-    """One value of a structured brief, redacted and reduced to JSON-safe data.
-
-    ``credential`` says the value sits under a key that names a credential — its
-    own, or one further up through any number of lists and dictionaries. A
-    credential is not one bit less of a credential for having been sent as a list
-    or a mapping, so everything under such a key is masked as a whole; only a null
-    stays null, as there is nothing in it to mask.
-
-    Every other string goes through ``mask_credential_shapes``, the strict redactor
-    the review itself uses: the credential shapes of ``SECRET_PATTERNS`` and a
-    credential assigned in Chinese (``数据库密码=…``, ``口令：…``) alike.
-    """
-    if credential:
-        return None if value is None else BRIEF_REDACTED
-    if depth > MAX_BRIEF_DEPTH:
-        return BRIEF_TRUNCATED
-    if isinstance(value, str):
-        return _mask_brief_text(value)
-    if value is None or isinstance(value, bool):
-        return value
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        # NaN and infinity are not JSON: a number the transports cannot carry is dropped.
-        return value if value == value and abs(value) != float("inf") else None
-    if isinstance(value, (list, tuple)):
-        return [_redact_brief_value(entry, depth=depth + 1) for entry in list(value)[:MAX_BRIEF_ITEMS]]
-    if isinstance(value, dict):
-        cleaned: dict[str, Any] = {}
-        for raw_key, entry in list(value.items())[:MAX_BRIEF_ITEMS]:
-            key = _mask_brief_text(str(raw_key), limit=120)
-            cleaned[key] = _redact_brief_value(
-                entry, depth=depth + 1, credential=_key_names_credential(raw_key)
-            )
-        return cleaned
-    return _mask_brief_text(str(value))
-
-
-def redact_structured_brief(brief: Any) -> dict[str, Any]:
-    """A client's structured brief as redacted, JSON-safe data (``{}`` when there is none).
-
-    The whole brief is cleaned, as deep as it goes, because it is persisted on the
-    queue item and handed to the model-backed review. Every string goes through the
-    strict redactor — the keys too — and whatever sits under a key that names a
-    credential (``password`` / ``token`` / ``api_key`` / ``密码`` …) is masked as a
-    whole: a scalar, and every leaf of a list or a dictionary under that key.
-    """
-    if not isinstance(brief, dict):
-        return {}
-    cleaned = _redact_brief_value(brief, depth=1)
-    return cleaned if isinstance(cleaned, dict) else {}
 
 
 def render_structured_brief(brief: Any) -> str:

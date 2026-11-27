@@ -30,7 +30,12 @@ from ai_flywheel.adapters.runners.contracts import (
     _slugify,
     normalize_rule_payload,
 )
-from ai_flywheel.core.privacy import SecretLeakError, mask_credential_shapes, sanitize_and_check_secrets
+from ai_flywheel.core.privacy import (
+    SecretLeakError,
+    mask_credential_shapes,
+    sanitize_and_check_secrets,
+    strip_private_tags,
+)
 from ai_flywheel.core.time_utils import shanghai_today_ymd
 from ai_flywheel.models import INCIDENT_APPROVAL_REASON, INCIDENT_PAGE_TYPE, SENSITIVE_CONFIG_PAGE_TYPE, PlannedWrite
 
@@ -233,9 +238,51 @@ def empty_domain_signals() -> dict[str, list[Any]]:
     return {key: [] for key in DOMAIN_SIGNAL_KEYS}
 
 
+def sanitize_review_text(value: str) -> str:
+    """Strip ``<private>`` spans and mask every credential shape in a P02 review string."""
+    return mask_credential_shapes(strip_private_tags(value))
+
+
+def sanitize_review_payload(value: Any) -> Any:
+    """Recursively sanitize every string in a P02 review structure so receipts and SQLite
+    never persist plaintext credentials or ``<private>`` blocks."""
+    if isinstance(value, str):
+        return sanitize_review_text(value)
+    if isinstance(value, list):
+        return [sanitize_review_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [sanitize_review_payload(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            (sanitize_review_text(k) if isinstance(k, str) else k): sanitize_review_payload(v)
+            for k, v in value.items()
+        }
+    return value
+
+
+def _sanitize_and_check_value(value: Any, *, context: str) -> Any:
+    """Recursively run ``sanitize_and_check_secrets`` over every string in a P03 structure."""
+    if isinstance(value, str):
+        return sanitize_and_check_secrets(value, context=context)
+    if isinstance(value, list):
+        return [_sanitize_and_check_value(item, context=context) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_and_check_value(item, context=context) for item in value]
+    if isinstance(value, dict):
+        return {
+            (
+                sanitize_and_check_secrets(k, context=f"{context}:key")
+                if isinstance(k, str)
+                else k
+            ): _sanitize_and_check_value(v, context=f"{context}.{k}")
+            for k, v in value.items()
+        }
+    return value
+
+
 def _signal_text(value: Any) -> str:
-    """One text item of a signal, trimmed and with any credential shape masked."""
-    return mask_credential_shapes(_as_text(value))[:_DOMAIN_TEXT_LIMIT].strip()
+    """One text item of a signal, trimmed with `<private>` stripped and credentials masked."""
+    return sanitize_review_text(_as_text(value))[:_DOMAIN_TEXT_LIMIT].strip()
 
 
 def _signal_list(raw: Any) -> list[str]:
@@ -313,11 +360,11 @@ def normalize_review_events(raw: Any) -> list[dict[str, str]]:
         if not isinstance(entry, dict):
             continue
         kind = _as_text(entry.get("kind")).strip().lower()
-        session_key = mask_credential_shapes(_as_text(entry.get("session_key"))).strip()[:_EVENT_KEY_LIMIT]
+        session_key = sanitize_review_text(_as_text(entry.get("session_key"))).strip()[:_EVENT_KEY_LIMIT]
         if kind not in REVIEW_EVENT_KINDS or not session_key:
             continue
-        title = mask_credential_shapes(_as_text(entry.get("title"))).strip()[:_EVENT_TITLE_LIMIT]
-        summary = mask_credential_shapes(_as_text(entry.get("summary"))).strip()[:_EVENT_SUMMARY_LIMIT]
+        title = sanitize_review_text(_as_text(entry.get("title"))).strip()[:_EVENT_TITLE_LIMIT]
+        summary = sanitize_review_text(_as_text(entry.get("summary"))).strip()[:_EVENT_SUMMARY_LIMIT]
         if not title and not summary:
             continue
         signature = (kind, title, summary, session_key)
@@ -346,12 +393,35 @@ def _normalize_planned_write(
     pw = PlannedWrite.model_validate(raw_item)
 
     # Privacy gate before anything durable happens: <private> spans are redacted and a
-    # credential is refused here, so a poisoned draft never reaches SQLite, the approval
-    # preview or the write path.
+    # credential is refused across body AND metadata (title, summary, path, approval reason,
+    # route declarations, source sessions), so a poisoned draft never reaches SQLite, the
+    # approval preview, decision cards or the write path.
     try:
         pw.content_preview = sanitize_and_check_secrets(
             pw.content_preview, context=f"p03:{pw.target_kind}"
         )
+        pw.title = sanitize_and_check_secrets(pw.title, context=f"p03:{pw.target_kind}:title")
+        pw.summary = sanitize_and_check_secrets(pw.summary, context=f"p03:{pw.target_kind}:summary")
+        if pw.relative_path is not None:
+            pw.relative_path = sanitize_and_check_secrets(
+                pw.relative_path, context=f"p03:{pw.target_kind}:relative_path"
+            )
+        pw.approval_reason = sanitize_and_check_secrets(
+            pw.approval_reason, context=f"p03:{pw.target_kind}:approval_reason"
+        )
+        if pw.wiki_route is not None:
+            pw.wiki_route = _sanitize_and_check_value(
+                pw.wiki_route, context=f"p03:{pw.target_kind}:wiki_route"
+            )
+        if pw.skill_route is not None:
+            pw.skill_route = _sanitize_and_check_value(
+                pw.skill_route, context=f"p03:{pw.target_kind}:skill_route"
+            )
+        if pw.source_session_keys:
+            pw.source_session_keys = [
+                sanitize_and_check_secrets(str(s), context=f"p03:{pw.target_kind}:source_session_keys")
+                for s in pw.source_session_keys
+            ]
     except SecretLeakError:
         raise _DropItem("SECRET_LEAK_BLOCKED") from None
 
@@ -359,15 +429,9 @@ def _normalize_planned_write(
         pw.action = "register_rule"
         pw.rule_payload = normalize_rule_payload(pw)
         try:
-            payload = dict(pw.rule_payload)
-            payload["title"] = sanitize_and_check_secrets(
-                str(payload.get("title") or ""), context="rule:title"
+            pw.rule_payload = _sanitize_and_check_value(
+                dict(pw.rule_payload), context="rule:payload"
             )
-            payload["checklist"] = [
-                sanitize_and_check_secrets(str(entry), context="rule:checklist")
-                for entry in (payload.get("checklist") or [])
-            ]
-            pw.rule_payload = payload
         except SecretLeakError:
             raise _DropItem("SECRET_LEAK_BLOCKED") from None
         if not pw.content_preview:

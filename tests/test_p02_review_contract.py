@@ -1970,3 +1970,74 @@ def test_two_batches_in_flight_on_one_runner_each_keep_their_own_stage_and_telem
     gateway.hold_call = None
     real_call("p", "s")  # from this thread, with no stage in flight: the configured pair
     assert [(thread, *_model_and_effort(request)) for thread, request in gateway.calls][-1] == ("MainThread", "mock-model", "medium")
+
+
+def test_p02_review_sanitizes_secrets_and_private_blocks_in_returned_payload_while_skipping_cache(
+    tmp_path: Path,
+):
+    """P02 review receipts/DB must never carry plaintext credentials or `<private>` blocks,
+    and the raw reply must still stay off the cache."""
+    runner = _api_runner(tmp_path)
+    finding = _finding("s1")
+    finding["facts"] = [f"暴露密钥 {SYNTHETIC_KEY}", "<private>内部敏感备注</private>"]
+    finding["anomalies"] = [f"异常带入 {SYNTHETIC_KEY}"]
+    raw = json.dumps(
+        {
+            "findings": [finding],
+            "events": [
+                {
+                    "kind": "incident",
+                    "title": f"事件 <private>秘密</private>",
+                    "summary": f"触发 {SYNTHETIC_KEY}",
+                    "session_key": "codex:s1",
+                }
+            ],
+            "mistakes": [
+                {
+                    "root_cause_key": "leak-check",
+                    "title": f"记录 {SYNTHETIC_KEY}",
+                    "phenomenon": "<private>敏感现场</private>",
+                    "truth": "禁止记录明文密钥",
+                    "session_key": "codex:s1",
+                }
+            ],
+            "dissents": [
+                {
+                    "target_type": "rule",
+                    "target_id": "rule-1",
+                    "counter_claim": f"反例 {SYNTHETIC_KEY}",
+                    "session_key": "codex:s1",
+                }
+            ],
+            "repeated_workflows": [],
+        },
+        ensure_ascii=False,
+    )
+    runner._call_chat_completion = _FakeModel(raw)
+    review = runner.review_sessions(_sessions("s1"), [])
+    dumped = json.dumps(review, ensure_ascii=False)
+    assert SYNTHETIC_KEY not in dumped
+    assert "内部敏感备注" not in dumped
+    assert "敏感现场" not in dumped
+    assert "秘密" not in dumped
+    assert review["review_diagnostics"]["cache_file"] is None
+    assert _files_under(tmp_path / "receipts") == []
+
+
+def test_p02_prompt_brief_redaction_matches_queue_privacy_rules():
+    """`_render_structured_brief` must mask underscored/plural/non-str credential keys and `<private>`."""
+    from ai_flywheel.adapters.runners.prompts import _render_structured_brief
+
+    rendered = _render_structured_brief(
+        {
+            "db_password": ["S1234-secret"],
+            "private_key": ["K9999-secret"],
+            "password": 98765432,
+            "note": "正常事实 <private>绝密内容</private>",
+        }
+    )
+    assert "S1234-secret" not in rendered
+    assert "K9999-secret" not in rendered
+    assert "98765432" not in rendered
+    assert "绝密内容" not in rendered
+    assert "正常事实" in rendered

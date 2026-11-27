@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from ai_flywheel.core.time_utils import (
     FRESHNESS_DAYS,
@@ -13,19 +14,28 @@ from ai_flywheel.core.time_utils import (
 # The date helpers live in `ai_flywheel.core.time_utils`; they are re-exported here so
 # that every existing `from ai_flywheel.core.privacy import ...` keeps working.
 __all__ = [
+    "BRIEF_REDACTED",
+    "BRIEF_TRUNCATED",
     "CJK_CREDENTIAL_ASSIGNMENT",
     "FRESHNESS_DAYS",
+    "MAX_BRIEF_DEPTH",
+    "MAX_BRIEF_ITEMS",
+    "MAX_BRIEF_VALUE_CHARS",
     "SECRET_PATTERNS",
     "SecretLeakError",
     "SecretPattern",
     "compute_valid_until",
     "find_secret_shape",
+    "has_private_tags",
+    "key_names_credential",
     "mask_credential_shapes",
     "redact_secrets",
+    "redact_structured_brief",
     "refuse_credential_shapes",
     "sanitize_and_check_secrets",
     "shanghai_iso_week_key",
     "shanghai_today_ymd",
+    "strip_private_tags",
 ]
 
 _PRIVATE_TAG_RE = re.compile(r"<private>.*?</private>", re.DOTALL | re.IGNORECASE)
@@ -180,6 +190,16 @@ def redact_secrets(text: str, *, mask: str = "[REDACTED]", keep_prefix: bool = T
     return redacted
 
 
+def has_private_tags(text: str) -> bool:
+    """Whether ``text`` contains a ``<private>...</private>`` block."""
+    return bool(_PRIVATE_TAG_RE.search(text or ""))
+
+
+def strip_private_tags(text: str) -> str:
+    """Replace every ``<private>...</private>`` block with ``[REDACTED_PRIVATE]``."""
+    return _PRIVATE_TAG_RE.sub("[REDACTED_PRIVATE]", text or "")
+
+
 def sanitize_and_check_secrets(
     text: str,
     *,
@@ -187,7 +207,7 @@ def sanitize_and_check_secrets(
     refuse_secrets: bool = True,
 ) -> str:
     """Strip <private>...</private> spans and block obvious credential/secret leaks before writing."""
-    cleaned = _PRIVATE_TAG_RE.sub("[REDACTED_PRIVATE]", text or "")
+    cleaned = strip_private_tags(text)
     if refuse_secrets:
         for secret in SECRET_PATTERNS:
             if not secret.credential:
@@ -199,3 +219,142 @@ def sanitize_and_check_secrets(
                     "Wrap private spans in <private>...</private> or remove credentials."
                 )
     return cleaned
+
+
+#: A structured brief is evidence for the review, not a second transcript: every
+#: string is capped, and so is each list.
+MAX_BRIEF_VALUE_CHARS = 2000
+MAX_BRIEF_ITEMS = 50
+MAX_BRIEF_DEPTH = 6
+
+#: What a value under a key that names a credential becomes, and what a value nested deeper
+#: than a brief is read becomes.
+BRIEF_REDACTED = "[REDACTED]"
+BRIEF_TRUNCATED = "[TRUNCATED]"
+
+#: The words by which a key of a structured brief names a credential. A key is read word by
+#: word, so ``db_password``, ``DB-PASSWORD``, ``dbPassword`` and ``passwords`` all say password.
+#: Redacted one string at a time, ``{"db_password": "…"}`` would keep its value: the pair is
+#: not the assignment ``password=…`` that the text patterns read.
+_CREDENTIAL_KEY_WORDS = frozenset(
+    {
+        "password",
+        "passwords",
+        "passwd",
+        "passphrase",
+        "passcode",
+        "pwd",
+        "secret",
+        "secrets",
+        "token",
+        "tokens",
+        "credential",
+        "credentials",
+        "authorization",
+        "bearer",
+        "jwt",
+        "apikey",
+        "privatekey",
+        "accesskey",
+    }
+)
+#: …and the same, spelled with a separator: ``api_key``, ``private-key``, ``access key``,
+#: ``signing key``. A primary key and a sort key are not among them.
+_CREDENTIAL_KEY_PREFIXES = frozenset(
+    {"api", "private", "access", "ssh", "signing", "encryption", "license", "master"}
+)
+#: ``token`` is also how a model's usage is spelled: these keys are figures, not credentials.
+_TOKEN_FIGURE_KEYS = frozenset(
+    {
+        "max tokens",
+        "min tokens",
+        "maximum tokens",
+        "minimum tokens",
+        "input tokens",
+        "output tokens",
+        "total tokens",
+        "prompt tokens",
+        "completion tokens",
+        "context tokens",
+        "cached tokens",
+        "reasoning tokens",
+        "token count",
+        "token usage",
+        "token limit",
+        "token budget",
+        "tokens used",
+    }
+)
+#: The same words in Chinese. Chinese does not separate its words, so they are read anywhere
+#: in the key: ``数据库密码`` and ``登录口令`` name a credential as clearly as ``password``.
+_CJK_CREDENTIAL_KEY_WORDS = ("密码", "口令", "私钥", "密钥", "秘钥", "令牌", "凭据", "凭证")
+
+#: A key as words: separators split, and so does the edge where a word starts with a capital.
+_KEY_WORDS_SPLIT_RE = re.compile(
+    r"[^0-9A-Za-z一-鿿]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])"
+)
+
+
+def key_names_credential(key: Any) -> bool:
+    """Whether a dictionary key names a credential: ``password``, ``api_key``, ``数据库密码`` …"""
+    text = str(key)
+    if any(word in text for word in _CJK_CREDENTIAL_KEY_WORDS):
+        return True
+    words = [word.lower() for word in _KEY_WORDS_SPLIT_RE.split(text) if word]
+    phrase = " ".join(words)
+    for index, word in enumerate(words):
+        if word in _CREDENTIAL_KEY_WORDS:
+            if word in {"token", "tokens"} and phrase in _TOKEN_FIGURE_KEYS:
+                continue
+            return True
+        if word in {"key", "keys"} and index and words[index - 1] in _CREDENTIAL_KEY_PREFIXES:
+            return True
+    return False
+
+
+def _mask_brief_text(text: str, limit: int = MAX_BRIEF_VALUE_CHARS) -> str:
+    """A string of a brief, capped: stripped and masked over the whole string first, so that
+    the cap can never cut a credential into a shape no pattern knows."""
+    return mask_credential_shapes(strip_private_tags(text))[:limit]
+
+
+def _redact_brief_value(value: Any, *, depth: int, credential: bool = False) -> Any:
+    """One value of a structured brief, redacted and reduced to JSON-safe data."""
+    if credential:
+        return None if value is None else BRIEF_REDACTED
+    if depth > MAX_BRIEF_DEPTH:
+        return BRIEF_TRUNCATED
+    if isinstance(value, str):
+        return _mask_brief_text(value)
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        # NaN and infinity are not JSON: a number the transports cannot carry is dropped.
+        return value if value == value and abs(value) != float("inf") else None
+    if isinstance(value, (list, tuple)):
+        return [_redact_brief_value(entry, depth=depth + 1) for entry in list(value)[:MAX_BRIEF_ITEMS]]
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for raw_key, entry in list(value.items())[:MAX_BRIEF_ITEMS]:
+            key = _mask_brief_text(str(raw_key), limit=120)
+            cleaned[key] = _redact_brief_value(
+                entry, depth=depth + 1, credential=key_names_credential(raw_key)
+            )
+        return cleaned
+    return _mask_brief_text(str(value))
+
+
+def redact_structured_brief(brief: Any) -> dict[str, Any]:
+    """A client's structured brief as redacted, JSON-safe data (``{}`` when there is none).
+
+    Single source of truth shared by queue ingress and P02 prompt rendering: every string
+    goes through ``strip_private_tags`` + ``mask_credential_shapes`` (keys too), and
+    whatever sits under a key that names a credential is masked as a whole — scalars,
+    numbers, lists and nested dicts alike.
+    """
+    if not isinstance(brief, dict):
+        return {}
+    cleaned = _redact_brief_value(brief, depth=1)
+    return cleaned if isinstance(cleaned, dict) else {}

@@ -239,7 +239,7 @@ class CliSubprocessRunner(BaseWorkflowRunner):
             cache_file_present=cache_hit,
         )
         # The review is usable: now the reply may be cached for the next identical batch.
-        _cache_review_reply(self._persist_cache, cache_file, parsed, cache_hit)
+        _cache_review_reply(self._persist_cache, cache_file, parsed, cache_hit, review=review)
         review["runner"] = f"cli:{self.cfg.runner.cli.command}"
         review["sent_session_keys"] = [s.session_key for s, _ in sessions[:P02_MAX_SESSIONS]]
         return review
@@ -303,14 +303,25 @@ def _cache_plan_reply(
     """Cache the reply behind a usable plan, when nothing in it carries a credential.
 
     The item the privacy gate refused never reaches the plan, but it is still in the
-    reply; and the title and summary of a kept item are not gated when the plan is
-    normalised. Either is a reason to leave the whole reply out of the cache: the plan
-    itself is unaffected. A plan that was not cached names no cache file, so no later
-    message tells the maintainer to delete a file that does not exist.
+    reply; any secret or ``<private>`` span anywhere in the reply or planned writes keeps
+    the whole reply off the disk without calling ``persist``. A plan that was not cached
+    names no cache file, so no later message tells the maintainer to delete a file that
+    does not exist.
     """
-    if plan_reply_refused_a_credential(outcome, parsed) is not None:
+    reason = plan_reply_refused_a_credential(outcome, parsed)
+    if reason is not None:
         outcome.diagnostics.cache_file = None
-    return persist(cache_file, parsed)
+        shape = reply_carries_secret(parsed) or reason
+        logger.warning(
+            "Reply not cached (%s): a credential shape is in the reply (%s). The next identical batch asks again.",
+            cache_file.name,
+            shape,
+        )
+        return False
+    written = persist(cache_file, parsed)
+    if not written:
+        outcome.diagnostics.cache_file = None
+    return written
 
 
 class OpenAICompatibleRunner(BaseWorkflowRunner):
@@ -623,7 +634,7 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
             cache_file_present=cache_hit,
         )
         # The review is usable: now the reply may be cached for the next identical batch.
-        _cache_review_reply(self._persist_cache, cache_file, parsed, cache_hit)
+        _cache_review_reply(self._persist_cache, cache_file, parsed, cache_hit, review=review)
         review["runner"] = f"api:{model}"
         review["sent_session_keys"] = [s.session_key for s, _ in sessions[:P02_MAX_SESSIONS]]
         return review
@@ -690,7 +701,14 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
         return self.plan_writes_detailed(*args, **kwargs).planned_writes
 
 
-def _cache_review_reply(persist: Any, cache_file: Path, parsed: Any, cache_hit: bool) -> None:
+def _cache_review_reply(
+    persist: Any,
+    cache_file: Path,
+    parsed: Any,
+    cache_hit: bool,
+    *,
+    review: dict[str, Any] | None = None,
+) -> None:
     """Cache the reply behind a usable review, when nothing in it carries a credential.
 
     A review quotes the sessions it read, so a credential one of them held can be in its
@@ -698,8 +716,9 @@ def _cache_review_reply(persist: Any, cache_file: Path, parsed: Any, cache_hit: 
     diagnostics stop naming a cache file that was never written.
     """
     if not persist(cache_file, parsed) and not cache_hit:
-        if isinstance(parsed, dict) and isinstance(parsed.get("review_diagnostics"), dict):
-            parsed["review_diagnostics"]["cache_file"] = None
+        target = review if review is not None else parsed
+        if isinstance(target, dict) and isinstance(target.get("review_diagnostics"), dict):
+            target["review_diagnostics"]["cache_file"] = None
 
 
 def api_model_label(api_cfg: ApiRunnerConfig) -> str:
