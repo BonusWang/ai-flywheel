@@ -17,7 +17,10 @@ import yaml
 
 from ai_flywheel.adapters.wiki.schema import (
     FORBIDDEN_PATH_SEGMENTS,
+    PROJECTS_PARTITION_ID,
+    SENSITIVE_LOAD_POLICY,
     WikiGateError,
+    deposit_routing_rules,
     normalize_relative_path,
     split_frontmatter,
 )
@@ -136,6 +139,84 @@ def _as_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _deposit_rules(schema: dict[str, Any]) -> list[dict[str, Any]]:
+    """The contract's deposit routing for a document check; none when it is absent or unusable.
+
+    A routing the schema reader already accepted is read again here because the check also
+    runs on a contract handed over directly. One it cannot read is reported by the schema
+    reader, not turned into a silent "no domain pages".
+    """
+    try:
+        return deposit_routing_rules(schema)
+    except WikiGateError:
+        return []
+
+
+def domain_page_issues(
+    schema: dict[str, Any], relative_path: str, page_type: str, frontmatter: dict[str, Any]
+) -> list[tuple[str, str, str]]:
+    """Where a project-domain page departs from the deposit domain it belongs to.
+
+    Only a Wiki that declares ``content_contract.deposit_routing`` has domain pages; for
+    any other this says nothing. The domain is the one the page type routes to and whose
+    directory the page sits in under its project: there the page follows the domain's
+    templates, in placement, knowledge kind and load policy.
+    """
+    rules = [rule for rule in _deposit_rules(schema) if page_type in rule.get("page_types", [])]
+    if not rules:
+        return []
+    partitions = (schema.get("partition_contract") or {}).get("partitions") or {}
+    root_parts = [segment for segment in str((partitions.get(PROJECTS_PARTITION_ID) or {}).get("root") or "").split("/") if segment]
+    parts = [segment for segment in normalize_relative_path(relative_path).split("/") if segment]
+    # <projects root>/<project>/<domain directory>/<page>.md
+    located = len(parts) >= len(root_parts) + 3 and parts[: len(root_parts)] == root_parts
+    domain_dir = "/".join(parts[len(root_parts) + 1 : -1])
+    domain = next((rule for rule in rules if located and rule.get("subdir") == domain_dir), None)
+    if domain is None:
+        where = " | ".join(f"{{project}}/{rule.get('subdir')}/" for rule in rules)
+        return [
+            (
+                "DOMAIN_PLACEMENT",
+                f"Page type '{page_type}' is deposited under {where} per content_contract.deposit_routing; "
+                f"'{relative_path}' is not a page of those directories.",
+                "type",
+            )
+        ]
+    issues: list[tuple[str, str, str]] = []
+    subdir = str(domain.get("subdir") or "")
+    kinds = [str(kind) for kind in domain.get("knowledge_kinds") or []]
+    if kinds and str(frontmatter.get("knowledge_kind") or "") not in kinds:
+        issues.append(
+            (
+                "DOMAIN_KNOWLEDGE_KIND",
+                f"Pages under {{project}}/{subdir}/ carry knowledge_kind {' or '.join(kinds)} "
+                f"per their template; got '{frontmatter.get('knowledge_kind')}'.",
+                "knowledge_kind",
+            )
+        )
+    policies = [str(policy) for policy in domain.get("load_policies") or []]
+    if policies and str(frontmatter.get("load_policy") or "") not in policies:
+        issues.append(
+            (
+                "DOMAIN_LOAD_POLICY",
+                f"Pages under {{project}}/{subdir}/ use load_policy {' or '.join(policies)} per their template; "
+                f"got '{frontmatter.get('load_policy')}'.",
+                "load_policy",
+            )
+        )
+    if domain.get("sensitive") and (str(frontmatter.get("load_policy") or "") == SENSITIVE_LOAD_POLICY) and (
+        "default_load" not in frontmatter or _as_bool(frontmatter.get("default_load"))
+    ):
+        issues.append(
+            (
+                "DOMAIN_DEFAULT_LOAD",
+                f"A {domain.get('domain')} page is loaded only on explicit request: it requires default_load: false.",
+                "default_load",
+            )
+        )
+    return issues
 
 
 def validate_body(
@@ -469,11 +550,13 @@ def validate_document(
             "原文/提炼 double layer is legacy-only.",
         )
 
-    # 11. Private credential pages stay in the approved project config vault.
+    # 11. Private credential pages stay in the approved project config vault: the directory the
+    #     engine knows, plus any domain the contract's deposit routing marks sensitive.
     sensitivity = str(fm.get("sensitivity") or "").lower()
     contains_credentials = _as_bool(fm.get("contains_credentials"))
     if sensitivity == "private_sensitive" or contains_credentials:
-        if "/项目配置/" not in "/" + rel:
+        vaults = {"/项目配置/", *(f"/{rule['subdir']}/" for rule in _deposit_rules(schema) if rule.get("sensitive"))}
+        if not any(vault in "/" + rel for vault in vaults):
             result.error(
                 "CREDENTIAL_PAGE_PLACEMENT",
                 "private_sensitive / contains_credentials pages must live under {project}/项目配置/.",
@@ -492,6 +575,10 @@ def validate_document(
             )
         if not fm.get("access_scope"):
             result.error("CREDENTIAL_ACCESS_SCOPE", "Credential pages require access_scope.", "access_scope")
+
+    # 11b. A project-domain page follows the template of the deposit domain it is filed under.
+    for code, message, field_name in domain_page_issues(schema, rel, raw_type, fm):
+        result.error(code, message, field_name)
 
     # 12. Body skeleton and line budget.
     validate_body(result, raw_type, fm, body)

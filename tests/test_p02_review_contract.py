@@ -2,6 +2,9 @@
 
 桩模型按提示词首行分流 P02、格式修复与 P03。会话、审查内容与模型回复全部是虚构示例，
 不含任何真实会话、项目或技能名。
+
+最后一节覆盖 finding 的可选字段 `domain_signals`（feat-project-domain-incremental-deposit）：
+会话查证过的表结构、配置、架构链路与业务口径线索，以及没有线索时的缺省。
 """
 from __future__ import annotations
 
@@ -33,6 +36,8 @@ from ai_flywheel.adapters.runners import (
     ReviewUnavailableError,
     _build_p02_prompt,
     build_runner,
+    empty_domain_signals,
+    normalize_domain_signals,
 )
 from ai_flywheel.config import FlywheelConfig
 from ai_flywheel.core import orchestrator as orchestrator_mod
@@ -643,3 +648,255 @@ def test_runner_without_a_declared_source_is_labelled_undeclared(tmp_path: Path,
     p02 = _node(run, "P02_REVIEW")
     assert p02.summary.startswith("审查来源：未声明；完成 0 段对话回顾")
     assert p02.payload["review_source"] == REVIEW_SOURCE_UNDECLARED
+
+
+# ---------------------------------------------------------------- the optional `domain_signals` of a finding
+# (feat-project-domain-incremental-deposit)
+
+
+_OMITTED = object()
+
+EMPTY_SIGNALS = {"database_tables": [], "project_configs": [], "architecture_flows": [], "business_calibers": []}
+
+
+def _domain_signals() -> dict[str, Any]:
+    """What a reviewer records for a session that verified the `orders` table and its connection constraint."""
+    return {
+        "database_tables": [
+            {
+                "table": "orders",
+                "verified_fields": ["order_id bigint 主键", "status varchar(32)"],
+                "enums": ["status：PAID / CLOSED"],
+                "join_keys": ["customer_id -> customers.customer_id"],
+                "pitfalls": ["status 没有空值"],
+            }
+        ],
+        "project_configs": [
+            {
+                "topic": "database",
+                "facts": ["逻辑库 orders 落在实例 db-orders-1", "跨库关联只能在应用层做"],
+                "pitfalls": ["测试库与生产库不是同一实例"],
+            }
+        ],
+        "architecture_flows": ["订单服务 -> 支付服务（同步回调）"],
+        "business_calibers": ["客单价按已支付金额统计"],
+    }
+
+
+def _signals_review() -> str:
+    """A model review whose finding carries the domain signals of its session."""
+    return json.dumps(
+        {"findings": [dict(_finding("s1"), domain_signals=_domain_signals())], "mistakes": [], "dissents": [], "repeated_workflows": []},
+        ensure_ascii=False,
+    )
+
+
+def test_p02_prompt_asks_for_verified_domain_signals_and_keeps_its_input():
+    sessions = [(record, f"正文{i}") for i, (record, _) in enumerate(_sessions("s1", "s2"))]
+    prompt = _build_p02_prompt(sessions, [], None, "daily")
+
+    assert prompt.startswith("You are the P02 Review Worker of AI Flywheel.\n")
+    # Only what the session itself verified, an untouched domain stays empty, and nothing is inferred.
+    for needle in (
+        "DOMAIN SIGNALS",
+        "it holds ONLY what this session itself queried, read in the code or verified",
+        "database_tables",
+        "project_configs",
+        "architecture_flows",
+        "business_calibers",
+        "a full DDL is never needed",
+        "Leave a domain the session did not touch empty ([])",
+        "never infer, generalise or pad it",
+        "omit the whole field when a finding has no such clue",
+        "NEVER write a password, token or private key into project_configs",
+    ):
+        assert needle in prompt, needle
+    # The output contract shows the four keys and the shape of their entries.
+    contract = prompt.split("Return STRICT JSON ONLY:\n", 1)[1].split("\n\n", 1)[0]
+    for shape in (
+        '"domain_signals":{"database_tables":[{"table":"table_name","verified_fields":["..."],"enums":["..."],',
+        '"join_keys":["..."],"pitfalls":["..."]}],"project_configs":[{"topic":"config_topic","facts":["..."],',
+        '"pitfalls":["..."]}],"architecture_flows":["..."],"business_calibers":["..."]}',
+    ):
+        assert shape in contract, shape
+    # The input JSON is what it was: the reviewer is told nothing about the Wiki or its projects.
+    payload = json.loads(prompt.rsplit("\n\n", 1)[1])
+    assert set(payload) == {"phase", "sessions", "open_retros", "existing_skills"}
+    assert empty_domain_signals() == EMPTY_SIGNALS
+
+
+def test_a_troubleshooting_session_yields_its_table_and_configuration_clues(tmp_path: Path):
+    runner = _api_runner(tmp_path)
+    # The session under review mentions a credential; a finding records where it is kept, never its value.
+    password = "Hk9-Qp31x"
+    session_text = (
+        "用户：订单状态对不上，跨库关联也查不出来。"
+        f"助手：查了 orders 表的 status 枚举和 customer_id；逻辑库 orders 在实例 db-orders-1；数据库密码：{password}。"
+    )
+    runner._call_chat_completion = _FakeModel(_signals_review())
+
+    result = runner.review_sessions([(_sessions("s1")[0][0], session_text)], [])
+
+    (finding,) = result["findings"]
+    assert finding["domain_signals"] == _domain_signals()
+    # The rest of the finding is the finding the model wrote
+    assert {key: value for key, value in finding.items() if key != "domain_signals"} == _finding("s1")
+    # The configuration clues carry the facts a later session must remember, and no password
+    assert finding["domain_signals"]["project_configs"][0]["facts"] == ["逻辑库 orders 落在实例 db-orders-1", "跨库关联只能在应用层做"]
+    assert password not in json.dumps(result, ensure_ascii=False)
+    assert result["review_diagnostics"]["reason_code"] is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param(_OMITTED, id="omitted"),
+        pytest.param(None, id="null"),
+        pytest.param("", id="empty-text"),
+        pytest.param([], id="list"),
+        pytest.param("orders", id="text"),
+        pytest.param({"database_tables": {"table": "orders"}}, id="wrong-shape"),
+    ],
+)
+def test_a_finding_without_domain_signals_is_completed_and_never_fails_the_review(tmp_path: Path, raw: Any):
+    finding = _finding("s1")
+    if raw is not _OMITTED:
+        finding["domain_signals"] = raw
+    runner = _api_runner(tmp_path)
+    runner._call_chat_completion = _FakeModel(json.dumps({"findings": [finding, _finding("s2")]}, ensure_ascii=False))
+
+    result = runner.review_sessions(_sessions("s1", "s2"), [])
+
+    # Neither finding is dropped, the review does not fail, and each finding carries the four empty keys.
+    assert [f["session_key"] for f in result["findings"]] == ["codex:s1", "codex:s2"]
+    assert [f["domain_signals"] for f in result["findings"]] == [EMPTY_SIGNALS, EMPTY_SIGNALS]
+    assert result["findings"][0]["facts"] == ["连接池上限过小导致超时"]
+    assert result["review_diagnostics"]["finding_count"] == 2
+
+
+def test_a_run_shows_the_domain_signals_in_the_review_node(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    rt, _ = _runtime(tmp_path)
+    _register(rt)
+    monkeypatch.setattr(OpenAICompatibleRunner, "_call_chat_completion", _FakeModel(_signals_review()))
+
+    run = rt.orchestrator.start_run(trigger="test", phase="daily", session_keys=["codex:s1"], auto_approve_override=True)
+
+    assert run.status == RunStatus.PASS, run.error
+    (finding,) = _node(run, "P02_REVIEW").payload["findings"]
+    assert finding["domain_signals"] == _domain_signals()
+
+
+def test_malformed_domain_signals_are_tidied_and_never_fail_the_review(tmp_path: Path):
+    finding = _finding("s1")
+    finding["domain_signals"] = {
+        "database_tables": [
+            "payments",  # a bare table name
+            {"table": "orders", "verified_fields": "order_id"},  # one field given as text
+            {"table": "orders", "verified_fields": ["order_id"], "enums": []},  # the same table again
+            {"verified_fields": ["orphan"]},  # no table named
+            42,  # not an entry
+        ],
+        "project_configs": {"topic": "database"},  # not a list
+        "architecture_flows": ["订单服务 -> 支付服务", "订单服务 -> 支付服务", " ", None],
+        "business_calibers": [f"口径{i}" for i in range(25)],
+        "something_else": ["not one of the four domains"],
+    }
+    runner = _api_runner(tmp_path)
+    runner._call_chat_completion = _FakeModel(json.dumps({"findings": [finding]}, ensure_ascii=False))
+
+    result = runner.review_sessions(_sessions("s1"), [])
+
+    # What can be read is kept in the one shape; what cannot be is dropped; the review itself is fine.
+    assert result["findings"][0]["domain_signals"] == {
+        "database_tables": [
+            {"table": "payments", "verified_fields": [], "enums": [], "join_keys": [], "pitfalls": []},
+            {"table": "orders", "verified_fields": ["order_id"], "enums": [], "join_keys": [], "pitfalls": []},
+        ],
+        "project_configs": [],
+        "architecture_flows": ["订单服务 -> 支付服务"],
+        "business_calibers": [f"口径{i}" for i in range(20)],
+    }
+    assert result["review_diagnostics"]["reason_code"] is None
+
+
+def test_domain_signals_are_bounded():
+    long_caliber = "口径" * 120  # 240 characters
+    signals = normalize_domain_signals({"business_calibers": ["统计口径", "统计口径", " ", None, long_caliber]})
+    assert signals == {**EMPTY_SIGNALS, "business_calibers": ["统计口径", long_caliber[:160]]}
+
+    tables = normalize_domain_signals({"database_tables": [f"table_{i}" for i in range(25)]})["database_tables"]
+    assert [table["table"] for table in tables] == [f"table_{i}" for i in range(20)]
+
+    fields = normalize_domain_signals({"database_tables": [{"table": "orders", "verified_fields": [f"f{i}" for i in range(15)]}]})
+    assert fields["database_tables"] == [
+        {"table": "orders", "verified_fields": [f"f{i}" for i in range(12)], "enums": [], "join_keys": [], "pitfalls": []}
+    ]
+
+
+def test_a_credential_inside_a_domain_signal_is_masked(tmp_path: Path):
+    finding = _finding("s1")
+    finding["domain_signals"] = {
+        "project_configs": [
+            {"topic": "database", "facts": ["数据库密码：Hk9-Qp31x", "密码走环境变量注入，仓库里不落明文"]},
+        ],
+    }
+    runner = _api_runner(tmp_path)
+    runner._call_chat_completion = _FakeModel(json.dumps({"findings": [finding]}, ensure_ascii=False))
+
+    result = runner.review_sessions(_sessions("s1"), [])
+
+    # A password never travels from a review into a plan: the line is kept, the value is not.
+    assert result["findings"][0]["domain_signals"] == {
+        **EMPTY_SIGNALS,
+        "project_configs": [
+            {
+                "topic": "database",
+                "facts": ["数据库密码：[REDACTED]", "密码走环境变量注入，仓库里不落明文"],
+                "pitfalls": [],
+            }
+        ],
+    }
+    assert "Hk9-Qp31x" not in json.dumps(result, ensure_ascii=False)
+
+
+def test_every_reviewer_states_the_four_keys(tmp_path: Path):
+    heuristic = DryRunHeuristicRunner().review_sessions(_sessions(*SESSION_IDS), [])
+    # The local reviewer reads no table, configuration or architecture: it states the empty structure.
+    assert [f["domain_signals"] for f in heuristic["findings"]] == [EMPTY_SIGNALS] * 3
+
+    cfg = FlywheelConfig(base_dir=tmp_path)
+    cfg.runner.mode = "cli"
+    cfg.runner.cli.command = "mock-cli"
+    cli = CliSubprocessRunner(cfg, ImmutableFileStore(tmp_path / "cli-receipts"))
+    cli._invoke_cli = lambda stage, prompt, **kwargs: json.loads(_signals_review())  # type: ignore[method-assign]
+    (finding,) = cli.review_sessions(_sessions("s1"), [])["findings"]
+    assert finding["domain_signals"] == _domain_signals()
+
+
+def test_a_cached_review_carries_its_domain_signals(tmp_path: Path):
+    runner = _api_runner(tmp_path)
+    fake = _FakeModel(_signals_review())
+    runner._call_chat_completion = fake
+
+    first = runner.review_sessions(_sessions("s1"), [])
+    second = runner.review_sessions(_sessions("s1"), [])
+
+    assert len(fake.prompts) == 1
+    assert (first["review_diagnostics"]["cache_hit"], second["review_diagnostics"]["cache_hit"]) == (False, True)
+    assert second["findings"] == first["findings"]
+
+
+def test_a_reply_cached_before_the_field_existed_is_completed_and_served(tmp_path: Path):
+    runner = _api_runner(tmp_path)
+    stale = _api_cache_dir(tmp_path) / "p02_review-before-signals.json"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text(_review("s1", "s2"), encoding="utf-8")  # a valid review that predates the optional field
+    runner._cache_file = lambda stage, prompt: stale  # type: ignore[method-assign]
+    fake = _FakeModel(_signals_review())
+    runner._call_chat_completion = fake
+
+    result = runner.review_sessions(_sessions("s1", "s2"), [])
+
+    assert fake.prompts == []  # served from the cache, the model is not asked again
+    assert result["review_diagnostics"]["cache_hit"] is True
+    assert [f["domain_signals"] for f in result["findings"]] == [EMPTY_SIGNALS, EMPTY_SIGNALS]

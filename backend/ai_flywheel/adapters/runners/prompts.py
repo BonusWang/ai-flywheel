@@ -79,11 +79,22 @@ def _build_p02_prompt(
         "(3) dissents/exceptions where a session shows an existing rule or experience card does NOT apply (preserve counter-evidence),\n"
         "(4) repeated multi-step workflows worth encapsulating into a new Skill or updating an existing Skill "
         "(compare against existing_skills to avoid duplicates).\n"
+        "DOMAIN SIGNALS: a finding may carry \"domain_signals\", and it holds ONLY what this session itself queried, read "
+        "in the code or verified. database_tables = business tables with the fields, enum values and join keys really "
+        "verified and the pitfalls met (a full DDL is never needed); project_configs = configuration facts the session "
+        "confirmed and a later session must remember (data source / instance and logical database mapping, connection "
+        "constraints); architecture_flows = service or interaction chains verified; business_calibers = business "
+        "algorithms and statistical calibers settled or verified. Leave a domain the session did not touch empty ([]) "
+        "and never infer, generalise or pad it; omit the whole field when a finding has no such clue. NEVER write a "
+        "password, token or private key into project_configs, not even partly masked: name where it is kept instead.\n"
         "Return STRICT JSON ONLY:\n"
         '{"findings":[{"session_key":"...","client":"...","project":"...","title":"简洁中文标题",'
         '"worthy":true,"category":"project|knowledge|workflow|temp_chat","skip_reason":"",'
         '"facts":["..."],"anomalies":["..."],"tags":["..."],"suggest_rule":true,'
-        '"skill_route":{"hit":false,"action":"none|create|update","target_skill":"slug-or-empty","reason":"..."}}],'
+        '"skill_route":{"hit":false,"action":"none|create|update","target_skill":"slug-or-empty","reason":"..."},'
+        '"domain_signals":{"database_tables":[{"table":"table_name","verified_fields":["..."],"enums":["..."],'
+        '"join_keys":["..."],"pitfalls":["..."]}],"project_configs":[{"topic":"config_topic","facts":["..."],'
+        '"pitfalls":["..."]}],"architecture_flows":["..."],"business_calibers":["..."]}}],'
         '"mistakes":[{"root_cause_key":"kebab-case-root-cause","severity_grade":"red_silent|yellow_caught|green_minor",'
         '"title":"简短错题标题","phenomenon":"发生了什么","truth":"正确做法","thinking_root_cause":"思维盲点",'
         '"caught_by":"user|tool|self","session_key":"..."}],'
@@ -134,6 +145,59 @@ def _p03_routing_text(routing_candidates: RoutingCandidates | None) -> tuple[str
     )
 
 
+def _domain_pages_offered(routing_candidates: RoutingCandidates | None) -> bool:
+    """Whether the planner is told about project-domain pages.
+
+    The Wiki must declare the deposit routing and offer somewhere to write: with no routable
+    page type or project, the routing paragraph already rules out every knowledge document.
+    """
+    if routing_candidates is None or not routing_candidates.routable:
+        return False
+    deposit = routing_candidates.deposit_routing
+    return deposit is not None and bool(deposit.domains)
+
+
+def _p03_deposit_text(routing_candidates: RoutingCandidates | None) -> str:
+    """The gradual-completion rules of a Wiki that declares a project-domain deposit routing.
+
+    Nothing when the Wiki declares none: such a Wiki keeps the prompt it had, byte for
+    byte. Everything the rules refer to (domain names, target paths, page types,
+    templates) is read by the model off ``routing_candidates.deposit_routing``; none of
+    it is written here.
+    """
+    if not _domain_pages_offered(routing_candidates):
+        return ""
+    return (
+        "PROJECT DOMAIN PAGES: this Wiki also files what a session VERIFIED about one project into that project's "
+        'domain pages. "routing_candidates.deposit_routing" declares them (domains, triggers, target_path, page_types '
+        'and templates: nothing is invented here) and each project\'s "domain_inventory" lists the domain pages it '
+        'already holds per directory; "domain_page_sections", where present, shows a page\'s sections and the header '
+        "row of each of its tables.\n"
+        "GRADUAL COMPLETION RULES:\n"
+        '1. Keep at least one slot for the main experience card of rule 1: a domain page must not crowd it out. Only '
+        'inside the item cap, plan one "knowledge_doc" per domain page that the findings\' "domain_signals" name, and '
+        "only for a fact the session verified. Never plan a domain page from a guess.\n"
+        "2. database_tables, ONE TABLE PER PAGE: when the table name is listed in that project's domain_inventory, "
+        'action="update" and relative_path is that existing page; otherwise action="create" with a page named after the '
+        "table alone. Record only the verified fields, enum values, join keys and pitfalls: a full DDL is never "
+        "required.\n"
+        '3. project_configs: a verified configuration fact that a later session must remember is planned even when '
+        'nothing was changed, so never skip it as "no config change". When the configuration page exists, prefer '
+        'action="update". NEVER output a password, token or private key, not even partly masked: such an item is '
+        "dropped before anyone sees it (SECRET_LEAK_BLOCKED). Name where the credential is kept instead.\n"
+        "4. architecture_flows and business_calibers follow the same rule for the pages of their domain.\n"
+        'EVERY domain "knowledge_doc" carries "wiki_route"={"page_type": <one page_types value of that domain>, '
+        '"project": <one project, copied exactly>, "reason": "..."}; "relative_path" = that domain\'s target_path with '
+        '{project} and {page} filled in; "action"="create|update"; and a "content_preview" that REPLACES the shape of '
+        'rule 1. For action="update" it is ONLY the increment: no frontmatter, no "# " title and nothing the page '
+        'already holds, just the sections to extend, each as "## <section name copied from the domain\'s templates '
+        'body_sections or from domain_page_sections>" followed by the new rows or bullets, a table row having exactly '
+        'as many cells as that section\'s header row. For action="create" it is the template sections with what was '
+        'verified, in template order (an untouched section may be left out), with no frontmatter and no "# " title: '
+        "the engine writes the page from its template.\n"
+    )
+
+
 def _existing_skill_sections(
     review_findings: dict[str, Any], skills_root: Path | None
 ) -> dict[str, list[str]]:
@@ -177,11 +241,22 @@ def _build_p03_prompt(
     capped_items = max(1, max_write_set)
     today = shanghai_today_ymd()
     routing_paragraph, knowledge_doc_routing = _p03_routing_text(routing_candidates)
+    deposit_paragraph = _p03_deposit_text(routing_candidates)
     routable = routing_candidates is not None and routing_candidates.routable
     skill_sections = {str(name): list(headings or []) for name, headings in (existing_skill_sections or {}).items()}
+    domain_pages_offered = _domain_pages_offered(routing_candidates)
+    findings: list[dict[str, Any]] = []
+    for finding in review_findings.get("findings", []):
+        if finding.get("worthy", True) is False:
+            continue
+        if not domain_pages_offered and "domain_signals" in finding:
+            # Only a Wiki that is told about domain pages plans them: anywhere else the review's
+            # `domain_signals` stay out of the input, so the prompt is the one it had, byte for byte.
+            finding = {key: value for key, value in finding.items() if key != "domain_signals"}
+        findings.append(finding)
     payload: dict[str, Any] = {
         "phase": phase,
-        "findings": [f for f in review_findings.get("findings", []) if f.get("worthy", True) is not False],
+        "findings": findings,
         "eligible_promotions": review_findings.get("eligible_promotions", []),
         "repeated_workflows": review_findings.get("repeated_workflows", []),
         "existing_rules": existing_summary,
@@ -207,6 +282,7 @@ def _build_p03_prompt(
         "plus the kind-specific keys listed below. "
         'If nothing is worth writing, return {"planned_writes": []}.\n'
         f"{routing_paragraph}"
+        f"{deposit_paragraph}"
         f"{skill_sections_note}"
         "Allowed target_kind values:\n"
         f'1. "knowledge_doc": relative_path under "{default_doc_prefix}{today}-slug.md", action="create|update", '

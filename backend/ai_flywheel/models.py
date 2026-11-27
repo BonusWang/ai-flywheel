@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
@@ -379,6 +380,36 @@ class PlannedWrite(BaseModel):
 # The write actions that always need a human: they destroy or replace core content.
 SENSITIVE_ACTIONS = frozenset({"delete", "overwrite_core"})
 
+# A Wiki's project configuration page, and the declaration of a page that holds private
+# material. A write into either is sensitive whatever the Wiki calls its directories: a
+# configuration page carries instance names, scopes and sometimes credentials, and it must
+# never be written silently under `smart`.
+SENSITIVE_CONFIG_PAGE_TYPE = "project-config"
+PRIVATE_SENSITIVITY = "private_sensitive"
+
+# The leading frontmatter block of a draft, and the two lines in it that mark a private page.
+_DRAFT_FRONTMATTER_RE = re.compile(r"\A(?:\ufeff)?---[ \t]*\r?\n(.*?)\r?\n?---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
+_SENSITIVITY_LINE_RE = re.compile(r"^\s*sensitivity:\s*[\"']?([A-Za-z0-9_-]+)", re.MULTILINE)
+_CONTAINS_CREDENTIALS_LINE_RE = re.compile(
+    r"^\s*contains_credentials:\s*[\"']?(?:true|yes|on|1)\b", re.MULTILINE | re.IGNORECASE
+)
+
+
+def declares_private_page(content_preview: str | None) -> bool:
+    """Whether a draft's own frontmatter declares it a private page.
+
+    Only the leading frontmatter block is read; an increment that carries no frontmatter
+    says nothing.
+    """
+    block = _DRAFT_FRONTMATTER_RE.match(content_preview or "")
+    if not block:
+        return False
+    sensitivity = _SENSITIVITY_LINE_RE.search(block.group(1))
+    return bool(
+        (sensitivity and sensitivity.group(1).lower() == PRIVATE_SENSITIVITY)
+        or _CONTAINS_CREDENTIALS_LINE_RE.search(block.group(1))
+    )
+
 
 def is_sensitive_write(write: "PlannedWrite | dict[str, Any]") -> bool:
     """The one canonical sensitivity predicate for a planned write.
@@ -389,21 +420,33 @@ def is_sensitive_write(write: "PlannedWrite | dict[str, Any]") -> bool:
 
     Accepts both a :class:`PlannedWrite` and the plain dict the Feishu card
     renders, so both sides of the boundary share one implementation.
+
+    A knowledge document is sensitive when it is declared as the project
+    configuration page, or when its draft declares itself a private page. A write
+    the pipeline recognised as one through the mounted Wiki's contract carries
+    ``requires_approval`` and is covered by that flag.
     """
     if isinstance(write, PlannedWrite):
         target_kind = write.target_kind
         requires_approval = bool(write.requires_approval)
         action = write.action
+        wiki_route = write.wiki_route
+        content_preview = write.content_preview
     elif isinstance(write, dict):
         target_kind = write.get("target_kind")
         requires_approval = bool(write.get("requires_approval"))
         action = write.get("action")
+        wiki_route = write.get("wiki_route")
+        content_preview = write.get("content_preview")
     else:  # pragma: no cover - defensive: an unknown shape is never "routine"
         return True
-    return (
-        target_kind == "skill_improvement"
-        or requires_approval
-        or action in SENSITIVE_ACTIONS
+    if target_kind == "skill_improvement" or requires_approval or action in SENSITIVE_ACTIONS:
+        return True
+    if target_kind != "knowledge_doc":
+        return False
+    page_type = str(wiki_route.get("page_type") or "").strip().lower() if isinstance(wiki_route, dict) else ""
+    return page_type == SENSITIVE_CONFIG_PAGE_TYPE or declares_private_page(
+        content_preview if isinstance(content_preview, str) else ""
     )
 
 

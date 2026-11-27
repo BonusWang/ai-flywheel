@@ -68,6 +68,7 @@ from ai_flywheel.adapters.runners.contracts import (
 from ai_flywheel.adapters.runners.clients import _as_int
 from ai_flywheel.adapters.runners.heuristic import DryRunHeuristicRunner
 from ai_flywheel.adapters.runners.normalizers import (
+    DOMAIN_SIGNAL_KEYS,
     _DropItem,
     _SENTENCE_END_RE,
     _addition_adds_nothing,
@@ -83,6 +84,8 @@ from ai_flywheel.adapters.runners.normalizers import (
     _normalize_planned_write,
     _substantive_lines,
     _validation_reasons,
+    empty_domain_signals,
+    normalize_domain_signals,
 )
 from ai_flywheel.adapters.runners.outcomes import (
     _SOURCE_NOUN,
@@ -92,6 +95,7 @@ from ai_flywheel.adapters.runners.outcomes import (
     _review_from_runner_output,
     _unavailable_plan_message,
     _unavailable_review_message,
+    deposit_page_types,
 )
 from ai_flywheel.adapters.runners.prompts import (
     P02_MIDDLE_OMITTED,
@@ -101,11 +105,13 @@ from ai_flywheel.adapters.runners.prompts import (
     _build_p02_prompt,
     _build_p03_prompt,
     _existing_skill_sections,
+    _p03_deposit_text,
     _p03_routing_text,
     excerpt_session_text,
 )
 
 __all__ = [
+    "DOMAIN_SIGNAL_KEYS",
     "BaseWorkflowRunner",
     "CliSubprocessRunner",
     "DryRunHeuristicRunner",
@@ -138,6 +144,7 @@ __all__ = [
     "ReviewUnavailableError",
     "SUPPORTED_TARGET_KINDS",
     "build_runner",
+    "deposit_page_types",
     "excerpt_session_text",
     "httpx",
     "normalize_rule_payload",
@@ -172,6 +179,7 @@ __all__ = [
     "_json_parse_error",
     "_normalize_plan_item",
     "_normalize_planned_write",
+    "_p03_deposit_text",
     "_p03_routing_text",
     "_plan_from_items",
     "_plan_from_runner_output",
@@ -182,4 +190,6 @@ __all__ = [
     "_unavailable_plan_message",
     "_unavailable_review_message",
     "_validation_reasons",
+    "empty_domain_signals",
+    "normalize_domain_signals",
 ]

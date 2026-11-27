@@ -31,7 +31,11 @@ from ai_flywheel.adapters.runners.contracts import (
     _json_parse_error,
 )
 from ai_flywheel.adapters.runners.heuristic import DryRunHeuristicRunner
-from ai_flywheel.adapters.runners.outcomes import _plan_from_runner_output, _review_from_runner_output
+from ai_flywheel.adapters.runners.outcomes import (
+    _plan_from_runner_output,
+    _review_from_runner_output,
+    deposit_page_types,
+)
 from ai_flywheel.adapters.runners.prompts import (
     _build_p02_prompt,
     _build_p03_prompt,
@@ -179,6 +183,7 @@ class CliSubprocessRunner(BaseWorkflowRunner):
             cache_hit=cache_hit,
             cache_file_present=cache_hit,
             reply_trace=reply_trace,
+            domain_page_types=deposit_page_types(routing_candidates),
         )
         # The plan is usable: now the reply may be cached for the next identical batch.
         self._persist_cache(cache_file, parsed)
@@ -464,6 +469,7 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
             cache_hit=cache_hit,
             cache_file_present=cache_hit,
             reply_trace=reply_trace,
+            domain_page_types=deposit_page_types(routing_candidates),
         )
         # The plan is usable: now the reply may be cached for the next identical batch.
         self._persist_cache(cache_file, parsed)

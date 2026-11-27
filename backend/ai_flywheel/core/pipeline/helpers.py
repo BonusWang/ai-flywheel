@@ -12,7 +12,12 @@ from collections import Counter
 from typing import Any
 
 from ai_flywheel.adapters.knowledge import KnowledgeSinkAdapter
-from ai_flywheel.adapters.wiki_gate import UNROUTED_REASON_LABEL, RouteDecision, RoutingCandidates
+from ai_flywheel.adapters.wiki_gate import (
+    CREATE_TARGET_EXISTS,
+    UNROUTED_REASON_LABEL,
+    RouteDecision,
+    RoutingCandidates,
+)
 from ai_flywheel.models import PlannedWrite, SessionRecord, WorkflowRunRecord
 from ai_flywheel.storage.db import FlywheelDB, SEVERITY_RANK, normalize_root_cause_key
 
@@ -224,7 +229,55 @@ def route_knowledge_doc(
         project_hint=" ".join(project_hint),
         allow_evidence_fallback=run.runner_mode == "dry_run",
         candidates=candidates,
+        # A project-domain page is routed by its action: an update is merged into the page
+        # that exists, a create is built from the template, and records where it came from.
+        action=item.action,
+        source_sessions=list(item.source_session_keys),
     )
+
+
+def apply_route_decision(write: PlannedWrite, decision: RouteDecision) -> list[str]:
+    """Carry what the route verdict decided onto the planned write; returns the traces it leaves.
+
+    Only a project-domain page changes anything. A sensitive page is flagged for the
+    approval gate: the mounted contract knows which directory that is, and the write then
+    carries the flag, so the gate, the portal and the Feishu card read one answer. A
+    create that met an existing page is shown as the update it became.
+    """
+    if not decision.routed or not decision.domain:
+        return []
+    traces: list[str] = []
+    reasons: list[str] = []
+    if decision.relabel == CREATE_TARGET_EXISTS:
+        write.action = "update"
+        traces.append(f"{CREATE_TARGET_EXISTS}: {write.relative_path}")
+        reasons.append("目标页已存在，按增量更新处理，原有内容完整保留")
+    if decision.sensitive and not write.requires_approval:
+        # The contract's directory made it sensitive, not the page type or the draft (those
+        # were flagged when the plan was normalised): the write now carries the one flag the
+        # gate, the portal and the card all read.
+        write.requires_approval = True
+        reasons.append(f"「{decision.domain}」页属于敏感写入，需人工确认后才会落盘")
+    if reasons:
+        base = write.approval_reason.strip().rstrip("。；; ")
+        write.approval_reason = "；".join(part for part in (base, *reasons) if part)
+    return traces
+
+
+def domain_signal_names(findings: Any) -> list[str]:
+    """The page names a review's ``domain_signals`` name: tables and configuration topics."""
+    names: list[str] = []
+    for finding in findings if isinstance(findings, list) else []:
+        signals = finding.get("domain_signals") if isinstance(finding, dict) else None
+        if not isinstance(signals, dict):
+            continue
+        for key, name in (("database_tables", "table"), ("project_configs", "topic")):
+            entries = signals.get(key)
+            for entry in entries if isinstance(entries, list) else []:
+                value = str(entry.get(name) or "").strip() if isinstance(entry, dict) else ""
+                if value and value not in names:
+                    names.append(value)
+    return names
 
 
 def partial_write_payload(

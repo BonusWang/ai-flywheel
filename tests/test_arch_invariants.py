@@ -359,6 +359,10 @@ def test_the_frontend_labels_cover_every_node_id_and_signal_kind():
     assert {kind.value for kind in SignalKind} <= _keys("RETRO_KIND_LABELS")
 
 
+PRIVATE_DRAFT = "---\ntitle: database\nsensitivity: private_sensitive\n---\n\n# database\n"
+CREDENTIAL_DRAFT = "---\ntitle: database\ncontains_credentials: true\n---\n\n# database\n"
+
+
 def test_the_feishu_card_and_the_backend_agree_on_what_is_sensitive():
     """卡片、审批门与门户必须对"敏感情项"给出同一个答案。"""
     target_kinds = ("knowledge_doc", "flywheel_rule", "skill_improvement")
@@ -378,6 +382,30 @@ def test_the_feishu_card_and_the_backend_agree_on_what_is_sensitive():
     assert is_sensitive({"target_kind": "skill_improvement", "action": "create", "requires_approval": False})
     assert is_sensitive({"target_kind": "knowledge_doc", "action": "delete", "requires_approval": False})
     assert not is_sensitive({"target_kind": "knowledge_doc", "action": "create", "requires_approval": False})
+    # A project configuration page, and a draft whose frontmatter declares it a private page,
+    # are sensitive on their own: a card must offer no way to pass them as routine items.
+    for action in ("create", "update"):
+        for declared in (
+            {"wiki_route": {"page_type": "project-config", "project": "alpha"}},
+            {"wiki_route": {"page_type": "project-practice-note", "project": "alpha"}, "content_preview": PRIVATE_DRAFT},
+            {"wiki_route": {"page_type": "project-practice-note", "project": "alpha"}, "content_preview": CREDENTIAL_DRAFT},
+        ):
+            write = {"target_kind": "knowledge_doc", "action": action, "requires_approval": False, "title": "t", "summary": "s", **declared}
+            assert is_sensitive(write) is True, write
+            assert is_sensitive_write(write) is True, write
+    # Any other page of a project is a routine write, and a mention of privacy in the body is not a declaration.
+    for preview in ("## 用途一行\n\n- 补充一行。\n", "## 关键事项\n\n- 该页标了 sensitivity: private_sensitive，不要外传。"):
+        routine = {
+            "target_kind": "knowledge_doc",
+            "action": "update",
+            "requires_approval": False,
+            "title": "t",
+            "summary": "s",
+            "wiki_route": {"page_type": "project-algorithm", "project": "alpha"},
+            "content_preview": preview,
+        }
+        assert is_sensitive(routine) is False, routine
+        assert is_sensitive_write(routine) is False, routine
 
 
 # ---------------------------------------------------------------- 4. 真实 serve 角色

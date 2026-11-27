@@ -9,10 +9,18 @@ from pathlib import Path
 import pytest
 import yaml
 
-from ai_flywheel.adapters.wiki_gate import WikiGateError, split_frontmatter
+from ai_flywheel.adapters.wiki_gate import (
+    UPDATE_NO_NEW_CONTENT,
+    WikiGateError,
+    merge_domain_increment,
+    preserves_existing,
+    split_frontmatter,
+)
 from ai_flywheel.adapters.knowledge import KnowledgeWriteError
 from ai_flywheel.adapters.channels.feishu.card import render_ask_card
 from ai_flywheel.config import FlywheelConfig
+from ai_flywheel.core.privacy import SecretLeakError
+from ai_flywheel.core.time_utils import shanghai_today_ymd
 from ai_flywheel.models import (
     OutcomeStatus,
     PlannedWrite,
@@ -898,3 +906,659 @@ def test_sync_fts_index_syncs_wiki_archived_status_and_protects_ledger(tmp_path:
     assert fmap_reactivated[rel2]["freshness_state"] == "fresh"
     assert fmap_reactivated[rel2]["last_verified_at"] == "2026-02-15"
 
+
+# ---------------------------------------------------------------- project-domain pages at the write gate
+# (feat-project-domain-incremental-deposit)
+
+
+PROJECTS = "wiki-知识库/projects-项目"
+ALPHA_DIR = "alpha-orders-Alpha订单系统"
+# The two domain pages project alpha holds, and a table page it does not hold yet.
+ORDERS_REL = f"{PROJECTS}/{ALPHA_DIR}/数据库结构/orders.md"
+DATABASE_REL = f"{PROJECTS}/{ALPHA_DIR}/项目配置/database.md"
+PAYMENTS_REL = f"{PROJECTS}/{ALPHA_DIR}/数据库结构/payments.md"
+# The sections the table template declares, in their order.
+TABLE_SECTIONS = ["用途一行", "字段语义表", "枚举值", "关联键", "坑与边界"]
+PRIVATE_KEY_HEADER = "-----BEGIN " + "RSA PRIVATE KEY-----"
+
+# The contract of a Wiki that declares the four-domain deposit routing (content_contract.deposit_routing).
+DEPOSIT_SCHEMA = textwrap.dedent(
+    """\
+    ---
+    core_contract:
+      required_fields: [title, description, type, created, updated]
+    partition_contract:
+      partitions:
+        projects:
+          root: wiki-知识库/projects-项目
+    content_contract:
+      legacy_type_aliases: {}
+      scope_profiles:
+        formal_active:
+          partition_ids: [projects]
+      page_types:
+        project-practice-lite:
+          partition: projects
+          required_fields: [title, description, type, project_id, record_id, load_policy, default_load, created, updated, status]
+          path_pattern: "^[^/]+/实战笔记/[^/]+\\\\.md$"
+          allowed_status: [active, deprecated, archived]
+        project-algorithm:
+          partition: projects
+          required_fields: [title, description, type, project_id, knowledge_kind, load_policy, default_load, created, updated, status]
+          path_pattern: "^[^/]+/(业务算法|数据库结构)/[^/]+\\\\.md$"
+          allowed_status: [active, deprecated, archived]
+          knowledge_kind_values: [ddl, algorithm, caliber]
+        project-architecture:
+          partition: projects
+          required_fields: [title, description, type, project_id, knowledge_kind, load_policy, default_load, created, updated, status]
+          path_pattern: "^[^/]+/系统架构/[^/]+\\\\.md$"
+          allowed_status: [active, deprecated, archived]
+        project-config:
+          partition: projects
+          required_fields: [title, description, type, project_id, load_policy, default_load, created, updated, status]
+          path_pattern: "^[^/]+/项目配置/.+\\\\.md$"
+          allowed_status: [active, deprecated, archived]
+      project_template_contract:
+        templates:
+          - id: T7
+            name: 表结构
+            page_type: project-algorithm
+            knowledge_kind: ddl
+            load_policy: index_then_on_demand
+            body_sections: [用途一行, 字段语义表, 枚举值, 关联键, 坑与边界]
+          - id: T1
+            name: 业务算法
+            page_type: project-algorithm
+            knowledge_kind: algorithm
+            load_policy: index_then_on_demand
+            body_sections: [适用场景, 算法步骤, 坑与边界]
+          - id: T3
+            name: 服务卡
+            page_type: project-architecture
+            knowledge_kind: service
+            load_policy: index_then_on_demand
+            body_sections: [职责, 依赖关系, 坑与边界]
+          - id: T6
+            name: 项目配置
+            page_type: project-config
+            load_policy: explicit_or_task_required
+            body_sections: [用途一行, 配置矩阵表, 使用规则, 变更记录表]
+      deposit_routing:
+        version: "1.1"
+        rule: 会话查证过的项目领域知识落到项目目录下：一表一页，缺页新建，已有页增量补充。
+        domains:
+          - domain: 数据库结构
+            trigger: 会话查证过业务表的字段、枚举、关联键或使用边界
+            target: "{project}/数据库结构/"
+            template: T7
+          - domain: 系统架构
+            trigger: 会话查证过服务依赖或部署关系
+            target: "{project}/系统架构/"
+            template: T3
+          - domain: 业务算法
+            trigger: 会话查证过业务算法或统计口径
+            target: "{project}/业务算法/"
+            template: T1
+          - domain: 项目配置
+            trigger: 会话查证过后续会话必须记住的项目配置事实
+            target: "{project}/项目配置/"
+            template: T6
+    ---
+
+    # Test Wiki Schema
+    """
+)
+
+# A table page as a first session left it: two of the template's sections hold what was verified.
+ORDERS_PAGE = textwrap.dedent(
+    """\
+    ---
+    title: orders
+    description: 订单主表：一笔订单一行
+    type: project-algorithm
+    project_id: alpha
+    knowledge_kind: ddl
+    load_policy: index_then_on_demand
+    default_load: false
+    created: 2026-11-20
+    updated: 2026-11-20
+    status: active
+    ---
+
+    # orders
+
+    ## 用途一行
+
+    订单主表，一笔订单一行。
+
+    ## 字段语义表
+
+    | 字段 | 类型 | 含义 | 备注 |
+    | --- | --- | --- | --- |
+    | id | bigint | 主键 | 自增 |
+
+    ## 坑与边界
+
+    无
+    """
+)
+
+# The same page after an increment added two rows and the first pitfall; only `updated` moved.
+MERGED_ORDERS_PAGE = textwrap.dedent(
+    """\
+    ---
+    title: orders
+    description: 订单主表：一笔订单一行
+    type: project-algorithm
+    project_id: alpha
+    knowledge_kind: ddl
+    load_policy: index_then_on_demand
+    default_load: false
+    created: 2026-11-20
+    updated: 2026-11-27
+    status: active
+    ---
+
+    # orders
+
+    ## 用途一行
+
+    订单主表，一笔订单一行。
+
+    ## 字段语义表
+
+    | 字段 | 类型 | 含义 | 备注 |
+    | --- | --- | --- | --- |
+    | id | bigint | 主键 | 自增 |
+    | status | varchar(32) | 订单状态 | PAID / CLOSED |
+
+    ## 坑与边界
+
+    - 跨库关联只能在应用层做。
+    """
+)
+
+# The configuration page declares itself private: the gate reads it to merge an increment, nothing else.
+DATABASE_PAGE = textwrap.dedent(
+    """\
+    ---
+    title: database
+    description: alpha 的数据源与逻辑库映射
+    type: project-config
+    project_id: alpha
+    load_policy: explicit_or_task_required
+    default_load: false
+    sensitivity: private_sensitive
+    access_scope: maintainers
+    created: 2026-11-20
+    updated: 2026-11-20
+    status: active
+    ---
+
+    # database
+
+    ## 用途一行
+
+    记录 alpha 服务连接数据库的方式；凭据本身不入库。
+
+    ## 配置矩阵表
+
+    | 配置项 | 取值 | 说明 |
+    | --- | --- | --- |
+    | logical_db.orders | shard_0 | 订单库路由 |
+
+    ## 使用规则
+
+    - 连接池上限按实例规格设置，不超过实例最大连接数的一半。
+    """
+)
+
+# A table page the Wiki does not hold yet, as the engine builds it from the template.
+PAYMENTS_PAGE = textwrap.dedent(
+    """\
+    ---
+    title: payments
+    description: 支付流水表：一次支付尝试一行
+    type: project-algorithm
+    project_id: alpha
+    knowledge_kind: ddl
+    load_policy: index_then_on_demand
+    default_load: false
+    created: 2026-11-27
+    updated: 2026-11-27
+    status: active
+    ---
+
+    # payments
+
+    ## 用途一行
+
+    支付流水表：一次支付尝试一行。
+
+    ## 字段语义表
+
+    | 字段 | 类型 | 含义 | 备注 |
+    | --- | --- | --- | --- |
+    | payment_id | bigint | 支付主键 | 自增 |
+    """
+)
+
+
+def _put(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(text.encode("utf-8"))  # LF, as the Wiki's pages are
+    return path
+
+
+def _deposit_runtime(tmp_path: Path, *, require_scripts: bool = False) -> FlywheelRuntime:
+    """A runtime over a Wiki that declares the deposit routing; project alpha holds two domain pages."""
+    root = tmp_path / "wiki"
+    _put(root / ".wiki-schema.md", DEPOSIT_SCHEMA)
+    _put(root / ORDERS_REL, ORDERS_PAGE)
+    _put(root / DATABASE_REL, DATABASE_PAGE)
+    cfg = FlywheelConfig(base_dir=tmp_path)
+    cfg.knowledge_sink.type = "local_markdown_wiki"
+    cfg.knowledge_sink.root = str(root)
+    cfg.knowledge_sink.allowed_write_prefixes = ["wiki-知识库/"]
+    cfg.knowledge_sink.wiki_gate_enabled = True
+    cfg.knowledge_sink.wiki_gate_require_scripts = require_scripts
+    cfg.knowledge_sink.wiki_d2_postflight_script = ""
+    cfg.knowledge_sink.wiki_lint_script = ""
+    return FlywheelRuntime(cfg)
+
+
+# ---- the merge
+
+
+def test_a_merge_adds_what_is_new_and_leaves_the_rest_of_the_page_alone():
+    increment = (
+        "## 字段语义表\n\n| status | varchar(32) | 订单状态 | PAID / CLOSED |\n\n"
+        "## 坑与边界\n\n- 跨库关联只能在应用层做。\n"
+    )
+
+    merge = merge_domain_increment(ORDERS_PAGE, increment, template_sections=TABLE_SECTIONS, today="2026-11-27")
+
+    assert (merge.ok, merge.has_additions) == (True, True)
+    assert merge.merged == MERGED_ORDERS_PAGE
+    assert (merge.added, merge.duplicates, merge.placeholders) == (2, 0, ["坑与边界"])
+    assert merge.added_text == (
+        "## 字段语义表\n\n| status | varchar(32) | 订单状态 | PAID / CLOSED |\n\n## 坑与边界\n\n- 跨库关联只能在应用层做。"
+    )
+    assert preserves_existing(ORDERS_PAGE, merge.merged) is True
+    # Without a date the frontmatter is left alone, as the plan-stage dry check needs it.
+    undated = merge_domain_increment(ORDERS_PAGE, increment, template_sections=TABLE_SECTIONS)
+    assert undated.merged == MERGED_ORDERS_PAGE.replace("updated: 2026-11-27", "updated: 2026-11-20")
+
+
+def test_a_page_or_an_increment_saved_with_crlf_merges_to_the_same_text():
+    increment = "## 字段语义表\n\n| status | varchar(32) | 订单状态 | PAID / CLOSED |\n"
+
+    lf = merge_domain_increment(ORDERS_PAGE, increment, template_sections=TABLE_SECTIONS)
+    mixed = merge_domain_increment(
+        ORDERS_PAGE.replace("\n", "\r\n"), increment.replace("\n", "\r\n"), template_sections=TABLE_SECTIONS
+    )
+
+    assert mixed.merged == lf.merged
+    assert "\r" not in mixed.merged
+
+
+def test_a_fenced_block_is_added_once_and_as_a_whole():
+    increment = "## 坑与边界\n\n```sql\nselect * from orders where status = 'PAID';\n```\n"
+
+    first = merge_domain_increment(ORDERS_PAGE, increment, template_sections=TABLE_SECTIONS)
+    again = merge_domain_increment(first.merged, increment, template_sections=TABLE_SECTIONS)
+
+    assert first.merged.endswith("## 坑与边界\n\n```sql\nselect * from orders where status = 'PAID';\n```\n")
+    assert (first.added, first.placeholders) == (3, ["坑与边界"])
+    assert (again.ok, again.has_additions, again.duplicates) == (True, False, 1)
+    assert again.merged == first.merged  # nothing added: the page as it is
+
+
+def test_a_table_the_merge_starts_carries_its_own_header():
+    page = ORDERS_PAGE.replace("## 坑与边界", "## 枚举值\n\n无\n\n## 坑与边界")
+    rows = "| status | PAID / CLOSED |\n| source | miniprogram / h5 |\n"
+
+    headerless = merge_domain_increment(page, f"## 枚举值\n\n{rows}", template_sections=TABLE_SECTIONS)
+    assert (headerless.ok, headerless.merged) == (False, "")
+    assert headerless.problems == ["小节「枚举值」在目标页中没有表格，增量行需要先给表头行与分隔行"]
+
+    started = merge_domain_increment(
+        page, f"## 枚举值\n\n| 字段 | 取值 |\n| --- | --- |\n{rows}", template_sections=TABLE_SECTIONS
+    )
+
+    assert started.ok is True
+    assert started.placeholders == ["枚举值"]
+    assert (
+        "## 枚举值\n\n| 字段 | 取值 |\n|---|---|\n| status | PAID / CLOSED |\n| source | miniprogram / h5 |\n\n## 坑与边界"
+        in started.merged
+    )
+
+
+def test_a_section_the_page_lacks_takes_its_place_in_template_order():
+    table = "## 字段语义表\n\n| 字段 | 类型 | 含义 | 备注 |\n| --- | --- | --- | --- |\n| id | bigint | 主键 | 自增 |\n\n"
+    page = ORDERS_PAGE.replace(table, "")
+
+    merge = merge_domain_increment(page, table, template_sections=TABLE_SECTIONS)
+
+    assert merge.ok is True
+    assert merge.merged == page.replace(
+        "## 坑与边界", "## 字段语义表\n\n| 字段 | 类型 | 含义 | 备注 |\n|---|---|---|---|\n| id | bigint | 主键 | 自增 |\n\n## 坑与边界"
+    )
+    # The template decides which sections a page has: one it does not declare is refused, not invented.
+    stranger = merge_domain_increment(page, "## 性能备注\n\n- 慢查询先看索引。\n", template_sections=TABLE_SECTIONS)
+    assert (stranger.ok, stranger.problems) == (False, ["小节「性能备注」不在目标页中，也不是页面模板声明的小节"])
+
+
+def test_preserves_existing_reads_every_meaningful_line_in_order():
+    page = "---\ntitle: orders\nupdated: 2026-11-20\n---\n\n## 字段语义表\n\n| id | bigint |\n\n## 坑与边界\n\n无\n"
+
+    # A new date, a placeholder that gave way and blank lines are not a loss.
+    grown = page.replace("updated: 2026-11-20", "updated: 2026-11-27").replace("\n\n无", "\n\n- 一条坑")
+    assert preserves_existing(page, grown) is True
+    # A line of the page gone is, and so is a line moved out of its order.
+    assert preserves_existing(page, "| id | bigint |\n") is False
+    assert preserves_existing(page, page.replace("| id | bigint |", "| status | varchar |")) is False
+    assert preserves_existing(page, page.replace("| id | bigint |", "| status | varchar |").replace("无", "| id | bigint |")) is False
+
+
+# ---- the write path
+
+
+def test_an_increment_is_merged_into_the_domain_page_and_loses_no_line(tmp_path: Path):
+    rt = _deposit_runtime(tmp_path)
+    target = rt.knowledge.root / ORDERS_REL
+    increment = (
+        "## 字段语义表\n\n| status | varchar(32) | 订单状态 | PAID / CLOSED |\n"
+        "| customer_id | bigint | 下单客户 | 关联 customers.customer_id |\n\n"
+        "## 坑与边界\n\n- 跨库关联只能在应用层做。\n"
+    )
+
+    result = rt.knowledge.write_document_verified(ORDERS_REL, increment, action="update", merge_increment=True)
+
+    after = target.read_bytes()
+    assert b"\r" not in after  # LF whatever line endings the page or the increment used
+    assert (result["verified"], result["wiki_gate"]["ok"]) == (True, True)
+    assert result["merge"] == {
+        "incremental": True,
+        "existing_lines": len(ORDERS_PAGE.splitlines()),
+        "added_lines": 3,
+        "duplicates_removed": 0,
+        "placeholders_replaced": ["坑与边界"],
+        "existing_preserved": True,
+    }
+    lines = after.decode("utf-8").splitlines()
+    position = 0
+    for line in ORDERS_PAGE.splitlines():  # every line the page held, in its order
+        if not line.startswith("updated:") and line.strip() != "无":  # the date moved; the placeholder gave way
+            position = lines.index(line, position) + 1
+    id_row = lines.index("| id | bigint | 主键 | 自增 |")
+    assert lines[id_row + 1 : id_row + 3] == [
+        "| status | varchar(32) | 订单状态 | PAID / CLOSED |",
+        "| customer_id | bigint | 下单客户 | 关联 customers.customer_id |",
+    ]
+    assert lines[-3:] == ["## 坑与边界", "", "- 跨库关联只能在应用层做。"]
+
+
+def test_a_page_saved_with_crlf_is_written_back_with_lf_and_the_same_lines(tmp_path: Path):
+    rt = _deposit_runtime(tmp_path)
+    target = rt.knowledge.root / ORDERS_REL
+    target.write_bytes(ORDERS_PAGE.replace("\n", "\r\n").encode("utf-8"))
+    increment = "## 字段语义表\n\n| status | varchar(32) | 订单状态 | PAID / CLOSED |\n"
+
+    rt.knowledge.write_document_verified(
+        ORDERS_REL, increment.replace("\n", "\r\n"), action="update", merge_increment=True
+    )
+
+    after = target.read_bytes()
+    assert b"\r" not in after
+    assert after.decode("utf-8") == merge_domain_increment(
+        ORDERS_PAGE, increment, template_sections=TABLE_SECTIONS, today=shanghai_today_ymd()
+    ).merged
+
+
+def test_rows_the_page_already_holds_are_not_written_twice(tmp_path: Path):
+    rt = _deposit_runtime(tmp_path)
+    target = rt.knowledge.root / ORDERS_REL
+
+    result = rt.knowledge.write_document_verified(
+        ORDERS_REL,
+        "## 字段语义表\n\n| id | bigint | 主键 | 自增 |\n| status | varchar(32) | 订单状态 | PAID / CLOSED |\n",
+        action="update",
+        merge_increment=True,
+    )
+
+    text = target.read_text(encoding="utf-8")
+    assert text.count("| id | bigint | 主键 | 自增 |") == 1
+    assert text.count("| status | varchar(32) | 订单状态 | PAID / CLOSED |") == 1
+    assert (result["merge"]["duplicates_removed"], result["merge"]["added_lines"]) == (1, 1)
+
+
+def test_an_increment_the_page_already_holds_writes_nothing(tmp_path: Path):
+    rt = _deposit_runtime(tmp_path)
+    target = rt.knowledge.root / ORDERS_REL
+    before = target.read_bytes()
+
+    result = rt.knowledge.write_document_verified(
+        ORDERS_REL, "## 字段语义表\n\n| id | bigint | 主键 | 自增 |\n", action="update", merge_increment=True
+    )
+
+    assert result == {
+        "relative_path": ORDERS_REL,
+        "action": "update",
+        "status": UPDATE_NO_NEW_CONTENT,
+        "skipped": True,
+        "written": False,
+        "reason": "增量内容均已存在于目标页，没有新增实质内容",
+    }
+    assert target.read_bytes() == before
+
+
+def test_an_increment_only_enters_an_existing_page_of_a_declared_domain(tmp_path: Path):
+    rt = _deposit_runtime(tmp_path)
+    note_rel = "wiki-知识库/projects-项目/demo/实战笔记/2026-11-23-缓存雪崩.md"
+    note = _write(rt.knowledge.root, note_rel, _lite_note("缓存雪崩快速定位"))
+    before = note.read_bytes()
+
+    with pytest.raises(KnowledgeWriteError) as exc:
+        rt.knowledge.write_document_verified(
+            PAYMENTS_REL, "## 字段语义表\n\n| payment_id | bigint | 支付主键 | 自增 |\n", action="update", merge_increment=True
+        )
+    assert "Domain update target is missing" in str(exc.value)
+    assert not (rt.knowledge.root / PAYMENTS_REL).exists()
+
+    with pytest.raises(KnowledgeWriteError) as exc:
+        rt.knowledge.write_document_verified(note_rel, "## 结论\n\n- 第二条结论。\n", action="update", merge_increment=True)
+    assert "not a project-domain page the Wiki contract declares" in str(exc.value)
+    assert note.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "defect, message",
+    [
+        pytest.param("a line of the page lost", "Domain merge would not preserve the existing page:", id="page-lost-a-line"),
+        pytest.param("an increment that no longer fits", "Domain increment cannot be merged without loss into", id="increment-does-not-fit"),
+    ],
+)
+def test_the_sink_merges_again_and_stops_when_the_result_cannot_be_trusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str, message: str
+):
+    """The route gate merged the increment when the plan was made. The sink merges again against the page as it is on disk and does not trust the result: a page that lost a line, or an increment that no longer fits, raises before anything is written."""
+    from dataclasses import replace
+
+    from ai_flywheel.adapters import knowledge as knowledge_module
+    from ai_flywheel.adapters.wiki_gate import MergeResult
+
+    rt = _deposit_runtime(tmp_path)
+    target = rt.knowledge.root / ORDERS_REL
+    before = target.read_bytes()
+    real_merge = knowledge_module.merge_domain_increment
+
+    def merge_with_the_defect(existing: str, increment: str, **kwargs: object) -> MergeResult:
+        merge = real_merge(existing, increment, **kwargs)
+        if defect == "a line of the page lost":
+            return replace(merge, merged=merge.merged.replace("| id | bigint | 主键 | 自增 |\n", ""))
+        return replace(merge, problems=["小节「字段语义表」在目标页中没有表格，增量行需要先给表头行与分隔行"])
+
+    monkeypatch.setattr(knowledge_module, "merge_domain_increment", merge_with_the_defect)
+
+    with pytest.raises(KnowledgeWriteError) as exc:
+        rt.knowledge.write_document_verified(
+            ORDERS_REL,
+            "## 字段语义表\n\n| status | varchar(32) | 订单状态 | PAID / CLOSED |\n",
+            action="update",
+            merge_increment=True,
+        )
+
+    assert str(exc.value).startswith(message)
+    assert target.read_bytes() == before
+
+
+def test_d2_postflight_failure_rolls_back_a_domain_increment_and_a_new_page(tmp_path: Path):
+    from ai_flywheel.adapters.wiki_gate import resolve_bash_executable
+
+    bash = resolve_bash_executable("bash")
+    if not bash or not Path(bash).is_file():
+        pytest.skip("bash is required for the D2 postflight rollback test")
+    rt = _deposit_runtime(tmp_path, require_scripts=True)
+    fake = tmp_path / "fake-d2.sh"
+    fake.write_text("#!/usr/bin/env bash\nexit 3\n", encoding="utf-8")
+    rt.cfg.knowledge_sink.wiki_d2_postflight_script = str(fake)
+    rt.cfg.knowledge_sink.wiki_bash = bash
+    orders = rt.knowledge.root / ORDERS_REL
+    payments = rt.knowledge.root / PAYMENTS_REL
+    # The page as a Windows editor may have saved it: the rollback must bring back these very bytes.
+    preimage = ORDERS_PAGE.replace("\n", "\r\n").encode("utf-8")
+    orders.write_bytes(preimage)
+
+    with pytest.raises(WikiGateError) as exc:
+        rt.knowledge.write_document_verified(
+            ORDERS_REL,
+            "## 字段语义表\n\n| status | varchar(32) | 订单状态 | PAID / CLOSED |\n",
+            action="update",
+            merge_increment=True,
+        )
+    assert "D2_BLOCKED" in str(exc.value)
+    assert orders.read_bytes() == preimage
+
+    with pytest.raises(WikiGateError) as exc:
+        rt.knowledge.write_document_verified(PAYMENTS_REL, PAYMENTS_PAGE, action="create")
+    assert "D2_BLOCKED" in str(exc.value)
+    assert not payments.exists()
+
+
+# ---- credentials and the private page
+
+
+def test_a_credential_kind_is_refused_on_any_domain_page(tmp_path: Path):
+    rt = _deposit_runtime(tmp_path)
+    target = rt.knowledge.root / ORDERS_REL
+    before = target.read_bytes()
+
+    with pytest.raises(SecretLeakError) as exc:
+        rt.knowledge.write_document_verified(
+            ORDERS_REL, f"## 坑与边界\n\n- 旧文档里贴过 {PRIVATE_KEY_HEADER}，已作废。\n", action="update", merge_increment=True
+        )
+
+    assert "Private Key Block" in str(exc.value)
+    assert target.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        pytest.param("- 测试库 password: Hk9-Qp31x，只在本地使用。", id="assignment"),
+        pytest.param("- 数据库密码：Hk9-Qp31x，只在本地使用。", id="chinese-assignment"),
+    ],
+)
+def test_a_password_in_a_configuration_increment_never_reaches_the_page(tmp_path: Path, line: str):
+    """These two shapes are only masked on the ordinary write path. A configuration page is read
+    by the strict privacy check, so the same increment is refused before anything is written."""
+    rt = _deposit_runtime(tmp_path)
+    target = rt.knowledge.root / DATABASE_REL
+    before = target.read_bytes()
+
+    with pytest.raises(SecretLeakError) as exc:
+        rt.knowledge.write_document_verified(
+            DATABASE_REL, f"## 使用规则\n\n{line}\n", action="update", merge_increment=True
+        )
+
+    assert "Credential Assignment" in str(exc.value)
+    assert "Hk9-Qp31x" not in str(exc.value)  # the refusal never echoes the credential
+    assert target.read_bytes() == before
+
+
+def test_a_clean_configuration_increment_is_merged_and_the_page_stays_private(tmp_path: Path):
+    rt = _deposit_runtime(tmp_path)
+    target = rt.knowledge.root / DATABASE_REL
+
+    result = rt.knowledge.write_document_verified(
+        DATABASE_REL, "## 使用规则\n\n- 跨库关联只能在应用层做。\n", action="update", merge_increment=True
+    )
+
+    text = target.read_text(encoding="utf-8")
+    assert result["merge"]["added_lines"] == 1
+    assert text.endswith("- 跨库关联只能在应用层做。\n")
+    for declared in ("sensitivity: private_sensitive", "access_scope: maintainers", "default_load: false"):
+        assert declared in text
+
+
+def test_the_gate_reads_a_domain_page_as_it_is_even_when_it_is_private(tmp_path: Path):
+    rt = _deposit_runtime(tmp_path)
+    gate = rt.knowledge.wiki_gate
+
+    assert gate.read_domain_page(DATABASE_REL) == DATABASE_PAGE
+    assert gate.read_domain_page(ORDERS_REL) == ORDERS_PAGE
+    assert gate.read_domain_page(PAYMENTS_REL) is None  # the page does not exist
+    assert gate.read_domain_page("") is None
+    assert gate.read_domain_page("../outside.md") is None  # never a file outside the Wiki
+
+
+def test_a_domain_page_is_searchable_and_a_private_one_stays_out_of_the_index(tmp_path: Path):
+    rt = _deposit_runtime(tmp_path)
+    rt.knowledge.sync_fts_index()
+
+    def hits(query: str) -> set[str]:
+        return {hit["doc_path"] for hit in rt.db.search_knowledge_fts(query, limit=10)}
+
+    assert ORDERS_REL in hits("订单主表")
+    assert DATABASE_REL not in hits("数据源")
+
+    # ...and an increment changes neither: what it adds to a private page is not indexed either.
+    rt.knowledge.write_document_verified(
+        ORDERS_REL, "## 坑与边界\n\n- 跨库关联只能在应用层做。\n", action="update", merge_increment=True
+    )
+    rt.knowledge.write_document_verified(
+        DATABASE_REL, "## 使用规则\n\n- 连接前先确认逻辑库所在分片。\n", action="update", merge_increment=True
+    )
+
+    assert ORDERS_REL in hits("跨库关联")
+    assert DATABASE_REL not in hits("所在分片")
+
+
+# ---- the validator
+
+
+def test_a_domain_page_follows_its_domain_in_placement_kind_and_load_policy(tmp_path: Path):
+    gate = _deposit_runtime(tmp_path).knowledge.wiki_gate
+
+    def issues(relative_path: str, text: str) -> dict[str, str]:
+        return {issue["code"]: issue["field"] for issue in gate.validate_document(relative_path, text).issues}
+
+    assert issues(ORDERS_REL, ORDERS_PAGE) == {}
+    assert issues(DATABASE_REL, DATABASE_PAGE) == {}
+
+    # Placed under another domain's directory
+    assert issues(f"{PROJECTS}/{ALPHA_DIR}/系统架构/orders.md", ORDERS_PAGE)["DOMAIN_PLACEMENT"] == "type"
+    # A knowledge kind, or a load policy, other than the domain's templates declare
+    assert issues(ORDERS_REL, ORDERS_PAGE.replace("knowledge_kind: ddl", "knowledge_kind: algorithm"))["DOMAIN_KNOWLEDGE_KIND"] == "knowledge_kind"
+    assert issues(ORDERS_REL, ORDERS_PAGE.replace("load_policy: index_then_on_demand", "load_policy: on_demand"))["DOMAIN_LOAD_POLICY"] == "load_policy"
+    # A configuration page is loaded only on explicit request
+    assert issues(DATABASE_REL, DATABASE_PAGE.replace("default_load: false", "default_load: true"))["DOMAIN_DEFAULT_LOAD"] == "default_load"
+
+
+def test_a_wiki_that_declares_no_deposit_routing_has_no_domain_rule(tmp_path: Path):
+    gate = _make_runtime(tmp_path / "plain").knowledge.wiki_gate
+
+    result = gate.validate_document(ORDERS_REL, ORDERS_PAGE)
+
+    assert not [issue for issue in result.issues if issue["code"].startswith("DOMAIN_")]

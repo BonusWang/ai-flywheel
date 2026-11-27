@@ -37,6 +37,7 @@ from ai_flywheel.adapters.skills import SkillWriterAdapter
 from ai_flywheel.adapters.wiki_gate import (
     ROUTE_DECLARED,
     ROUTE_EVIDENCE,
+    UPDATE_NO_NEW_CONTENT,
     approved_registration_matches,
 )
 from ai_flywheel.config import FlywheelConfig
@@ -55,8 +56,10 @@ from ai_flywheel.core.pipeline.constants import (
 from ai_flywheel.core.pipeline.events import EventBroker
 from ai_flywheel.core.pipeline.git_commit import commit_p04_written_files
 from ai_flywheel.core.pipeline.helpers import (
+    apply_route_decision,
     candidate_dissents,
     candidate_mistakes,
+    domain_signal_names,
     eligible_promotions,
     partial_write_payload,
     promote_observation,
@@ -710,6 +713,12 @@ class WorkflowOrchestrator(RecoveryMixin):
             routing_candidates = (
                 self.knowledge.wiki_gate.routing_candidates() if self.knowledge.wiki_gate.applicable else None
             )
+            if routing_candidates is not None:
+                # The planner cannot fit rows into a table it has never seen: the domain pages the
+                # review signalled lend it their section layout before the plan is written.
+                self.knowledge.wiki_gate.sketch_domain_pages(
+                    routing_candidates, domain_signal_names(review_findings.get("findings"))
+                )
             try:
                 plan_outcome = runner.plan_writes_detailed(
                     review_findings,
@@ -734,11 +743,28 @@ class WorkflowOrchestrator(RecoveryMixin):
             routed_docs: list[dict[str, Any]] = []
             index_capacity_drops: list[dict[str, Any]] = []
             knowledge_write_paths: set[str] = set()
+            domain_docs: list[dict[str, Any]] = []
             if self.knowledge.wiki_gate.applicable:
                 used_norm_paths: set[str] = set()
                 sess_by_key = {s.session_key: s for s, _ in admitted}
                 routed_writes: list[PlannedWrite] = []
-                for w in planned_writes:
+                deposit = routing_candidates.deposit_routing if routing_candidates is not None else None
+                domain_page_types = set(deposit.page_types) if deposit is not None else set()
+
+                def domain_page_last(write: PlannedWrite) -> bool:
+                    """A project-domain page claims the batch's write capacity after everything else.
+
+                    The main experience card keeps its slot: within one batch's limit the
+                    card (with the index entry it needs) is counted first, and the domain
+                    pages fill what is left.
+                    """
+                    route = write.wiki_route if isinstance(write.wiki_route, dict) else {}
+                    return (
+                        write.target_kind == "knowledge_doc"
+                        and str(route.get("page_type") or "").lower() in domain_page_types
+                    )
+
+                for w in sorted(planned_writes, key=domain_page_last):
                     if w.target_kind != "knowledge_doc":
                         routed_writes.append(w)
                         continue
@@ -751,6 +777,7 @@ class WorkflowOrchestrator(RecoveryMixin):
                             w.content_preview,
                             source_sessions=w.source_session_keys,
                             route=decision,
+                            action=w.action,
                         )
                         if decision.routed
                         else None
@@ -769,9 +796,11 @@ class WorkflowOrchestrator(RecoveryMixin):
                         )
                         continue
                     new_rel, new_md = adapted
-                    if new_rel in used_norm_paths:
+                    if new_rel in used_norm_paths and not decision.domain:
                         stem = new_rel[:-3] if new_rel.endswith(".md") else new_rel
                         new_rel = f"{stem}-{len(used_norm_paths) + 1}.md"
+                    # A domain page keeps its path even when the plan names it twice: one table is
+                    # one page. The later increment is merged after the earlier one at write time.
                     index_registration = (
                         self.knowledge.wiki_gate.plan_practice_index_registration(
                             new_rel,
@@ -798,6 +827,7 @@ class WorkflowOrchestrator(RecoveryMixin):
                     w.relative_path = new_rel
                     w.content_preview = new_md
                     w.side_effects = [side_effect] if side_effect else []
+                    apply_route_decision(w, decision)
                     routed_writes.append(w)
                     routed_docs.append(
                         {
@@ -808,6 +838,8 @@ class WorkflowOrchestrator(RecoveryMixin):
                             "side_effects": list(w.side_effects),
                         }
                     )
+                    if decision.domain:
+                        domain_docs.append(routed_docs[-1])
                 planned_writes = routed_writes
                 plan_info.kept_count = len(planned_writes)
             run.planned_writes = planned_writes
@@ -872,6 +904,14 @@ class WorkflowOrchestrator(RecoveryMixin):
                 if index_capacity_drops
                 else ""
             )
+            domain_updates = sum(1 for doc in domain_docs if doc["route"].get("incremental"))
+            domain_sensitive = sum(1 for doc in domain_docs if doc["route"].get("sensitive"))
+            domain_note = (
+                f"；其中 {len(domain_docs)} 项为项目领域页（增量更新 {domain_updates}、新建 "
+                f"{len(domain_docs) - domain_updates}、敏感待审批 {domain_sensitive}）"
+                if domain_docs
+                else ""
+            )
             invalid_items = len(plan_info.dropped_items) - plan_info.over_limit_count
             dropped_note = ""
             if plan_info.dropped_items:
@@ -890,7 +930,7 @@ class WorkflowOrchestrator(RecoveryMixin):
                     f"计划来源：{PLAN_SOURCE_LABELS.get(plan_info.source, plan_info.source)}；"
                     f"查重比对 {len(existing_rules)} 条规则与 {len(existing_skills)} 个技能，"
                     f"整理出 {len(planned_writes)} 项建议（含 {skill_plans} 项 Skill 封装/优化）"
-                    f"{dropped_note}{unrouted_note}{capacity_note}{deferred_note}"
+                    f"{dropped_note}{unrouted_note}{capacity_note}{domain_note}{deferred_note}"
                 ),
                 internal_checks=[
                     {"name": "规则与技能查重", "status": "PASS"},
@@ -926,6 +966,7 @@ class WorkflowOrchestrator(RecoveryMixin):
                                     "declared": sum(1 for d in routed_docs if d["route"]["source"] == ROUTE_DECLARED),
                                     "evidence": sum(1 for d in routed_docs if d["route"]["source"] == ROUTE_EVIDENCE),
                                     "unrouted": len(unrouted_docs),
+                                    **({"domain_pages": len(domain_docs)} if domain_docs else {}),
                                 },
                             }
                         ]
@@ -1309,6 +1350,7 @@ class WorkflowOrchestrator(RecoveryMixin):
         created_rules: list[str] = []
         written_skills: list[str] = []
         skipped_docs: list[dict[str, Any]] = []
+        merged_domain_pages = 0
         try:
             # ---------------- P04 WRITE & VERIFY ----------------
             t0 = self._begin_node(run, "P04_WRITE_VERIFY")
@@ -1365,9 +1407,11 @@ class WorkflowOrchestrator(RecoveryMixin):
                             )
                         rel_to_write = item.relative_path
                         content_to_write = item.content_preview
+                        merge_write: dict[str, Any] = {}
                         if self.knowledge.wiki_gate.applicable:
                             # P03 already routed every knowledge document; this re-check only catches a plan
                             # that went stale between P03 and P04 (saved before routing, or edited since).
+                            # A project-domain update is judged against the page as it is on disk now.
                             decision = route_knowledge_doc(
                                 self.knowledge, run, item, self._stored_sessions(item.source_session_keys), None
                             )
@@ -1379,17 +1423,22 @@ class WorkflowOrchestrator(RecoveryMixin):
                                     content_to_write,
                                     source_sessions=item.source_session_keys,
                                     route=decision,
+                                    action=item.action,
                                 )
                                 if decision.routed
                                 else None
                             )
                             if adapted is None:
-                                # A stale plan must not fail the batch here
+                                # A stale plan must not fail the batch here. A domain increment the
+                                # page gained meanwhile is reported by its own marker, not as unrouted.
+                                already_there = decision.reason_code == "update_no_new_content"
                                 skipped_docs.append(
                                     {
                                         "relative_path": item.relative_path,
                                         "title": item.title,
-                                        "status": "SKIPPED_UNROUTED_PROJECT",
+                                        "status": UPDATE_NO_NEW_CONTENT if already_there else "SKIPPED_UNROUTED_PROJECT",
+                                        "skipped": True,
+                                        "written": False,
                                         "reason": decision.detail or LANDING_FAILED_REASON,
                                         "reason_code": decision.reason_code or "landing_failed",
                                     }
@@ -1397,6 +1446,8 @@ class WorkflowOrchestrator(RecoveryMixin):
                                 write_receipts.append(skipped_docs[-1])
                                 continue
                             rel_to_write, content_to_write = adapted
+                            if decision.incremental:
+                                merge_write = {"merge_increment": True}
                         res = self.knowledge.write_document_verified(
                             rel_to_write,
                             content_to_write,
@@ -1404,7 +1455,25 @@ class WorkflowOrchestrator(RecoveryMixin):
                             sync_fts=False,  # the batch rebuilds the search index once, at the end
                             sync_practice_index=self.knowledge.wiki_gate.applicable,
                             approved_side_effects=item.side_effects,
+                            **merge_write,
                         )
+                        if res.get("skipped"):
+                            # The page gained this increment after the plan was approved: nothing is left to add.
+                            skipped_docs.append(
+                                {
+                                    "relative_path": item.relative_path,
+                                    "title": item.title,
+                                    "status": str(res.get("status") or "SKIPPED"),
+                                    "skipped": True,
+                                    "written": False,
+                                    "reason_code": "update_no_new_content",
+                                    "reason": str(res.get("reason") or ""),
+                                }
+                            )
+                            write_receipts.append(res)
+                            continue
+                        if res.get("merge"):
+                            merged_domain_pages += 1
                         written_paths.append(res["relative_path"])
                         index_receipt = res.get("practice_index") or {}
                         if (
@@ -1502,6 +1571,10 @@ class WorkflowOrchestrator(RecoveryMixin):
                 elif git_commit_result.get("status") == "failed":
                     git_note = "；本地 Git 提交失败（已留审计）"
 
+            # A domain increment the page already held is not a landing failure: it is counted apart.
+            no_new_content_skips = sum(1 for doc in skipped_docs if doc["status"] == UPDATE_NO_NEW_CONTENT)
+            unrouted_skips = len(skipped_docs) - no_new_content_skips
+
             self._finish_node(
                 run,
                 "P04_WRITE_VERIFY",
@@ -1514,7 +1587,9 @@ class WorkflowOrchestrator(RecoveryMixin):
                         if written_index_paths
                         else ""
                     )
-                    + (f"；{len(skipped_docs)} 篇笔记因无法归属项目跳过" if skipped_docs else "")
+                    + (f"；{unrouted_skips} 篇笔记因无法归属项目跳过" if unrouted_skips else "")
+                    + (f"；{merged_domain_pages} 篇领域页按增量无损合并，原有内容完整保留" if merged_domain_pages else "")
+                    + (f"；{no_new_content_skips} 篇领域页增量已存在于页面，未重复写入" if no_new_content_skips else "")
                     + (
                         f"；错题观察池入池 {len(persisted_observations)} 条"
                         if persisted_observations
@@ -1548,6 +1623,20 @@ class WorkflowOrchestrator(RecoveryMixin):
                     *(
                         [
                             {
+                                "name": "项目领域页增量无损合并",
+                                "status": "PASS",
+                                "detail": {
+                                    "merged": merged_domain_pages,
+                                    "no_new_content": no_new_content_skips,
+                                },
+                            }
+                        ]
+                        if merged_domain_pages or no_new_content_skips
+                        else []
+                    ),
+                    *(
+                        [
+                            {
                                 "name": "P04 写入后本地 Git 审计提交（可选）",
                                 "status": "PASS"
                                 if git_commit_result.get("status") == "committed"
@@ -1570,6 +1659,7 @@ class WorkflowOrchestrator(RecoveryMixin):
                     "written_paths": written_paths,
                     "written_practice_index_paths": written_index_paths,
                     "skipped_unrouted_docs": skipped_docs,
+                    **({"merged_domain_pages": merged_domain_pages} if merged_domain_pages else {}),
                     "persisted_observation_ids": [
                         str(o.get("obs_id")) for o in persisted_observations if o.get("obs_id")
                     ],

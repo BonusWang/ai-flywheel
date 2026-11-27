@@ -13,15 +13,18 @@ from ai_flywheel.adapters.wiki import (
     PracticeIndexError,
     PracticeIndexRegistration,
     SCHEMA_FILE_NAME,
+    UPDATE_NO_NEW_CONTENT,
     WikiGate,
     WikiGateError,
     WikiSchemaLoader,
     approved_registration_matches,
+    merge_domain_increment,
     practice_index_write_lock,
+    preserves_existing,
     split_frontmatter,
 )
 from ai_flywheel.config import FlywheelConfig
-from ai_flywheel.core.privacy import sanitize_and_check_secrets
+from ai_flywheel.core.privacy import refuse_credential_shapes, sanitize_and_check_secrets
 from ai_flywheel.core.time_utils import compute_valid_until, shanghai_today_ymd
 from ai_flywheel.storage.db import FlywheelDB, build_knowledge_search_text
 from ai_flywheel.storage.fs_store import file_sha256
@@ -322,6 +325,7 @@ class KnowledgeSinkAdapter:
         sync_fts: bool = True,
         sync_practice_index: bool = False,
         approved_side_effects: list[dict[str, object]] | None = None,
+        merge_increment: bool = False,
     ) -> dict[str, Any]:
         """Controlled atomic write with privacy/secrets gate, pre-write schema gate, and post-write verification.
 
@@ -331,9 +335,27 @@ class KnowledgeSinkAdapter:
         ``sync_practice_index`` is enabled by P04 for schema-governed project practice
         cards. The card and its project notes-index entry are committed as one
         compensating transaction, with both paths included in postflight.
+
+        ``merge_increment`` is for a project-domain page: ``content`` is then only what
+        the session verified, and it is merged into the page as it is on disk at this
+        moment, never written over it. The merged page goes through the same gates as
+        any other document. An increment the page already holds writes nothing and
+        returns a receipt marked ``UPDATE_NO_NEW_CONTENT``.
         """
         target = self._safe_resolve(relative_path)
         rel = relative_path.replace("\\", "/").lstrip("/")
+        merge_receipt: dict[str, Any] | None = None
+        if merge_increment:
+            content, merge_receipt = self._merge_domain_increment(rel, content)
+            if merge_receipt is None:
+                return {
+                    "relative_path": rel,
+                    "action": "update",
+                    "status": UPDATE_NO_NEW_CONTENT,
+                    "skipped": True,
+                    "written": False,
+                    "reason": "增量内容均已存在于目标页，没有新增实质内容",
+                }
         # v3 write-time privacy & secret leak gate (<private> redaction + refuseSecrets)
         content = sanitize_and_check_secrets(content, context=f"knowledge_doc:{rel}")
         # LF-only documents: a Windows write must never introduce CRLF into an
@@ -346,6 +368,7 @@ class KnowledgeSinkAdapter:
             else None
         )
         self._require_approved_practice_index(registration, approved_side_effects)
+        receipt: dict[str, Any]
         if registration is not None:
             index_target = self._safe_resolve(registration.target_relative_path)
             with practice_index_write_lock(index_target):
@@ -353,7 +376,7 @@ class KnowledgeSinkAdapter:
                 # between the approved preview and this write.
                 registration = self._plan_practice_index_registration(rel, content)
                 self._require_approved_practice_index(registration, approved_side_effects)
-                return self._write_document_transaction(
+                receipt = self._write_document_transaction(
                     target=target,
                     rel=rel,
                     content=content,
@@ -361,14 +384,59 @@ class KnowledgeSinkAdapter:
                     sync_fts=sync_fts,
                     registration=registration,
                 )
-        return self._write_document_transaction(
-            target=target,
-            rel=rel,
-            content=content,
-            action=action,
-            sync_fts=sync_fts,
-            registration=registration,
+        else:
+            receipt = self._write_document_transaction(
+                target=target,
+                rel=rel,
+                content=content,
+                action=action,
+                sync_fts=sync_fts,
+                registration=registration,
+            )
+        if merge_receipt is not None:
+            receipt["merge"] = merge_receipt
+        return receipt
+
+    def _merge_domain_increment(self, rel: str, increment: str) -> tuple[str, dict[str, Any] | None]:
+        """Merge an increment into the project-domain page at ``rel`` as it is on disk.
+
+        Returns the merged page and what the merge did, or ``(page, None)`` when the page
+        already holds everything the increment says. Raises when the increment cannot
+        enter the page without loss, or when it carries a credential: a configuration
+        page is read by the strict privacy check here as it was at planning time.
+        """
+        existing = self.wiki_gate.read_domain_page(rel)
+        if existing is None:
+            raise KnowledgeWriteError(f"Domain update target is missing, nothing to merge into: {rel}")
+        template = self.wiki_gate.domain_page_template(rel, existing)
+        if template is None:
+            raise KnowledgeWriteError(f"Target is not a project-domain page the Wiki contract declares: {rel}")
+        if self.wiki_gate.is_sensitive_page(rel, increment, existing_text=existing):
+            refuse_credential_shapes(increment, context=f"knowledge_doc:{rel}")
+        merge = merge_domain_increment(
+            existing,
+            increment,
+            template_sections=[str(name) for name in (template.get("body_sections") or [])],
+            today=shanghai_today_ymd(),
         )
+        if not merge.ok:
+            raise KnowledgeWriteError(
+                f"Domain increment cannot be merged without loss into {rel}: {'；'.join(merge.problems)}"
+            )
+        if not merge.has_additions:
+            return existing, None
+        if not preserves_existing(existing, merge.merged):
+            # The merge is additive by construction. A result that dropped a line of the
+            # page is a defect, and it never reaches the file.
+            raise KnowledgeWriteError(f"Domain merge would not preserve the existing page: {rel}")
+        return merge.merged, {
+            "incremental": True,
+            "existing_lines": len(existing.splitlines()),
+            "added_lines": merge.added,
+            "duplicates_removed": merge.duplicates,
+            "placeholders_replaced": list(merge.placeholders),
+            "existing_preserved": True,
+        }
 
     def _write_document_transaction(
         self,

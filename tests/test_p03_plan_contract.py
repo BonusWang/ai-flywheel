@@ -3,12 +3,16 @@
 夹具按真实缓存输出 `p03_plan-*.json` 的形状脱敏构造：改写提示词之后的输出普遍没有 `summary`，
 更早的两个批次连 `title` 也没有；规则项只有 `rule_payload`，Skill 项带 `skill_route` 与 frontmatter。
 内容全部是虚构示例，不含任何真实会话、项目或技能名。
+
+最后一节覆盖挂载 Wiki 声明 `content_contract.deposit_routing` 时的 P03 输入与领域页计划项
+（feat-project-domain-incremental-deposit）：示例项目 alpha 的 `orders` 表结构页与 `database` 配置页。
 """
 from __future__ import annotations
 
 import json
 import logging
 import shutil
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -25,10 +29,22 @@ from ai_flywheel.adapters.runners import (
     OpenAICompatibleRunner,
     PlanUnavailableError,
     _build_p03_prompt,
+    _plan_from_items,
     build_runner,
+    deposit_page_types,
 )
+from ai_flywheel.adapters.wiki_gate import RoutingCandidates, WikiGate, page_section_sketch, preserves_existing
 from ai_flywheel.config import FlywheelConfig
-from ai_flywheel.models import NodeExecution, NodeStatus, RegisterSessionRequest, RunStatus, SessionStatus, WorkflowRunRecord
+from ai_flywheel.core.pipeline.helpers import domain_signal_names
+from ai_flywheel.models import (
+    NodeExecution,
+    NodeStatus,
+    RegisterSessionRequest,
+    RunStatus,
+    SessionStatus,
+    WorkflowRunRecord,
+    is_sensitive_write,
+)
 from ai_flywheel.runtime import FlywheelRuntime
 from ai_flywheel.storage.fs_store import ImmutableFileStore
 
@@ -655,3 +671,811 @@ def test_json_repair_retry_receives_the_same_required_fields(tmp_path: Path):
     for key in P03_ITEM_REQUIRED_KEYS:
         assert f'"{key}"' in repair_prompts[0]
     assert P03_REPAIR_SCHEMA_HINT in repair_prompts[0]
+
+
+# ---------------------------------------------------------------- project-domain pages in the write plan
+# (feat-project-domain-incremental-deposit)
+
+
+PROJECTS = "wiki-知识库/projects-项目"
+# The one project of the deposit Wiki, and the two domain pages it already holds.
+ALPHA_DIR = "alpha-orders-Alpha订单系统"
+ORDERS_REL = f"{PROJECTS}/{ALPHA_DIR}/数据库结构/orders.md"
+DATABASE_REL = f"{PROJECTS}/{ALPHA_DIR}/项目配置/database.md"
+
+# The contract of a Wiki that declares the four-domain deposit routing (content_contract.deposit_routing).
+DEPOSIT_SCHEMA = textwrap.dedent(
+    """\
+    ---
+    core_contract:
+      required_fields: [title, description, type, created, updated]
+    partition_contract:
+      partitions:
+        projects:
+          root: wiki-知识库/projects-项目
+    content_contract:
+      page_types:
+        project-practice-note:
+          partition: projects
+          path_pattern: "^[^/]+/实战笔记/[^/]+\\\\.md$"
+          allowed_status: [active, deprecated, archived]
+        project-algorithm:
+          partition: projects
+          required_fields: [title, description, type, project_id, knowledge_kind, load_policy, default_load, created, updated, status]
+          path_pattern: "^[^/]+/(业务算法|数据库结构)/[^/]+\\\\.md$"
+          allowed_status: [active, deprecated, archived]
+          knowledge_kind_values: [ddl, algorithm, caliber]
+        project-architecture:
+          partition: projects
+          required_fields: [title, description, type, project_id, knowledge_kind, load_policy, default_load, created, updated, status]
+          path_pattern: "^[^/]+/系统架构/[^/]+\\\\.md$"
+          allowed_status: [active, deprecated, archived]
+        project-config:
+          partition: projects
+          required_fields: [title, description, type, project_id, load_policy, default_load, created, updated, status]
+          path_pattern: "^[^/]+/项目配置/.+\\\\.md$"
+          allowed_status: [active, deprecated, archived]
+      project_template_contract:
+        templates:
+          - id: T7
+            name: 表结构
+            page_type: project-algorithm
+            knowledge_kind: ddl
+            load_policy: index_then_on_demand
+            body_sections: [用途一行, 字段语义表, 枚举值, 关联键, 坑与边界]
+          - id: T1
+            name: 业务算法
+            page_type: project-algorithm
+            knowledge_kind: algorithm
+            load_policy: index_then_on_demand
+            body_sections: [适用场景, 算法步骤, 坑与边界]
+          - id: T3
+            name: 服务卡
+            page_type: project-architecture
+            knowledge_kind: service
+            load_policy: index_then_on_demand
+            body_sections: [职责, 依赖关系, 坑与边界]
+          - id: T6
+            name: 项目配置
+            page_type: project-config
+            load_policy: explicit_or_task_required
+            body_sections: [用途一行, 配置矩阵表, 使用规则, 变更记录表]
+      deposit_routing:
+        version: "1.1"
+        rule: 会话查证过的项目领域知识落到项目目录下：一表一页，缺页新建，已有页增量补充。
+        domains:
+          - domain: 数据库结构
+            trigger: 会话查证过业务表的字段、枚举、关联键或使用边界
+            target: "{project}/数据库结构/"
+            template: T7
+          - domain: 系统架构
+            trigger: 会话查证过服务依赖或部署关系
+            target: "{project}/系统架构/"
+            template: T3
+          - domain: 业务算法
+            trigger: 会话查证过业务算法或统计口径
+            target: "{project}/业务算法/"
+            template: T1
+          - domain: 项目配置
+            trigger: 会话查证过后续会话必须记住的项目配置事实
+            target: "{project}/项目配置/"
+            template: T6
+    ---
+
+    # Test Wiki Schema
+    """
+)
+
+ORDERS_PAGE = textwrap.dedent(
+    """\
+    ---
+    title: orders
+    description: 订单主表：一笔订单一行
+    type: project-algorithm
+    project_id: alpha
+    knowledge_kind: ddl
+    load_policy: index_then_on_demand
+    default_load: false
+    created: 2026-11-20
+    updated: 2026-11-20
+    status: active
+    ---
+
+    # orders
+
+    ## 用途一行
+
+    订单主表，一笔订单一行。
+
+    ## 字段语义表
+
+    | 字段 | 类型 | 含义 | 备注 |
+    | --- | --- | --- | --- |
+    | id | bigint | 主键 | 自增 |
+    """
+)
+
+# The configuration page declares itself private: the planner may learn its layout, nothing else.
+DATABASE_PAGE = textwrap.dedent(
+    """\
+    ---
+    title: database
+    description: alpha 的数据源与逻辑库映射
+    type: project-config
+    project_id: alpha
+    load_policy: explicit_or_task_required
+    default_load: false
+    sensitivity: private_sensitive
+    access_scope: maintainers
+    created: 2026-11-20
+    updated: 2026-11-20
+    status: active
+    ---
+
+    # database
+
+    ## 用途一行
+
+    记录 alpha 服务连接数据库的方式；凭据本身不入库。
+
+    ## 配置矩阵表
+
+    | 配置项 | 取值 | 说明 |
+    | --- | --- | --- |
+    | logical_db.orders | shard_0 | 订单库路由 |
+
+    ## 使用规则
+
+    - 连接池上限按实例规格设置，不超过实例最大连接数的一半。
+    """
+)
+
+
+def _put(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(text.encode("utf-8"))  # LF, as the Wiki's pages are
+    return path
+
+
+def _deposit_wiki(tmp_path: Path) -> Path:
+    """A mounted Wiki that declares the deposit routing; project alpha is its only project.
+
+    Alpha holds the table page `orders` (next to a hidden and an archived draft, which are
+    not pages of the domain) and the private configuration page `database`.
+    """
+    wiki = tmp_path / "deposit-wiki"
+    _put(wiki / ".wiki-schema.md", DEPOSIT_SCHEMA)
+    _put(
+        wiki / PROJECTS / ALPHA_DIR / "实战笔记" / "笔记索引.md",
+        "---\ntitle: alpha 索引\ndescription: alpha 实战经验卡索引\ntype: project-practice-index\nproject_id: alpha\n"
+        "aliases: [Alpha Orders]\ncreated: 2026-11-20\nupdated: 2026-11-20\nstatus: active\n---\n\n# alpha 索引\n",
+    )
+    _put(wiki / ORDERS_REL, ORDERS_PAGE)
+    _put(wiki / f"{PROJECTS}/{ALPHA_DIR}/数据库结构/.draft-payments.md", ORDERS_PAGE)
+    _put(wiki / f"{PROJECTS}/{ALPHA_DIR}/数据库结构/archive-refunds.md", ORDERS_PAGE)
+    _put(wiki / DATABASE_REL, DATABASE_PAGE)
+    return wiki
+
+
+def _deposit_config(tmp_path: Path) -> FlywheelConfig:
+    cfg = FlywheelConfig(base_dir=tmp_path)
+    cfg.knowledge_sink.type = "local_markdown_wiki"
+    cfg.knowledge_sink.root = str(tmp_path / "deposit-wiki")
+    cfg.knowledge_sink.allowed_write_prefixes = ["wiki-知识库"]
+    cfg.knowledge_sink.wiki_gate_require_scripts = False
+    return cfg
+
+
+def _deposit_gate(tmp_path: Path, *, project: bool = True) -> WikiGate:
+    """The gate of a deposit Wiki; without ``project`` the contract declares domains no page can reach."""
+    if project:
+        _deposit_wiki(tmp_path)
+    else:
+        _put(tmp_path / "deposit-wiki" / ".wiki-schema.md", DEPOSIT_SCHEMA)
+    return WikiGate(_deposit_config(tmp_path))
+
+
+def _deposit_runtime(tmp_path: Path, *, approval_mode: str = "smart") -> FlywheelRuntime:
+    _deposit_wiki(tmp_path)
+    shutil.copytree(REPO_ROOT / "profile", tmp_path / "profile")
+    (tmp_path / "skills").mkdir()
+    cfg = _deposit_config(tmp_path)
+    cfg.capabilities.skills_dirs = [str(tmp_path / "skills")]
+    cfg.workflow.approval_mode = approval_mode
+    # `auto` only takes effect with the safety valve open: the valve has the last word.
+    cfg.safety_valves.auto_approve_writes = approval_mode == "auto"
+    cfg.runner.mode = "api"
+    cfg.runner.api.base_url = "http://127.0.0.1:9999/v1"
+    cfg.runner.api.model = "mock-model"
+    return FlywheelRuntime(cfg)
+
+
+def _signalled_review(session_key: str = "codex:s-1") -> dict[str, Any]:
+    """A review whose finding verified the `orders` table and a connection fact of project alpha."""
+    return {
+        "findings": [
+            {
+                "session_key": session_key,
+                "client": "codex",
+                "project": "alpha",
+                "title": "订单表字段排查",
+                "worthy": True,
+                "category": "project",
+                "skip_reason": "",
+                "facts": ["查证了 orders 表的 status 枚举与 customer_id 关联键"],
+                "anomalies": [],
+                "tags": ["alpha"],
+                "suggest_rule": False,
+                "skill_route": {"hit": False, "action": "none", "target_skill": "", "reason": "单次任务"},
+                "domain_signals": {
+                    "database_tables": [
+                        {
+                            "table": "orders",
+                            "verified_fields": ["status varchar(32)"],
+                            "enums": ["status：PAID / CLOSED"],
+                            "join_keys": ["customer_id -> customers.customer_id"],
+                            "pitfalls": [],
+                        }
+                    ],
+                    "project_configs": [
+                        {
+                            "topic": "database",
+                            "facts": ["逻辑库 payments 与 orders 不在同一分片"],
+                            "pitfalls": ["跨库关联只能在应用层做"],
+                        }
+                    ],
+                    "architecture_flows": [],
+                    "business_calibers": [],
+                },
+            }
+        ],
+        "eligible_promotions": [],
+        "repeated_workflows": [],
+    }
+
+
+def _planner_input(review: dict[str, Any], candidates: RoutingCandidates | None) -> tuple[str, dict[str, Any]]:
+    prompt = _build_p03_prompt(review, [], [], 5, "lessons/", "daily", routing_candidates=candidates)
+    return prompt, json.loads(prompt.rsplit("\n\n", 1)[1])
+
+
+def _card_only_candidates() -> RoutingCandidates:
+    """The candidates of a contract-governed Wiki that declares no deposit routing."""
+    return RoutingCandidates(
+        page_types=["project-practice-note"],
+        projects=[{"dir_name": ALPHA_DIR, "project_id": "alpha", "aliases": ["Alpha Orders"], "description": ""}],
+        evidence_page_types=["project-practice-note"],
+    )
+
+
+def _table_item() -> dict[str, Any]:
+    """A plan item for a table page that does not exist yet: the template's sections."""
+    return {
+        "target_kind": "knowledge_doc",
+        "action": "create",
+        "title": "payments 支付流水表",
+        "summary": "新表 payments 的实战已证字段",
+        "relative_path": f"{PROJECTS}/{ALPHA_DIR}/数据库结构/payments.md",
+        "source_session_keys": ["codex:s-1"],
+        "content_preview": (
+            "## 用途一行\n\n支付流水表：一次支付尝试一行。\n\n"
+            "## 字段语义表\n\n| 字段 | 类型 | 含义 | 备注 |\n| --- | --- | --- | --- |\n| payment_id | bigint | 支付主键 | 自增 |\n"
+        ),
+        "wiki_route": {"page_type": "project-algorithm", "project": "alpha", "reason": "会话查证了本项目自己的表"},
+    }
+
+
+def _service_item() -> dict[str, Any]:
+    return {
+        "target_kind": "knowledge_doc",
+        "action": "create",
+        "title": "payment-service 服务卡",
+        "summary": "支付服务的职责与依赖",
+        "relative_path": f"{PROJECTS}/{ALPHA_DIR}/系统架构/payment-service.md",
+        "source_session_keys": ["codex:s-1"],
+        "content_preview": "## 职责\n\n- 订单受理与状态推进。\n",
+        "wiki_route": {"page_type": "project-architecture", "project": "alpha", "reason": "会话核实了本服务的依赖"},
+    }
+
+
+def _config_item(**overrides: Any) -> dict[str, Any]:
+    """A plan item that adds one verified configuration fact to the existing configuration page."""
+    item: dict[str, Any] = {
+        "target_kind": "knowledge_doc",
+        "action": "update",
+        "title": "database 配置页增量",
+        "summary": "补充逻辑库分片与连库注意事项",
+        "relative_path": DATABASE_REL,
+        "source_session_keys": ["codex:plan-1"],
+        "content_preview": "## 使用规则\n\n- 逻辑库 payments 与 orders 不在同一分片，跨库关联只能在应用层做。\n",
+        "wiki_route": {"page_type": "project-config", "project": "alpha", "reason": "会话查证了本项目的连库配置"},
+    }
+    item.update(overrides)
+    return item
+
+
+def _plan(items: list[Any], *, max_write_set: int = 8, domain_page_types: frozenset[str] = frozenset()):
+    return _plan_from_items(
+        items,
+        source=PLAN_SOURCE_MODEL,
+        max_write_set=max_write_set,
+        default_doc_prefix="lessons/",
+        skills_root=None,
+        domain_page_types=domain_page_types,
+    )
+
+
+class _DepositModel:
+    """Stands in for the model gateway: the review carries domain signals, the plan is canned."""
+
+    def __init__(self, items: list[dict[str, Any]]) -> None:
+        self.items = items
+        self.prompts: list[str] = []
+
+    def __call__(self, prompt: str, system_prompt: str) -> str:
+        self.prompts.append(prompt)
+        if prompt.startswith("You are the P02 Review Worker"):
+            return json.dumps(_signalled_review("codex:plan-1"), ensure_ascii=False)
+        return json.dumps({"planned_writes": self.items}, ensure_ascii=False)
+
+
+def _register_troubleshooting(rt: FlywheelRuntime) -> None:
+    rt.register_session(
+        RegisterSessionRequest(
+            client="codex",
+            session_id="plan-1",
+            title="订单表字段与连库排查",
+            project="alpha",
+            summary="记录订单表已证字段与连库配置事实",
+            content=(
+                "用户：订单跨库关联查不出来。"
+                "助手：查了 orders 表的 status 枚举；逻辑库 payments 与 orders 不在同一分片，跨库关联只能在应用层做。"
+            ),
+        )
+    )
+
+
+# ---- the planning input
+
+
+def test_a_wiki_that_declares_the_deposit_routing_enters_the_p03_input(tmp_path: Path):
+    gate = _deposit_gate(tmp_path)
+    candidates = gate.routing_candidates()
+    gate.sketch_domain_pages(candidates, ["orders", "database"])
+    assert candidates.routable is True
+
+    prompt, payload = _planner_input(_signalled_review(), candidates)
+
+    assert prompt.startswith("You are the P03 Route & Write-Plan Worker of AI Flywheel.\n")
+    offered = payload["routing_candidates"]
+    deposit = offered["deposit_routing"]
+    # The contract's rules, read off the Wiki: every domain with its trigger, target and page types.
+    assert deposit["version"] == "1.1"
+    assert deposit["rule"] == "会话查证过的项目领域知识落到项目目录下：一表一页，缺页新建，已有页增量补充。"
+    assert deposit["projects_root"] == PROJECTS
+    assert [(domain["domain"], domain["target_path"], domain["page_types"]) for domain in deposit["domains"]] == [
+        ("数据库结构", f"{PROJECTS}/{{project}}/数据库结构/{{page}}.md", ["project-algorithm"]),
+        ("系统架构", f"{PROJECTS}/{{project}}/系统架构/{{page}}.md", ["project-architecture"]),
+        ("业务算法", f"{PROJECTS}/{{project}}/业务算法/{{page}}.md", ["project-algorithm"]),
+        ("项目配置", f"{PROJECTS}/{{project}}/项目配置/{{page}}.md", ["project-config"]),
+    ]
+    assert deposit["domains"][3]["trigger"] == "会话查证过后续会话必须记住的项目配置事实"
+    assert [domain["sensitive"] for domain in deposit["domains"]] == [False, False, False, True]
+    table_template = deposit["domains"][0]["templates"][0]
+    assert (table_template["id"], table_template["knowledge_kind"]) == ("T7", "ddl")
+    assert table_template["body_sections"] == ["用途一行", "字段语义表", "枚举值", "关联键", "坑与边界"]
+    assert deposit["domains"][0]["required_fields"]["project-algorithm"][:5] == ["title", "description", "type", "created", "updated"]
+    # The card types stay routable next to the domain page types
+    assert offered["page_types"] == ["project-practice-note", "project-algorithm", "project-architecture", "project-config"]
+
+    # Each candidate project carries the domain pages it already holds: alpha holds `orders` and `database`.
+    (alpha,) = offered["projects"]
+    assert alpha["project"] == ALPHA_DIR
+    assert alpha["domain_inventory"] == {"数据库结构": ["orders"], "系统架构": [], "业务算法": [], "项目配置": ["database"]}
+
+    # The review's signals reach the planner with their finding
+    signals = payload["findings"][0]["domain_signals"]
+    assert signals["database_tables"][0]["table"] == "orders"
+    assert signals["project_configs"][0]["topic"] == "database"
+
+    # ...and so do the planning rules: what the spec asks of a plan for these pages.
+    rules = prompt[prompt.index("PROJECT DOMAIN PAGES:") : prompt.index("Allowed target_kind values:")]
+    for needle in (
+        '"routing_candidates.deposit_routing" declares them',
+        '"domain_inventory" lists the domain pages it',
+        "GRADUAL COMPLETION RULES:",
+        "Keep at least one slot for the main experience card of rule 1: a domain page must not crowd it out",
+        "Only inside the item cap",
+        "only for a fact the session verified",
+        "Never plan a domain page from a guess",
+        "2. database_tables, ONE TABLE PER PAGE",
+        'when the table name is listed in that project\'s domain_inventory, action="update" and relative_path is that existing page',
+        'otherwise action="create" with a page named after the table alone',
+        "Record only the verified fields, enum values, join keys and pitfalls: a full DDL is never required",
+        "3. project_configs: a verified configuration fact that a later session must remember is planned even when nothing was changed",
+        'never skip it as "no config change"',
+        'When the configuration page exists, prefer action="update"',
+        "NEVER output a password, token or private key, not even partly masked",
+        "SECRET_LEAK_BLOCKED",
+        "Name where the credential is kept instead",
+        "4. architecture_flows and business_calibers follow the same rule for the pages of their domain",
+    ):
+        assert needle in rules, needle
+    # The domain item keeps the shape of every other knowledge document
+    assert '"wiki_route"={"page_type": <one page_types value of that domain>' in rules
+    assert "Reserve at least one slot for a worthy knowledge_doc item" in prompt  # the rule it had
+    assert set(payload) == {
+        "phase",
+        "findings",
+        "eligible_promotions",
+        "repeated_workflows",
+        "existing_rules",
+        "existing_skill_names",
+        "existing_skill_sections",
+        "routing_candidates",
+    }
+
+
+@pytest.mark.parametrize("candidates", [None, _card_only_candidates()], ids=["no-contract", "cards-only"])
+def test_a_wiki_that_declares_no_deposit_routing_keeps_the_p03_prompt_it_had(candidates):
+    signalled = _signalled_review()
+    plain = {**signalled, "findings": [{key: value for key, value in signalled["findings"][0].items() if key != "domain_signals"}]}
+
+    # A review that carries `domain_signals` yields the prompt a review without them always yielded.
+    for review in (signalled, plain):
+        prompt, payload = _planner_input(review, candidates)
+        assert prompt == _planner_input(plain, candidates)[0]
+        assert "domain_signals" not in prompt
+        assert "deposit_routing" not in json.dumps(payload, ensure_ascii=False)
+        assert "domain_inventory" not in json.dumps(payload, ensure_ascii=False)
+        for absent in ("PROJECT DOMAIN PAGES", "GRADUAL COMPLETION RULES", "ONE TABLE PER PAGE", "SECRET_LEAK_BLOCKED", "no config change"):
+            assert absent not in prompt, absent
+    # The output contract is the one it had: `wiki_route` exactly when the Wiki routes cards.
+    skeleton = prompt.split("Return STRICT JSON ONLY:\n", 1)[1].split("\n\n", 1)[0]
+    assert ('"wiki_route":{"page_type":"...","project":"... or null","reason":"..."}' in skeleton) is (candidates is not None)
+
+
+def test_the_rules_stay_out_when_the_wiki_offers_nothing_to_write(tmp_path: Path):
+    gate = _deposit_gate(tmp_path, project=False)
+    candidates = gate.routing_candidates()
+    assert (candidates.routable, candidates.deposit_routing is not None) == (False, True)
+
+    prompt, _ = _planner_input(_signalled_review(), candidates)
+
+    assert 'Do not output any "knowledge_doc" item' in prompt
+    assert "PROJECT DOMAIN PAGES" not in prompt
+    assert "domain_signals" not in prompt
+
+
+def test_the_api_runner_hands_the_planner_the_declared_routing(tmp_path: Path):
+    gate = _deposit_gate(tmp_path)
+    candidates = gate.routing_candidates()
+    rt, _ = _runtime(tmp_path)
+    runner = OpenAICompatibleRunner(rt.cfg, rt.fs_store)
+    seen: list[str] = []
+
+    def chat(prompt: str, system_prompt: str) -> str:
+        seen.append(prompt)
+        return '{"planned_writes": []}'
+
+    runner._call_chat_completion = chat
+
+    assert runner.plan_writes_detailed(_signalled_review(), [], 8, routing_candidates=candidates).planned_writes == []
+
+    (prompt,) = seen
+    payload = json.loads(prompt.rsplit("\n\n", 1)[1])
+    assert payload["routing_candidates"]["deposit_routing"]["version"] == "1.1"
+    assert payload["findings"][0]["domain_signals"]["database_tables"][0]["table"] == "orders"
+    assert "PROJECT DOMAIN PAGES:" in prompt
+
+
+# ---- what the planner is shown of the pages it may update
+
+
+def test_the_planner_sees_the_layout_of_the_pages_a_plan_may_update(tmp_path: Path):
+    gate = _deposit_gate(tmp_path)
+    candidates = gate.routing_candidates()
+    gate.sketch_domain_pages(candidates, ["orders", "database"])
+    (alpha,) = candidates.projects
+
+    # Section by section: the header row of a table, None where the section holds text.
+    assert alpha["domain_page_sections"] == {
+        "orders": {"用途一行": None, "字段语义表": ["字段", "类型", "含义", "备注"]},
+        "database": {"用途一行": None, "配置矩阵表": ["配置项", "取值", "说明"], "使用规则": None},
+    }
+
+    # A private page lends its layout and nothing else: no value it states leaves it.
+    prompt, _ = _planner_input(_signalled_review(), candidates)
+    assert '"domain_page_sections"' in prompt
+    for value in ("shard_0", "订单库路由", "凭据本身不入库", "自增", "订单主表，一笔订单一行"):
+        assert value not in prompt, value
+
+
+def test_only_the_pages_the_review_signalled_are_sketched(tmp_path: Path):
+    gate = _deposit_gate(tmp_path)
+    candidates = gate.routing_candidates()
+
+    gate.sketch_domain_pages(candidates, ["payments"])
+    assert "domain_page_sections" not in candidates.projects[0]
+    gate.sketch_domain_pages(candidates, [])
+    assert "domain_page_sections" not in candidates.projects[0]
+    # A page that is not on disk any more has no layout to show
+    gate.sketch_domain_pages(candidates, ["payments", "orders"])
+    assert list(candidates.projects[0]["domain_page_sections"]) == ["orders"]
+
+
+def test_a_page_sketch_shows_table_headers_and_no_data_row():
+    page = (
+        "---\ntype: project-config\n---\n\n# database\n\n"
+        "## 配置矩阵表\n\n| 配置项 | 取值 |\n| --- | --- |\n| logical_db.orders | shard_0 |\n\n"
+        "## 使用规则\n\n- 密码走环境变量注入\n\n"
+        "## 变更记录表\n\n| 2026-11-20 | 建页 |\n| 2026-11-21 | 补一行 |\n\n"
+        "## 示例\n\n```sql\nselect 1;\n```\n"
+    ).replace("\n", "\r\n")  # a page saved with CRLF endings reads the same
+
+    assert page_section_sketch(page) == {
+        "配置矩阵表": ["配置项", "取值"],
+        "使用规则": None,  # text
+        "变更记录表": None,  # rows without a separator row under the first one: no header to show
+        "示例": None,  # a fenced block
+    }
+    assert page_section_sketch("") == {}
+    assert page_section_sketch("## 配置矩阵表\n\n无\n") == {"配置矩阵表": None}
+
+
+def test_the_review_names_the_pages_a_plan_may_touch():
+    assert domain_signal_names(_signalled_review()["findings"]) == ["orders", "database"]
+    assert domain_signal_names(None) == []
+    assert domain_signal_names("not a list") == []
+    assert domain_signal_names([{"facts": ["no domain clue"]}, {"domain_signals": {}}]) == []
+    # Each name once, in the order of first mention; the other two domains name no page.
+    findings = [
+        {"domain_signals": {"database_tables": [{"table": "orders"}, {"table": "payments"}], "project_configs": [{"topic": "database"}]}},
+        {
+            "domain_signals": {
+                "database_tables": [{"table": "orders"}],
+                "project_configs": [{"topic": "database"}],
+                "architecture_flows": ["订单服务 -> 支付服务"],
+                "business_calibers": ["客单价按已支付金额统计"],
+            }
+        },
+    ]
+    assert domain_signal_names(findings) == ["orders", "payments", "database"]
+
+
+# ---- the plan items of a project-domain page
+
+
+def test_a_configuration_page_is_flagged_sensitive_before_anyone_approves_it():
+    (write,) = _plan([_config_item()]).planned_writes
+    assert write.requires_approval is True
+    assert write.approval_reason == "项目配置页属于敏感写入，需人工确认后才会落盘"
+    assert is_sensitive_write(write) is True
+
+    # The model's own reason is kept; the flag is set all the same.
+    (kept,) = _plan([_config_item(approval_reason="补充逻辑库分片映射")]).planned_writes
+    assert (kept.requires_approval, kept.approval_reason) == (True, "补充逻辑库分片映射")
+
+    # A new configuration page is as sensitive as an increment into an existing one.
+    (created,) = _plan([_config_item(action="create", relative_path=f"{PROJECTS}/{ALPHA_DIR}/项目配置/redis.md")]).planned_writes
+    assert (created.action, created.requires_approval, is_sensitive_write(created)) == ("create", True, True)
+
+
+@pytest.mark.parametrize("page_type", ["project-practice-note", "project-algorithm", "project-architecture"])
+def test_every_other_page_stays_routine(page_type: str):
+    route = {"page_type": page_type, "project": "alpha", "reason": "会话查证了本项目自己的表"}
+    (write,) = _plan([_config_item(wiki_route=route)]).planned_writes
+    assert (write.requires_approval, write.approval_reason, is_sensitive_write(write)) == (False, "", False)
+
+
+PRIVATE_KEY_HEADER = "-----BEGIN " + "RSA PRIVATE KEY-----"
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        pytest.param("sk-" + "9" * 32, id="api-key"),
+        pytest.param(PRIVATE_KEY_HEADER, id="private-key"),
+    ],
+)
+def test_a_credential_in_a_domain_item_is_dropped_before_it_is_planned(secret: str):
+    """A credential kind is refused by the privacy gate every knowledge document passes."""
+    draft = f"## 使用规则\n\n- 测试库 {secret}，只在本地使用。\n"
+
+    outcome = _plan([_table_item(), _config_item(content_preview=draft)])
+
+    assert [write.title for write in outcome.planned_writes] == ["payments 支付流水表"]
+    assert [(dropped["index"], dropped["reasons"]) for dropped in outcome.diagnostics.dropped_items] == [(1, ["SECRET_LEAK_BLOCKED"])]
+    assert secret not in json.dumps(outcome.diagnostics.to_dict(), ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        pytest.param("- 测试库 password: Hk9-Qp31x，只在本地使用。", id="assignment"),
+        pytest.param("- 数据库密码：Hk9-Qp31x，只在本地使用。", id="chinese-assignment"),
+    ],
+)
+def test_a_password_in_an_increment_is_left_to_the_wiki_gate(tmp_path: Path, line: str):
+    """A credential assignment is only masked on the ordinary write path: an experience card may
+    mention one. A configuration page is held to the strict reading, so the Wiki gate refuses it."""
+    draft = f"## 使用规则\n\n{line}\n"
+
+    (write,) = _plan([_config_item(content_preview=draft)]).planned_writes
+
+    # Sensitive, so it waits for a human either way: the route gate refuses it before that.
+    assert (write.requires_approval, "Hk9-Qp31x" in write.content_preview) == (True, True)
+    gate = _deposit_gate(tmp_path)
+    decision = gate.evaluate_route(
+        relative_path=DATABASE_REL,
+        title=write.title,
+        summary=write.summary,
+        content=write.content_preview,
+        wiki_route=write.wiki_route,
+        action="update",
+    )
+
+    assert (decision.routed, decision.reason_code) == (False, "secret_leak_blocked")
+    assert decision.detail.startswith("SECRET_LEAK_BLOCKED：")
+    assert (tmp_path / "deposit-wiki" / DATABASE_REL).read_bytes() == DATABASE_PAGE.encode("utf-8")
+
+
+def test_the_contract_decides_which_pages_are_sensitive(tmp_path: Path):
+    gate = _deposit_gate(tmp_path)
+    orders = (tmp_path / "deposit-wiki" / ORDERS_REL).read_text(encoding="utf-8")
+    increment = "## 用途一行\n\n- 补充一行。\n"
+
+    # The page type, a declaration of the page, and the domain the contract marks sensitive.
+    assert gate.is_sensitive_page(ORDERS_REL, orders) is False
+    assert gate.is_sensitive_page(ORDERS_REL, increment, existing_text=orders) is False
+    assert gate.is_sensitive_page(DATABASE_REL, increment) is True
+    assert gate.is_sensitive_page(DATABASE_REL, DATABASE_PAGE) is True
+    assert gate.is_sensitive_page(f"{PROJECTS}/{ALPHA_DIR}/项目配置/redis.md", increment) is True
+    assert gate.is_sensitive_page(f"{PROJECTS}/{ALPHA_DIR}/系统架构/payment-service.md", increment) is False
+
+
+@pytest.mark.parametrize(
+    "write, sensitive",
+    [
+        pytest.param(
+            {
+                "target_kind": "knowledge_doc",
+                "action": "update",
+                "wiki_route": {"page_type": "project-config", "project": "alpha"},
+                "content_preview": "## 使用规则\n\n- 逻辑库 payments 与 orders 不在同一分片。\n",
+            },
+            True,
+            id="configuration-page-update",
+        ),
+        pytest.param(
+            {
+                "target_kind": "knowledge_doc",
+                "action": "create",
+                "wiki_route": {"page_type": "Project-Config", "project": "alpha"},
+                "content_preview": "## 用途一行\n\n记录数据源映射。\n",
+            },
+            True,
+            id="configuration-page-create-spelled-in-any-case",
+        ),
+        pytest.param(
+            {
+                "target_kind": "knowledge_doc",
+                "action": "update",
+                "wiki_route": {"page_type": "project-practice-note", "project": "alpha"},
+                "content_preview": "---\nsensitivity: private_sensitive\n---\n\n# database\n",
+            },
+            True,
+            id="draft-declares-itself-private",
+        ),
+        pytest.param(
+            {
+                "target_kind": "knowledge_doc",
+                "action": "update",
+                "wiki_route": {"page_type": "project-practice-note", "project": "alpha"},
+                "content_preview": "---\ncontains_credentials: true\n---\n\n# database\n",
+            },
+            True,
+            id="draft-declares-credentials",
+        ),
+        pytest.param(
+            {
+                "target_kind": "knowledge_doc",
+                "action": "update",
+                "wiki_route": {"page_type": "project-practice-note", "project": "alpha"},
+                "content_preview": "## 关键事项\n\n- 正文里引用 sensitivity: private_sensitive 不算声明。\n",
+            },
+            False,
+            id="a-mention-in-the-body-is-not-a-declaration",
+        ),
+        pytest.param(
+            {
+                "target_kind": "knowledge_doc",
+                "action": "update",
+                "wiki_route": {"page_type": "project-algorithm", "project": "alpha"},
+                "content_preview": "## 坑与边界\n\n- status 只在线上验证过两种取值。\n",
+            },
+            False,
+            id="table-page",
+        ),
+        pytest.param({"target_kind": "flywheel_rule", "action": "register_rule"}, False, id="rule"),
+    ],
+)
+def test_what_counts_as_a_sensitive_write_for_the_portal_and_the_card(write: dict[str, Any], sensitive: bool):
+    """`is_sensitive_write` also takes the plain dict a card renders: both sides read one answer."""
+    assert is_sensitive_write(write) is sensitive
+
+
+def test_domain_pages_claim_the_batch_capacity_after_everything_else(tmp_path: Path):
+    card = _doc(slug="card", with_summary=True)
+    items = [_table_item(), _config_item(), _service_item(), card]  # the reply puts the domain pages first
+
+    offered = deposit_page_types(_deposit_gate(tmp_path).routing_candidates())
+    assert offered == frozenset({"project-algorithm", "project-architecture", "project-config"})
+    assert deposit_page_types(_card_only_candidates()) == frozenset()
+    assert deposit_page_types(None) == frozenset()
+
+    # Three of four fit: the experience card keeps its slot, the last domain page waits for another batch.
+    outcome = _plan(items, max_write_set=3, domain_page_types=offered)
+    assert [write.title for write in outcome.planned_writes] == [card["title"], items[0]["title"], items[1]["title"]]
+    assert (outcome.diagnostics.kept_count, outcome.diagnostics.over_limit_count) == (3, 1)
+    assert [(dropped["index"], dropped["reasons"]) for dropped in outcome.diagnostics.dropped_items] == [(2, ["OVER_LIMIT"])]
+
+    # A Wiki that declares no routing reads the reply in the order the model used, as before.
+    plain = _plan(items, max_write_set=3)
+    assert [write.title for write in plain.planned_writes] == [item["title"] for item in items[:3]]
+
+
+# ---- the run, on a Wiki that declares the routing
+
+
+def test_a_configuration_increment_pauses_the_run_for_a_human(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    rt = _deposit_runtime(tmp_path)  # under `smart` only a sensitive write pauses the run, and this is one
+    _register_troubleshooting(rt)
+    target = tmp_path / "deposit-wiki" / DATABASE_REL
+    before = target.read_bytes()
+    model = _DepositModel([_config_item()])
+    monkeypatch.setattr(OpenAICompatibleRunner, "_call_chat_completion", model)
+
+    run = rt.orchestrator.start_run(trigger="test", phase="daily", session_keys=["codex:plan-1"])
+
+    assert run.status == RunStatus.AWAITING_APPROVAL, run.error
+    (write,) = run.planned_writes
+    assert (write.action, write.relative_path, write.requires_approval) == ("update", DATABASE_REL, True)
+    assert is_sensitive_write(write) is True
+    assert "项目配置页属于敏感写入" in write.approval_reason
+    assert target.read_bytes() == before  # nothing is written while the run waits
+
+    # What the review saw, what the planner was told and what it planned line up.
+    review = _node(run, "P02_REVIEW").payload["findings"][0]["domain_signals"]
+    assert (review["database_tables"][0]["table"], review["project_configs"][0]["topic"]) == ("orders", "database")
+    assert model.prompts[0].startswith("You are the P02 Review Worker")
+    assert '"deposit_routing"' in model.prompts[1] and '"domain_page_sections"' in model.prompts[1]
+    (routed,) = _payload_of(rt, run, "planned_doc_routed")["routed_docs"]
+    assert (routed["route"]["domain"], routed["route"]["incremental"], routed["route"]["sensitive"]) == ("项目配置", True, True)
+    assert "其中 1 项为项目领域页（增量更新 1、新建 0、敏感待审批 1）" in _node(run, "P03_ROUTE_PLAN").summary
+
+    finished = rt.orchestrator.approve_and_resume(run.run_id)
+
+    assert finished.status == RunStatus.PASS, finished.error
+    after = target.read_bytes()
+    assert b"\r" not in after
+    assert "- 逻辑库 payments 与 orders 不在同一分片，跨库关联只能在应用层做。" in after.decode("utf-8")
+    assert preserves_existing(before.decode("utf-8"), after.decode("utf-8"))
+    assert rt.db.get_session("codex:plan-1").status == SessionStatus.PROCESSED
+
+
+def test_a_rejected_configuration_increment_leaves_the_page_as_it_was(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    rt = _deposit_runtime(tmp_path)
+    _register_troubleshooting(rt)
+    target = tmp_path / "deposit-wiki" / DATABASE_REL
+    before = target.read_bytes()
+    monkeypatch.setattr(OpenAICompatibleRunner, "_call_chat_completion", _DepositModel([_config_item()]))
+
+    run = rt.orchestrator.start_run(trigger="test", phase="daily", session_keys=["codex:plan-1"])
+    assert run.status == RunStatus.AWAITING_APPROVAL, run.error
+
+    rejected = rt.orchestrator.reject_run(run.run_id, "配置事实待核对")
+
+    assert rejected.status == RunStatus.CANCELLED
+    assert target.read_bytes() == before
+    assert rt.db.get_session("codex:plan-1").status == SessionStatus.PENDING

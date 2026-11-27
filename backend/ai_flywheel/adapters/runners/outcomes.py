@@ -27,7 +27,8 @@ from ai_flywheel.adapters.runners.contracts import (
     ReviewUnavailableError,
     _json_error_note,
 )
-from ai_flywheel.adapters.runners.normalizers import _item_brief, _normalize_plan_item
+from ai_flywheel.adapters.runners.normalizers import _item_brief, _normalize_plan_item, normalize_domain_signals
+from ai_flywheel.adapters.wiki.router import RoutingCandidates
 from ai_flywheel.models import PlannedWrite
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,15 @@ def _unavailable_plan_message(diagnostics: PlanDiagnostics) -> str:
     return message + _NO_FALLBACK_HINT
 
 
+def _is_domain_page_item(raw_item: Any, domain_page_types: frozenset[str]) -> bool:
+    """Whether a plan item is a project-domain page the Wiki's deposit contract declares."""
+    if not domain_page_types or not isinstance(raw_item, dict):
+        return False
+    route = raw_item.get("wiki_route")
+    page_type = str(route.get("page_type") or "").strip().lower() if isinstance(route, dict) else ""
+    return page_type in domain_page_types
+
+
 def _plan_from_items(
     raw_items: list[Any],
     *,
@@ -81,8 +91,14 @@ def _plan_from_items(
     cache_hit: bool = False,
     cache_file_present: bool = False,
     reply_trace: dict[str, Any] | None = None,
+    domain_page_types: frozenset[str] = frozenset(),
 ) -> PlanOutcome:
-    """Normalize every item a model or CLI returned. Raises `PlanUnavailableError` when none of them is usable."""
+    """Normalize every item a model or CLI returned. Raises `PlanUnavailableError` when none of them is usable.
+
+    Within the batch cap the main experience card keeps its slot: the items of a project-domain
+    page (``domain_page_types``, the page types the Wiki's deposit contract declares) are read
+    after every other item, whatever order the reply used, so an item beyond the cap is theirs.
+    """
     diagnostics = PlanDiagnostics(
         source=source,
         returned_count=len(raw_items),
@@ -91,7 +107,11 @@ def _plan_from_items(
     )
     _apply_reply_trace(diagnostics, reply_trace)
     planned: list[PlannedWrite] = []
-    for index, raw_item in enumerate(raw_items):
+    reading_order = sorted(
+        range(len(raw_items)), key=lambda index: _is_domain_page_item(raw_items[index], domain_page_types)
+    )
+    for index in reading_order:
+        raw_item = raw_items[index]
         if len(planned) >= max_write_set:
             # The quota counts the writes that were kept, not the items that were read:
             # an invalid item must not use up the slot of a valid one behind it.
@@ -132,6 +152,16 @@ def _plan_from_items(
     return PlanOutcome(planned, diagnostics)
 
 
+def deposit_page_types(routing_candidates: RoutingCandidates | None) -> frozenset[str]:
+    """The page types of the project-domain pages a Wiki's deposit contract declares.
+
+    Empty for a Wiki that declares none, and for a knowledge base without a contract:
+    their plans are read in the order the reply used, as before.
+    """
+    deposit = routing_candidates.deposit_routing if routing_candidates is not None else None
+    return frozenset(deposit.page_types) if deposit is not None else frozenset()
+
+
 def _plan_from_runner_output(
     parsed: Any,
     *,
@@ -143,6 +173,7 @@ def _plan_from_runner_output(
     cache_hit: bool = False,
     cache_file_present: bool = False,
     reply_trace: dict[str, Any] | None = None,
+    domain_page_types: frozenset[str] = frozenset(),
 ) -> PlanOutcome:
     """Turn a parsed model/CLI reply into a plan. Never substitutes the heuristic planner."""
     if not (isinstance(parsed, dict) and isinstance(parsed.get("planned_writes"), list)):
@@ -167,6 +198,7 @@ def _plan_from_runner_output(
         cache_hit=cache_hit,
         cache_file_present=cache_file_present,
         reply_trace=reply_trace,
+        domain_page_types=domain_page_types,
     )
 
 
@@ -250,6 +282,10 @@ def _review_from_runner_output(
     diagnostics = _diagnostics(None, finding_count=len(findings), usable=True)
     for key in ("mistakes", "dissents", "repeated_workflows"):
         parsed.setdefault(key, [])
+    for finding in findings:
+        if isinstance(finding, dict):
+            # Optional in the review contract, present afterwards: a planner reads one shape.
+            finding["domain_signals"] = normalize_domain_signals(finding.get("domain_signals"))
     parsed["phase"] = phase
     parsed["sessions_reviewed"] = len(findings)
     parsed["review_source"] = source

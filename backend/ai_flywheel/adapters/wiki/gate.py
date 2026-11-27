@@ -14,6 +14,7 @@ from typing import Any
 
 import yaml
 
+from ai_flywheel.adapters.wiki.domain_pages import page_section_sketch
 from ai_flywheel.adapters.wiki.postflight import (
     resync_after_rollback,
     run_postflight,
@@ -27,6 +28,10 @@ from ai_flywheel.adapters.wiki.router import (
     RouteContext,
     RouteDecision,
     RoutingCandidates,
+    DepositRouting,
+    _domain_path_parts,
+    _domain_template,
+    _frontmatter_field,
     discover_practice_projects,
     evaluate_route,
     routable_page_types,
@@ -41,6 +46,7 @@ from ai_flywheel.adapters.wiki.schema import (
 from ai_flywheel.adapters.wiki.t5_adapter import _CARD_BODY_MAPPERS, normalize_planned_document
 from ai_flywheel.adapters.wiki.validator import WikiGateResult, validate_document
 from ai_flywheel.config import FlywheelConfig, KnowledgeSinkConfig
+from ai_flywheel.models import SENSITIVE_CONFIG_PAGE_TYPE, declares_private_page
 
 
 class WikiGate:
@@ -112,11 +118,54 @@ class WikiGate:
         return self._routing_candidates(self._load_schema())
 
     def _routing_candidates(self, schema: dict[str, Any]) -> RoutingCandidates:
-        _, projects_root = self._projects_root(schema)
+        """What the mounted Wiki lets a knowledge document become, and into which projects.
+
+        Practice card types are always offered. The page types of the Wiki's declared
+        project-domain deposit routing are offered with them, each project carrying the
+        domain pages it already holds.
+        """
+        root_rel, projects_root = self._projects_root(schema)
+        deposit = DepositRouting.from_schema(schema)
+        if deposit is not None:
+            deposit.projects_root = root_rel
+        card_types = self._routable_page_types(schema)
         return RoutingCandidates(
-            page_types=self._routable_page_types(schema),
-            projects=self._discover_practice_projects(projects_root),
+            page_types=list(dict.fromkeys([*card_types, *(deposit.page_types if deposit is not None else [])])),
+            projects=self._discover_practice_projects(
+                projects_root, domain_subdirs=deposit.subdirs if deposit is not None else ()
+            ),
+            evidence_page_types=card_types,
+            deposit_routing=deposit,
         )
+
+    def domain_page_template(self, relative_path: str, content: str = "") -> dict[str, Any] | None:
+        """The page template a project-domain page follows, or None when it is not one.
+
+        The path names the domain (its directory under the project) and the page's own
+        ``type`` the page type; together they pick the template whose sections an increment
+        may fill. ``content`` is the page as it exists: a domain that holds several templates
+        is told apart by the page's ``knowledge_kind``.
+        """
+        if not self.applicable:
+            return None
+        try:
+            schema = self._load_schema()
+            deposit = DepositRouting.from_schema(schema)
+            if deposit is None:
+                return None
+            parts = _domain_path_parts(self._normalize(relative_path), self.schema_loader.projects_root_rel(schema))
+        except (OSError, WikiGateError, yaml.YAMLError):
+            return None
+        if parts is None:
+            return None
+        domain = next(
+            (item for item in deposit.domains_for(_frontmatter_field(content, "type")) if item["subdir"] == parts[1]),
+            None,
+        )
+        if domain is None:
+            return None
+        template, _problem = _domain_template(domain, content)
+        return template
 
     def _projects_root(self, schema: dict[str, Any]) -> tuple[str, Path]:
         root_rel = self.schema_loader.projects_root_rel(schema)
@@ -125,8 +174,10 @@ class WikiGate:
     def _routable_page_types(self, schema: dict[str, Any]) -> list[str]:
         return routable_page_types(schema, _CARD_BODY_MAPPERS)
 
-    def _discover_practice_projects(self, projects_root: Path) -> list[dict[str, Any]]:
-        return discover_practice_projects(projects_root)
+    def _discover_practice_projects(
+        self, projects_root: Path, *, domain_subdirs: Any = ()
+    ) -> list[dict[str, Any]]:
+        return discover_practice_projects(projects_root, domain_subdirs=domain_subdirs)
 
     def _route_context(self, schema: dict[str, Any], candidates: RoutingCandidates) -> RouteContext:
         return RouteContext(
@@ -135,7 +186,79 @@ class WikiGate:
             projects_root_rel=self.schema_loader.projects_root_rel(schema),
             sink=self.sink,
             validate_document=self.validate_document,
+            read_document=self.read_domain_page,
         )
+
+    def read_domain_page(self, relative_path: str) -> str | None:
+        """A project-domain page as it is on disk, or None when it does not exist.
+
+        Only pages under the Wiki root are read. A page the document surface keeps out of
+        default view (a private configuration page) is read here and nowhere else: an
+        increment is merged into the page itself, and the result goes back to the same file.
+        """
+        rel = self._normalize(relative_path)
+        if not rel:
+            return None
+        try:
+            target = (self.root / rel).resolve()
+            if not target.is_relative_to(self.root.resolve()) or not target.is_file():
+                return None
+            return target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
+    def is_sensitive_page(
+        self, relative_path: str, content: str = "", *, existing_text: str | None = None
+    ) -> bool:
+        """Whether a write touches a page that must never be written without a human.
+
+        The contract decides, on three grounds: the page is the Wiki's project configuration
+        page (its page type, or a deposit domain the contract marks sensitive); or the page,
+        the existing one or the draft, declares itself private.
+        """
+        if not self.applicable:
+            return False
+        page_type = _frontmatter_field(existing_text or "", "type") or _frontmatter_field(content, "type")
+        if page_type == SENSITIVE_CONFIG_PAGE_TYPE:
+            return True
+        if declares_private_page(existing_text or "") or declares_private_page(content):
+            return True
+        try:
+            schema = self._load_schema()
+            deposit = DepositRouting.from_schema(schema)
+            if deposit is None:
+                return False
+            parts = _domain_path_parts(self._normalize(relative_path), self.schema_loader.projects_root_rel(schema))
+        except (OSError, WikiGateError, yaml.YAMLError):
+            return False
+        return parts is not None and parts[1] in deposit.sensitive_subdirs()
+
+    def sketch_domain_pages(self, candidates: RoutingCandidates, names: list[Any]) -> None:
+        """Give each candidate project the section layout of the domain pages a plan may update.
+
+        A planner cannot write rows that fit a table it has never seen. For every name the
+        review signalled that is an existing page of a project, the project gains
+        ``domain_page_sections``: each section's table header, or None where the section holds
+        text. Only that structure is read, never a data row, so a page that declares itself
+        private lends its layout too: its increments have to fit the same tables.
+        """
+        wanted = {str(name).strip().lower() for name in names if str(name or "").strip()}
+        if not wanted or not self.applicable:
+            return
+        try:
+            schema = self._load_schema()
+            root_rel = self.schema_loader.projects_root_rel(schema)
+        except (OSError, WikiGateError, yaml.YAMLError):
+            return
+        for project in candidates.projects:
+            for subdir, pages in (project.get("domain_inventory") or {}).items():
+                for page in pages:
+                    if page.lower() not in wanted:
+                        continue
+                    text = self.read_domain_page(f"{root_rel}/{project['dir_name']}/{subdir}/{page}.md")
+                    if text is None:
+                        continue
+                    project.setdefault("domain_page_sections", {})[page] = page_section_sketch(text)
 
     def evaluate_route(
         self,
@@ -149,12 +272,16 @@ class WikiGate:
         project_hint: str = "",
         allow_evidence_fallback: bool = True,
         candidates: RoutingCandidates | None = None,
+        action: str = "create",
+        source_sessions: list[str] | None = None,
     ) -> RouteDecision:
         """Decide, without any model call, whether a knowledge document is written and where.
 
         The planner's declaration (``wiki_route``) chooses the page type and the project; workspace
         and draft evidence only validate it. Without a declaration only the dry-run planner's
         evidence-based selection applies, and only when ``allow_evidence_fallback`` is set.
+        ``action`` matters for a project-domain page only, whose ``source_sessions`` a new
+        page records as its provenance.
         """
         if not self.applicable:
             return RouteDecision(routed=True, passthrough=True)
@@ -175,6 +302,8 @@ class WikiGate:
             project_hint=project_hint,
             allow_evidence_fallback=allow_evidence_fallback,
             candidates=candidates,
+            action=action,
+            source_sessions=source_sessions or [],
         )
 
     def _select_practice_project(
@@ -203,6 +332,7 @@ class WikiGate:
         wiki_route: dict[str, Any] | None = None,
         route: RouteDecision | None = None,
         allow_evidence_fallback: bool = True,
+        action: str = "create",
     ) -> tuple[str, str] | None:
         """Adapt a generic P03 knowledge_doc into a schema-compliant Wiki page (T5 project-practice-note).
 
@@ -211,6 +341,10 @@ class WikiGate:
 
         ``route`` is a verdict the caller already computed; without it the verdict is computed
         here from the planner's ``wiki_route`` declaration and the evidence arguments.
+
+        A project-domain page (the verdict carries a ``domain``) has no generic draft to
+        adapt: an update writes the increment the verdict merged and a create the page the
+        verdict built, both free of anything the Wiki already holds.
         """
         rel = self._normalize(relative_path or "")
         if not self.applicable:
@@ -231,11 +365,15 @@ class WikiGate:
                 source_workspaces=source_workspaces,
                 project_hint=project_hint,
                 allow_evidence_fallback=allow_evidence_fallback,
+                action=action,
+                source_sessions=source_sessions,
             )
         if not route.routed:
             return None
         if route.passthrough:
             return rel, content
+        if route.domain:
+            return rel, (route.increment if route.incremental else route.page)
 
         # If already valid against the mounted schema, keep as-is
         if rel and self.validate_document(rel, content).ok:

@@ -15,6 +15,14 @@ Six collaborators, one contract:
 from __future__ import annotations
 
 from ai_flywheel.adapters.wiki.gate import WikiGate
+from ai_flywheel.adapters.wiki.domain_pages import (
+    MergeResult,
+    build_domain_page,
+    is_single_table_name,
+    merge_domain_increment,
+    page_section_sketch,
+    preserves_existing,
+)
 from ai_flywheel.adapters.wiki.postflight import (
     _GIT_BASH_FALLBACKS,
     _WSL_BASH_MARKERS,
@@ -37,12 +45,17 @@ from ai_flywheel.adapters.wiki.practice_index import (
     practice_index_write_lock,
 )
 from ai_flywheel.adapters.wiki.router import (
+    CREATE_TARGET_EXISTS,
+    DOMAIN_INVENTORY_LIMIT,
     ROUTE_DECLARED,
     ROUTE_EVIDENCE,
     ROUTE_PATH,
+    SECRET_LEAK_BLOCKED,
     UNROUTED_DOC_REASON,
     UNROUTED_REASON_LABEL,
     UNROUTED_REASON_TEXT,
+    UPDATE_NO_NEW_CONTENT,
+    DepositRouting,
     RouteContext,
     RouteDecision,
     RoutingCandidates,
@@ -59,6 +72,7 @@ from ai_flywheel.adapters.wiki.router import (
     _token_in_text,
     _workspace_segments,
     declared_project,
+    discover_domain_pages,
     discover_practice_projects,
     evaluate_route,
     evidence_hits,
@@ -67,11 +81,13 @@ from ai_flywheel.adapters.wiki.router import (
     select_practice_project,
 )
 from ai_flywheel.adapters.wiki.schema import (
+    DEPOSIT_ROUTING_KEY,
     FORBIDDEN_PATH_SEGMENTS,
     REQUIRED_SCHEMA_BLOCKS,
     SCHEMA_FILE_NAME,
     WikiGateError,
     WikiSchemaLoader,
+    deposit_routing_rules,
     normalize_relative_path,
     split_frontmatter,
 )
@@ -113,12 +129,16 @@ from ai_flywheel.adapters.wiki.validator import (
     _body_lines,
     _section_name,
     _strip_fenced,
+    domain_page_issues,
     validate_body,
     validate_document,
 )
 
 __all__ = [
     "ALLOWED_LOAD_POLICIES",
+    "CREATE_TARGET_EXISTS",
+    "DEPOSIT_ROUTING_KEY",
+    "DOMAIN_INVENTORY_LIMIT",
     "FORBIDDEN_PATH_SEGMENTS",
     "MAX_DESCRIPTION_CHARS",
     "MAX_TAGS",
@@ -132,6 +152,7 @@ __all__ = [
     "ROUTE_EVIDENCE",
     "ROUTE_PATH",
     "SCHEMA_FILE_NAME",
+    "SECRET_LEAK_BLOCKED",
     "T5B_MAX_BODY_LINES",
     "T5B_SECTIONS",
     "T5_MAX_BODY_LINES",
@@ -139,6 +160,9 @@ __all__ = [
     "UNROUTED_DOC_REASON",
     "UNROUTED_REASON_LABEL",
     "UNROUTED_REASON_TEXT",
+    "UPDATE_NO_NEW_CONTENT",
+    "DepositRouting",
+    "MergeResult",
     "RouteContext",
     "RouteDecision",
     "RoutingCandidates",
@@ -165,12 +189,20 @@ __all__ = [
     "_split_draft_body",
     "_token_in_text",
     "_workspace_segments",
+    "build_domain_page",
     "declared_project",
+    "deposit_routing_rules",
+    "discover_domain_pages",
     "discover_practice_projects",
+    "domain_page_issues",
     "evaluate_route",
     "evidence_hits",
+    "is_single_table_name",
+    "merge_domain_increment",
     "normalize_planned_document",
     "normalize_relative_path",
+    "page_section_sketch",
+    "preserves_existing",
     "approved_registration_matches",
     "plan_practice_index_registration",
     "practice_index_write_lock",

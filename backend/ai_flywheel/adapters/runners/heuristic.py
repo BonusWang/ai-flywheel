@@ -26,6 +26,7 @@ from ai_flywheel.adapters.runners.contracts import (
     _slugify,
     normalize_rule_payload,
 )
+from ai_flywheel.adapters.runners.normalizers import empty_domain_signals
 from ai_flywheel.adapters.wiki.router import RoutingCandidates
 from ai_flywheel.core.privacy import SecretLeakError, sanitize_and_check_secrets
 from ai_flywheel.core.time_utils import compute_valid_until, shanghai_today_ymd
@@ -147,6 +148,8 @@ class DryRunHeuristicRunner(BaseWorkflowRunner):
                         "target_skill": matched_skill or "",
                         "reason": "命中重复流程关键词" if suggest_skill else "常规单次任务，暂无需封装 Skill",
                     },
+                    # The local reviewer reads no table, configuration or architecture: no domain clue.
+                    "domain_signals": empty_domain_signals(),
                 }
             )
         return {

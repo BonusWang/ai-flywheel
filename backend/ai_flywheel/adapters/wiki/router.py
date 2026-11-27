@@ -14,8 +14,22 @@ from typing import Any, Callable
 
 import yaml
 
-from ai_flywheel.adapters.wiki.schema import normalize_relative_path, split_frontmatter
+from ai_flywheel.adapters.wiki.domain_pages import (
+    build_domain_page,
+    is_single_table_name,
+    merge_domain_increment,
+)
+from ai_flywheel.adapters.wiki.schema import (
+    DEPOSIT_ROUTING_KEY,
+    FORBIDDEN_PATH_SEGMENTS,
+    deposit_routing_rules,
+    normalize_relative_path,
+    split_frontmatter,
+)
 from ai_flywheel.config import KnowledgeSinkConfig
+from ai_flywheel.core.privacy import find_secret_shape
+from ai_flywheel.core.time_utils import shanghai_today_ymd
+from ai_flywheel.models import declares_private_page
 
 # Who decided the page type and the project of a knowledge document.
 ROUTE_DECLARED = "declared"  # the planner declared them; evidence only validated the declaration
@@ -36,6 +50,17 @@ UNROUTED_REASON_TEXT = {
     "no_evidence": UNROUTED_DOC_REASON,
     "page_type_not_routable": "页面类型不属于可路由类型",
     "path_mismatch": "声明与目标路径所示项目不一致",
+    # A project-domain page the deposit contract declares (content_contract.deposit_routing).
+    "domain_path_mismatch": "目标路径不在声明页面类型的领域落点目录内",
+    "path_pattern_mismatch": "目标路径与该页面类型声明的分区或 path_pattern 不匹配",
+    "table_page_name_invalid": "一表一页：表结构页的文件名只能是单张表名",
+    "update_target_missing": "update 的目标领域页不存在（缺页应使用 create）",
+    "update_target_type_mismatch": "update 的目标页页面类型与路由声明不一致",
+    "update_target_invalid": "目标页未通过挂载 Wiki 的写前门禁，不能在其上合并增量",
+    "update_no_new_content": "增量内容均已存在于目标页，没有新增实质内容",
+    "increment_invalid": "增量内容无法无损并入目标页",
+    "domain_page_invalid": "按模板生成的领域页未通过挂载 Wiki 的写前门禁",
+    "secret_leak_blocked": "增量内容命中密码、Token 或私钥明文形态，密钥门禁阻断",
 }
 # Short label of every reason code, for node and audit summaries.
 UNROUTED_REASON_LABEL = {
@@ -48,6 +73,33 @@ UNROUTED_REASON_LABEL = {
     "no_evidence": "无归属证据",
     "page_type_not_routable": "页面类型不可路由",
     "path_mismatch": "声明与目标路径冲突",
+    "domain_path_mismatch": "领域落点路径不符",
+    "path_pattern_mismatch": "路径模式不符",
+    "table_page_name_invalid": "表页命名不符",
+    "update_target_missing": "更新目标不存在",
+    "update_target_type_mismatch": "更新目标类型不符",
+    "update_target_invalid": "更新目标未过门禁",
+    "update_no_new_content": "增量无新增内容",
+    "increment_invalid": "增量格式不符",
+    "domain_page_invalid": "领域页未过门禁",
+    "secret_leak_blocked": "密钥门禁阻断",
+}
+# How many existing page names per domain a candidate project carries into the planning prompt.
+DOMAIN_INVENTORY_LIMIT = 100
+# The trace marker of an update whose content the page already holds (the Skill normaliser's spelling).
+UPDATE_NO_NEW_CONTENT = "UPDATE_NO_NEW_CONTENT"
+# The trace marker of a planned item the privacy gate refused before it could reach a page.
+SECRET_LEAK_BLOCKED = "SECRET_LEAK_BLOCKED"
+# The trace marker of a create that met an existing page and was merged into it instead.
+CREATE_TARGET_EXISTS = "CREATE_TARGET_EXISTS"
+# Gate issues that are about where a page sits rather than what it says.
+_PLACEMENT_ISSUE_CODES = {
+    "CORE_FILE_BLOCKED",
+    "FORBIDDEN_PATH",
+    "PARTITION_UNKNOWN",
+    "PLACEMENT_OUTSIDE_PARTITION",
+    "PATH_PATTERN_MISMATCH",
+    "FILE_PATTERN_MISMATCH",
 }
 # Values of a declared project that mean "no attribution". Only these exact spellings count.
 _NO_ATTRIBUTION_TOKENS = {"", "none", "null", "n/a", "na", "-", "无", "无归属", "不归属", "不适用"}
@@ -64,33 +116,142 @@ _GENERIC_PROJECT_WORDS = {
 _LEADING_ASCII_RE = re.compile(r"[A-Za-z0-9]+")
 
 
+def _mapping(raw: Any) -> dict[str, Any]:
+    return raw if isinstance(raw, dict) else {}
+
+
+@dataclass
+class DepositRouting:
+    """The Wiki's declared project-domain deposit routing, resolved for routing and planning.
+
+    Read off ``content_contract.deposit_routing``: which domain each trigger feeds, the
+    directory under a project that holds its pages, and the page templates they follow.
+    Nothing here is hardcoded: a Wiki that declares other domains gets those.
+    """
+
+    version: str
+    rule: str
+    domains: list[dict[str, Any]]
+    required_fields: dict[str, list[str]] = field(default_factory=dict)  # frontmatter a page type requires
+    # Where the Wiki keeps its project directories, so a planner can write a page's full path.
+    projects_root: str = ""
+
+    @classmethod
+    def from_schema(cls, schema: dict[str, Any]) -> DepositRouting | None:
+        """The routing a contract declares, or None when it declares none."""
+        rules = deposit_routing_rules(schema)
+        if not rules:
+            return None
+        content = _mapping(schema.get("content_contract"))
+        block = _mapping(content.get(DEPOSIT_ROUTING_KEY))
+        declared = _mapping(content.get("page_types"))
+        core = [str(name) for name in (_mapping(schema.get("core_contract")).get("required_fields") or [])]
+        required: dict[str, list[str]] = {}
+        for rule in rules:
+            for page_type in rule["page_types"]:
+                type_cfg = _mapping(declared.get(page_type))
+                # The core fields first, then the page type's own; a field both name is listed once.
+                required[page_type] = list(dict.fromkeys([*core, *(str(name) for name in (type_cfg.get("required_fields") or []))]))
+        return cls(
+            version=str(block.get("version") or ""),
+            rule=" ".join(str(block.get("rule") or "").split()),
+            domains=rules,
+            required_fields=required,
+        )
+
+    @property
+    def page_types(self) -> list[str]:
+        """Every page type the declared domains route to."""
+        return list(dict.fromkeys(page_type for domain in self.domains for page_type in domain["page_types"]))
+
+    @property
+    def subdirs(self) -> list[str]:
+        """The directory under a project that holds each domain's pages."""
+        return [domain["subdir"] for domain in self.domains]
+
+    def domains_for(self, page_type: str) -> list[dict[str, Any]]:
+        """The declared domains a page type belongs to (several when they share the type)."""
+        return [domain for domain in self.domains if page_type in domain["page_types"]]
+
+    def sensitive_subdirs(self) -> list[str]:
+        """Directories whose pages are a sensitive write: the project's configuration."""
+        return [domain["subdir"] for domain in self.domains if domain["sensitive"]]
+
+    def page_path(self, subdir: str, project: str, page: str) -> str:
+        """The relative path of one domain page: ``<projects root>/<project>/<domain directory>/<page>.md``."""
+        return "/".join(part for part in (self.projects_root, project, subdir, f"{page}.md") if part)
+
+    def to_dict(self) -> dict[str, Any]:
+        """The form the planning prompt carries."""
+        return {
+            "version": self.version,
+            "rule": self.rule,
+            "projects_root": self.projects_root,
+            "domains": [
+                {
+                    "domain": domain["domain"],
+                    "trigger": domain["trigger"],
+                    "target": domain["target"],
+                    "target_path": self.page_path(domain["subdir"], "{project}", "{page}"),
+                    "page_types": list(domain["page_types"]),
+                    "required_fields": {
+                        page_type: list(self.required_fields.get(page_type, [])) for page_type in domain["page_types"]
+                    },
+                    "templates": [dict(template) for template in domain["templates"]],
+                    "sensitive": domain["sensitive"],
+                }
+                for domain in self.domains
+            ],
+        }
+
+
 @dataclass
 class RoutingCandidates:
     """Page types and projects a knowledge document may be routed to, read off the mounted Wiki."""
 
     page_types: list[str] = field(default_factory=list)
     projects: list[dict[str, Any]] = field(default_factory=list)
+    # Page types the evidence fallback may pick without a declaration (the dry-run planner
+    # only): the practice card types. A project-domain page type is reached by declaration alone.
+    evidence_page_types: list[str] = field(default_factory=list)
+    # The Wiki's declared project-domain deposit routing; None when the contract declares none.
+    deposit_routing: DepositRouting | None = None
 
     @property
     def routable(self) -> bool:
         return bool(self.page_types and self.projects)
 
+    @property
+    def fallback_page_types(self) -> list[str]:
+        """What the evidence fallback may choose: the evidence page types, else every page type."""
+        return list(self.evidence_page_types or self.page_types)
+
     def to_dict(self, *, description_limit: int = 0) -> dict[str, Any]:
-        """Serialisable form; ``description_limit`` caps each project description (0 keeps it whole)."""
-        return {
+        """Serialisable form; ``description_limit`` caps each project description (0 keeps it whole).
+
+        The deposit routing and each project's domain inventory appear only when the Wiki
+        declares the routing: a Wiki that does not keeps exactly the prompt it had.
+        """
+        payload: dict[str, Any] = {
             "page_types": list(self.page_types),
-            "projects": [
-                {
-                    "project": project["dir_name"],
-                    "project_id": project["project_id"],
-                    "aliases": list(project.get("aliases") or []),
-                    "description": (project.get("description") or "")[:description_limit]
-                    if description_limit
-                    else project.get("description") or "",
-                }
-                for project in self.projects
-            ],
+            "projects": [],
         }
+        for project in self.projects:
+            entry: dict[str, Any] = {
+                "project": project["dir_name"],
+                "project_id": project["project_id"],
+                "aliases": list(project.get("aliases") or []),
+                "description": (project.get("description") or "")[:description_limit]
+                if description_limit
+                else project.get("description") or "",
+            }
+            for key in ("domain_inventory", "domain_page_sections"):
+                if project.get(key):
+                    entry[key] = project[key]
+            payload["projects"].append(entry)
+        if self.deposit_routing is not None:
+            payload["deposit_routing"] = self.deposit_routing.to_dict()
+        return payload
 
 
 @dataclass
@@ -109,13 +270,26 @@ class RouteDecision:
     # The gate could not read the contract, so it says nothing about the document: leave it untouched
     # and let the write gate report the unreadable schema instead of unrouting everything quietly.
     passthrough: bool = False
+    # A project-domain page (content_contract.deposit_routing): the domain it was routed to,
+    # whether the write merges an increment into the existing page, and whether it is a sensitive
+    # write (the project's configuration page, or a page that declares itself private).
+    domain: str = ""
+    incremental: bool = False
+    sensitive: bool = False
+    relabel: str = ""  # CREATE_TARGET_EXISTS when a create met an existing page and became an update
+    # Working state the normalisation step reads back: the page a create will write, or the
+    # increment an update will merge (already free of what the page holds).
+    page: str = ""
+    increment: str = ""
+    duplicates: int = 0
+    placeholders: list[str] = field(default_factory=list)
 
     @property
     def project_dir(self) -> str:
         return str(self.project["dir_name"]) if self.project else ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "routed": self.routed,
             "source": self.source,
             "page_type": self.page_type,
@@ -127,6 +301,17 @@ class RouteDecision:
             "evidence": {key: list(value) for key, value in self.evidence.items()},
             "detail": self.detail,
         }
+        if self.domain:
+            # `duplicates`: rows and blocks of the increment the page already held. They were
+            # dropped before anything was written, and this is where that is recorded.
+            payload.update(
+                domain=self.domain,
+                incremental=self.incremental,
+                sensitive=self.sensitive,
+                relabel=self.relabel,
+                duplicates=self.duplicates,
+            )
+        return payload
 
 
 @dataclass
@@ -139,6 +324,9 @@ class RouteContext:
     sink: KnowledgeSinkConfig
     #: The gate's own document check, so a draft that already satisfies the schema keeps its path.
     validate_document: Callable[[str, str], Any]
+    #: Reads a page the sink may write, or None when it does not exist. Only a domain-page
+    #: update needs it: an increment is merged into the page as it is, never into a redrawn one.
+    read_document: Callable[[str], str | None] | None = None
 
 
 def _token_in_text(token: str, text: str) -> bool:
@@ -237,11 +425,39 @@ def routable_page_types(schema: dict[str, Any], card_body_mappers: dict[str, Any
     return routable
 
 
-def discover_practice_projects(projects_root: Path) -> list[dict[str, Any]]:
+def discover_domain_pages(domain_dir: Path, *, limit: int = DOMAIN_INVENTORY_LIMIT) -> list[str]:
+    """Basenames of the pages a project already holds in one domain directory.
+
+    Direct children only: hidden files, archived pages and nested folders are not pages
+    of the domain. Sorted by name and capped at ``limit``, which is all the planning
+    prompt needs.
+    """
+    try:
+        if not domain_dir.is_dir():
+            return []
+        names = sorted(
+            (
+                page.stem
+                for page in domain_dir.iterdir()
+                if page.is_file()
+                and page.suffix.lower() == ".md"
+                and not page.name.startswith(".")
+                and not page.name.startswith("archive-")
+            ),
+            key=str.lower,
+        )
+    except OSError:
+        return []
+    return names[:limit]
+
+
+def discover_practice_projects(projects_root: Path, *, domain_subdirs: Any = ()) -> list[dict[str, Any]]:
     """Dynamically inspect mounted Wiki project dirs that host a 实战笔记/ folder (zero hardcoded names).
 
     Each candidate carries the identifiers and the one-line description declared on its
     practice index page, so a planner can name it exactly and judge whether a note is about it.
+    With ``domain_subdirs`` (the directories a Wiki's deposit routing declares) each candidate
+    also carries its read-only ``domain_inventory``: the domain pages it already holds.
     """
     if not projects_root.is_dir():
         return []
@@ -271,6 +487,8 @@ def discover_practice_projects(projects_root: Path) -> list[dict[str, Any]]:
                         candidate["project_id"] = str(fm["project_id"]).strip()
                     candidate["aliases"] = _index_aliases(fm.get("aliases"))
                     candidate["description"] = " ".join(str(fm.get("description") or "").split())
+        if domain_subdirs:
+            candidate["domain_inventory"] = {subdir: discover_domain_pages(child / subdir) for subdir in domain_subdirs}
         found.append(candidate)
     return found
 
@@ -371,12 +589,18 @@ def evaluate_route(
     project_hint: str = "",
     allow_evidence_fallback: bool = True,
     candidates: RoutingCandidates | None = None,
+    action: str = "create",
+    source_sessions: list[str] | None = None,
 ) -> RouteDecision:
     """Decide, without any model call, whether a knowledge document is written and where.
 
     The planner's declaration (``wiki_route``) chooses the page type and the project; workspace
     and draft evidence only validate it. Without a declaration only the dry-run planner's
     evidence-based selection applies, and only when ``allow_evidence_fallback`` is set.
+
+    ``action`` matters for a project-domain page only: there an ``update`` is merged into
+    the page that exists and a ``create`` makes a new one, recording ``source_sessions``
+    as its provenance.
     """
     candidates = candidates if candidates is not None else context.candidates
     declared = _declared_route(wiki_route)
@@ -408,9 +632,38 @@ def evaluate_route(
             detail=detail or UNROUTED_REASON_TEXT.get(code, ""),
         )
 
+    check = context.validate_document(rel, content) if rel else None
+
+    # 0. A project-domain page follows the Wiki's deposit contract: the same project checks as a
+    #    card, then the page's own (the domain's directory, an update merged, a create built).
+    deposit = candidates.deposit_routing
+    if deposit is not None:
+        domain_type = declared["page_type"] if has_declaration else (check.page_type if check and check.ok else "")
+        domains = deposit.domains_for(domain_type)
+        if domains:
+            return _evaluate_deposit_route(
+                context=context,
+                domains=domains,
+                page_type=domain_type,
+                declared=declared,
+                has_declaration=has_declaration,
+                allow_evidence_fallback=allow_evidence_fallback,
+                rel=rel,
+                title=title,
+                summary=summary,
+                content=content,
+                action=action,
+                check=check,
+                workspaces=workspaces,
+                haystack=haystack,
+                workspace_hits=workspace_hits,
+                content_hits=content_hits,
+                verdict=verdict,
+                source_sessions=source_sessions or [],
+            )
+
     # 1. A draft that already satisfies the schema at its own path: the path decides.
-    if rel:
-        check = context.validate_document(rel, content)
+    if check is not None:
         if check.ok:
             path_project = project_of_path(rel, candidates.projects, context.projects_root_rel)
             if check.page_type not in candidates.page_types:
@@ -455,7 +708,7 @@ def evaluate_route(
         )
         if chosen is None:
             return verdict(False, code="no_evidence")
-        return verdict(True, source=ROUTE_EVIDENCE, page_type=candidates.page_types[0], project=chosen)
+        return verdict(True, source=ROUTE_EVIDENCE, page_type=candidates.fallback_page_types[0], project=chosen)
 
     # 4. A declaration is validated, never corrected.
     state, declared_project_match = declared_project(declared["project"], candidates.projects)
@@ -478,3 +731,257 @@ def evaluate_route(
     if conflict:
         return verdict(False, code=conflict[0], detail=conflict[1])
     return verdict(True, source=ROUTE_DECLARED, page_type=declared["page_type"], project=declared_project_match)
+
+
+def _domain_path_parts(rel: str, projects_root_rel: str) -> tuple[str, str, str] | None:
+    """(project directory, domain directory, file name) of a page under the projects root.
+
+    None when the path is not ``<projects root>/<project>/<domain directory>/<file>``.
+    """
+    root = projects_root_rel.strip("/")
+    if not root or not rel.lower().startswith(root.lower() + "/"):
+        return None
+    parts = [segment for segment in rel[len(root) + 1 :].split("/") if segment]
+    if len(parts) < 3:
+        return None
+    return parts[0], "/".join(parts[1:-1]), parts[-1]
+
+
+def _frontmatter_field(content: str, key: str) -> str:
+    """One frontmatter value of a page or a draft, or '' when it does not carry it."""
+    fm_text, _ = split_frontmatter(content or "")
+    if not fm_text:
+        return ""
+    try:
+        fm = yaml.safe_load(fm_text)
+    except yaml.YAMLError:
+        return ""
+    return str(fm.get(key) or "").strip() if isinstance(fm, dict) else ""
+
+
+def _issue_text(issues: list[Any]) -> str:
+    return "；".join(f"{issue.get('code')}: {issue.get('message')}" for issue in issues[:5])
+
+
+def _domain_template(domain: dict[str, Any], content: str) -> tuple[dict[str, Any] | None, str]:
+    """The domain's page template a create follows, or a problem that says why not.
+
+    A domain may hold several templates (an algorithm page and a caliber page under one
+    page type); the draft's ``knowledge_kind`` says which. Without one, a single-template
+    domain is unambiguous and a several-template domain is not: nothing is guessed.
+    """
+    templates = domain["templates"]
+    by_kind = {template["knowledge_kind"]: template for template in templates if template.get("knowledge_kind")}
+    if not by_kind:
+        return (templates[0], "") if templates else (None, f"领域 {domain['domain']} 没有可用模板")
+    kind = _frontmatter_field(content, "knowledge_kind")
+    if kind in by_kind:
+        return by_kind[kind], ""
+    if not kind and len(by_kind) == 1:
+        return next(iter(by_kind.values())), ""
+    if kind:
+        return None, f"草稿的 knowledge_kind「{kind}」不属于领域 {domain['domain']}（可为：{'、'.join(by_kind)}）"
+    return None, f"领域 {domain['domain']} 有多个模板（{'、'.join(by_kind)}），草稿须声明 knowledge_kind"
+
+
+def _evaluate_deposit_route(
+    *,
+    context: RouteContext,
+    domains: list[dict[str, Any]],
+    page_type: str,
+    declared: dict[str, str],
+    has_declaration: bool,
+    allow_evidence_fallback: bool,
+    rel: str,
+    title: str,
+    summary: str,
+    content: str,
+    action: str,
+    check: Any,
+    workspaces: list[str],
+    haystack: str,
+    workspace_hits: list[str],
+    content_hits: list[str],
+    verdict: Callable[..., RouteDecision],
+    source_sessions: list[str] | None = None,
+) -> RouteDecision:
+    """Route a project-domain page: the card's project checks first, then the page's own.
+
+    The declaration names the page type and the project; the path names one page inside
+    the domain's directory. An ``update`` is merged into the page that exists and never
+    replaces it. A ``create`` that meets an existing page becomes an update of it, so an
+    existing page is never overwritten without the merge showing what it adds.
+    """
+    candidates = context.candidates
+    if not candidates.routable:
+        return verdict(False, code="no_routable_target")
+    if action not in ("create", "update"):
+        return verdict(
+            False, code="declaration_invalid", detail=f"领域页只支持 create 或 update，计划动作为「{action or '空'}」"
+        )
+    if has_declaration:
+        state, project = declared_project(declared["project"], candidates.projects)
+        if state == "none":
+            return verdict(False, code="declared_none")
+        if project is None:
+            return verdict(
+                False,
+                code="declaration_invalid",
+                detail=f"声明的项目 {declared['project'] or '（空）'} 不能唯一匹配候选项目",
+            )
+    else:
+        if not allow_evidence_fallback:
+            return verdict(False, code="declaration_missing")
+        project = project_of_path(rel, candidates.projects, context.projects_root_rel)
+        if project is None:
+            return verdict(False, code="no_routable_target")
+        chosen = select_practice_project(
+            candidates.projects, haystack, workspaces, fallback_project=context.sink.practice_fallback_project
+        )
+        if chosen is None:
+            return verdict(False, code="no_evidence")
+        if chosen is not project:
+            return verdict(
+                False,
+                code="path_mismatch",
+                detail=f"证据指向 {chosen['dir_name']}，目标路径所示项目为 {project['dir_name']}",
+            )
+    name = project["dir_name"]
+    conflict = _declaration_conflict(name, workspace_hits, content_hits)
+    if conflict:
+        return verdict(False, code=conflict[0], detail=conflict[1])
+
+    # 1. The path names one page inside the domain's directory.
+    parts = _domain_path_parts(rel, context.projects_root_rel)
+    domain = next((item for item in domains if parts and item["subdir"] == parts[1]), None)
+    if parts is None or parts[0].lower() != name.lower() or domain is None:
+        where = " | ".join(item["subdir"] for item in domains)
+        return verdict(
+            False,
+            code="domain_path_mismatch",
+            detail=f"{UNROUTED_REASON_TEXT['domain_path_mismatch']}：目标路径须为 "
+            f"{context.projects_root_rel}/{name}/({where})/<页面名>.md，实际为 {rel or '（空）'}",
+        )
+    file_name = parts[2]
+    if not file_name.lower().endswith(".md") or any(
+        segment.startswith((".", "archive-")) or segment in FORBIDDEN_PATH_SEGMENTS for segment in rel.split("/")
+    ):
+        return verdict(
+            False,
+            code="domain_path_mismatch",
+            detail=f"{UNROUTED_REASON_TEXT['domain_path_mismatch']}：{rel} 不是领域目录下的 Markdown 页面",
+        )
+    stem = file_name[: -len(".md")]
+    if any(template.get("knowledge_kind") == "ddl" for template in domain["templates"]) and not is_single_table_name(stem):
+        return verdict(
+            False,
+            code="table_page_name_invalid",
+            detail=f"{UNROUTED_REASON_TEXT['table_page_name_invalid']}：{stem}",
+        )
+
+    # 2. The page that exists, if any, decides what the action can mean.
+    existing = context.read_document(rel) if context.read_document is not None else None
+    flags: dict[str, Any] = {
+        "domain": domain["domain"],
+        "sensitive": bool(domain["sensitive"]) or declares_private_page(existing or content),
+    }
+    if flags["sensitive"]:
+        # A configuration page records where a credential is kept, never the credential itself.
+        # Only what would enter the page is judged, and the trace names the shape, never the value.
+        shape = find_secret_shape(content, strict=True)
+        if shape:
+            return verdict(
+                False,
+                code="secret_leak_blocked",
+                detail=f"{SECRET_LEAK_BLOCKED}：{UNROUTED_REASON_TEXT['secret_leak_blocked']}（{shape}）",
+            )
+
+    def routed(**extra: Any) -> RouteDecision:
+        decision = verdict(True, source=ROUTE_DECLARED if has_declaration else ROUTE_PATH, page_type=page_type, project=project)
+        for key, value in {**flags, **extra}.items():
+            setattr(decision, key, value)
+        return decision
+
+    if action == "update" or existing is not None:
+        if existing is None:
+            return verdict(
+                False, code="update_target_missing", detail=f"{UNROUTED_REASON_TEXT['update_target_missing']}：{rel}"
+            )
+        existing_type = _frontmatter_field(existing, "type")
+        if existing_type != page_type:
+            return verdict(
+                False,
+                code="update_target_type_mismatch",
+                detail=f"{UNROUTED_REASON_TEXT['update_target_type_mismatch']}：{rel} 为「{existing_type or '未知'}」，"
+                f"路由声明为「{page_type}」",
+            )
+        template_sections = [name for template in domain["templates"] for name in template["body_sections"]]
+        merge = merge_domain_increment(existing, content, template_sections=template_sections)
+        if not merge.ok:
+            return verdict(
+                False,
+                code="increment_invalid",
+                detail=f"{UNROUTED_REASON_TEXT['increment_invalid']}：{'；'.join(merge.problems)}",
+            )
+        if not merge.has_additions:
+            return verdict(
+                False,
+                code="update_no_new_content",
+                detail=f"{UPDATE_NO_NEW_CONTENT}：{UNROUTED_REASON_TEXT['update_no_new_content']}"
+                f"（{stem}，{merge.duplicates} 条均已存在）",
+            )
+        gate = context.validate_document(rel, merge.merged)
+        if not gate.ok:
+            return verdict(
+                False,
+                code="update_target_invalid",
+                detail=f"{UNROUTED_REASON_TEXT['update_target_invalid']}：{_issue_text(gate.issues)}",
+            )
+        return routed(
+            incremental=True,
+            increment=merge.added_text,
+            duplicates=merge.duplicates,
+            placeholders=list(merge.placeholders),
+            relabel=CREATE_TARGET_EXISTS if action == "create" else "",
+        )
+
+    # 3. A new page: the draft when it already satisfies the schema, else the template's shape.
+    if check is not None and check.ok:
+        if check.page_type != page_type:
+            return verdict(
+                False,
+                code="declaration_invalid",
+                detail=f"声明的页面类型「{page_type}」与草稿页面的类型「{check.page_type}」不一致",
+            )
+        return routed(page=content)
+    draft_type = _frontmatter_field(content, "type")
+    if draft_type and draft_type != page_type:
+        # The same refusal for a draft the engine would rebuild: one that states another page
+        # type than the declaration is contradicted, not corrected.
+        return verdict(
+            False,
+            code="declaration_invalid",
+            detail=f"声明的页面类型「{page_type}」与草稿页面的类型「{draft_type}」不一致",
+        )
+    template, problem = _domain_template(domain, content)
+    if template is None:
+        return verdict(False, code="declaration_invalid", detail=problem)
+    page, problems = build_domain_page(
+        title=title,
+        summary=summary,
+        content=content,
+        page_type=page_type,
+        project_id=str(project.get("project_id") or name),
+        template=template,
+        today=shanghai_today_ymd(),
+        source_sessions=list(source_sessions or []),
+    )
+    gate_issues = [{"code": "DOMAIN_PAGE_BUILD", "message": note} for note in problems]
+    if not gate_issues:
+        gate = context.validate_document(rel, page)
+        gate_issues = list(gate.issues) if not gate.ok else []
+    if gate_issues:
+        placement = [issue for issue in gate_issues if issue.get("code") in _PLACEMENT_ISSUE_CODES]
+        code = "path_pattern_mismatch" if placement else "domain_page_invalid"
+        return verdict(False, code=code, detail=f"{UNROUTED_REASON_TEXT[code]}：{_issue_text(placement or gate_issues)}")
+    return routed(page=page)

@@ -30,9 +30,9 @@ from ai_flywheel.adapters.runners.contracts import (
     _slugify,
     normalize_rule_payload,
 )
-from ai_flywheel.core.privacy import SecretLeakError, sanitize_and_check_secrets
+from ai_flywheel.core.privacy import SecretLeakError, mask_credential_shapes, sanitize_and_check_secrets
 from ai_flywheel.core.time_utils import shanghai_today_ymd
-from ai_flywheel.models import PlannedWrite
+from ai_flywheel.models import SENSITIVE_CONFIG_PAGE_TYPE, PlannedWrite
 
 
 class _DropItem(Exception):
@@ -214,6 +214,76 @@ def _addition_adds_nothing(addition: str, existing_text: str) -> bool:
     return True
 
 
+# ---------------- P02: the domain signals of one finding ----------------
+
+# The four domains a finding's optional `domain_signals` may record.
+DOMAIN_SIGNAL_KEYS = ("database_tables", "project_configs", "architecture_flows", "business_calibers")
+# The object entries: the field that names the subject, and the list fields that describe it.
+_DOMAIN_OBJECT_FIELDS = {
+    "database_tables": ("table", ("verified_fields", "enums", "join_keys", "pitfalls")),
+    "project_configs": ("topic", ("facts", "pitfalls")),
+}
+_DOMAIN_ENTRY_LIMIT = 20  # entries kept per key
+_DOMAIN_ITEM_LIMIT = 12  # items kept per list field
+_DOMAIN_TEXT_LIMIT = 160  # characters kept per text item
+
+
+def empty_domain_signals() -> dict[str, list[Any]]:
+    """The `domain_signals` of a finding that recorded no domain clue."""
+    return {key: [] for key in DOMAIN_SIGNAL_KEYS}
+
+
+def _signal_text(value: Any) -> str:
+    """One text item of a signal, trimmed and with any credential shape masked."""
+    return mask_credential_shapes(_as_text(value))[:_DOMAIN_TEXT_LIMIT].strip()
+
+
+def _signal_list(raw: Any) -> list[str]:
+    """A list field of a signal: its text items, deduplicated, in order."""
+    items = raw if isinstance(raw, list) else ([raw] if isinstance(raw, str) else [])
+    return list(dict.fromkeys(text for text in map(_signal_text, items) if text))[:_DOMAIN_ITEM_LIMIT]
+
+
+def _domain_signal_entry(key: str, entry: Any) -> Any:
+    """One normalised entry of a key, or None when it names no subject."""
+    if key not in _DOMAIN_OBJECT_FIELDS:
+        return _signal_text(entry) or None
+    name_field, list_fields = _DOMAIN_OBJECT_FIELDS[key]
+    if isinstance(entry, str):
+        entry = {name_field: entry}
+    if not isinstance(entry, dict):
+        return None
+    name = _signal_text(entry.get(name_field))
+    if not name:
+        return None
+    item: dict[str, Any] = {name_field: name}
+    for field in list_fields:
+        item[field] = _signal_list(entry.get(field))
+    return item
+
+
+def normalize_domain_signals(raw: Any) -> dict[str, list[Any]]:
+    """The `domain_signals` of one finding, in the one shape a planner reads.
+
+    The field is optional in the review contract, so whatever came back (nothing, a
+    malformed value, other keys) yields the four keys. An entry that names no subject is
+    dropped, and a text that carries a credential is masked: a password never travels
+    from a review into a plan. Nothing here fails the review.
+    """
+    signals = empty_domain_signals()
+    if not isinstance(raw, dict):
+        return signals
+    for key in DOMAIN_SIGNAL_KEYS:
+        entries = raw.get(key)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            item = _domain_signal_entry(key, entry)
+            if item is not None and item not in signals[key] and len(signals[key]) < _DOMAIN_ENTRY_LIMIT:
+                signals[key].append(item)
+    return signals
+
+
 def _normalize_planned_write(
     raw_item: dict[str, Any],
     default_doc_prefix: str,
@@ -328,6 +398,12 @@ def _normalize_planned_write(
         if pw.action in {"delete", "overwrite_core"}:
             pw.requires_approval = True
             pw.approval_reason = pw.approval_reason or "涉及高风险文档修改，需人工确认"
+        page_type = str((pw.wiki_route or {}).get("page_type") or "").strip().lower() if isinstance(pw.wiki_route, dict) else ""
+        if page_type == SENSITIVE_CONFIG_PAGE_TYPE and not pw.requires_approval:
+            # The project configuration page is a sensitive write whatever the action: it is
+            # flagged here, so the approval preview already says so before the Wiki gate routes it.
+            pw.requires_approval = True
+            pw.approval_reason = pw.approval_reason or "项目配置页属于敏感写入，需人工确认后才会落盘"
     return pw
 
 
