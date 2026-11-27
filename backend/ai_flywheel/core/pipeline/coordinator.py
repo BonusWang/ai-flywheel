@@ -78,6 +78,7 @@ from ai_flywheel.core.queue_service import (
 from ai_flywheel.models import (
     CreateRuleRequest,
     DistillQueueItem,
+    INCIDENT_PAGE_TYPE,
     NodeExecution,
     NodeStatus,
     PlannedWrite,
@@ -382,6 +383,24 @@ class WorkflowOrchestrator(RecoveryMixin):
         current = self._distill_modes(session_keys)
         return [key for key, mode in current.items() if mode in modes]
 
+    @staticmethod
+    def _reviewed_session(sess: SessionRecord, item: DistillQueueItem) -> SessionRecord:
+        """The session as P02 reviews it: carrying the structured brief its queue item holds.
+
+        A client may submit a structured brief with a session: the tables, configuration,
+        root causes and decisions it made sure of. The queue keeps it on the first chunk
+        of the item. It is attached here to the session record the review reads, so the
+        reviewer puts it on top of the dialogue and carries it whole, whatever became of
+        the text (its size, a compaction, a caller that trims it). Nothing is persisted:
+        the copy lives as long as the batch, and a record that already carries a brief
+        is returned as it is.
+        """
+        payload = item.payload if isinstance(item.payload, dict) else {}
+        brief = payload.get("structured_brief") if item.chunk_index <= 1 else None
+        if not brief or not isinstance(sess.metadata, dict) or sess.metadata.get("structured_brief"):
+            return sess
+        return sess.model_copy(update={"metadata": {**sess.metadata, "structured_brief": brief}})
+
     def _record_partial_writes(
         self,
         run: WorkflowRunRecord,
@@ -567,7 +586,7 @@ class WorkflowOrchestrator(RecoveryMixin):
                         continue
                     used_chars += len(text)
                     self.db.update_session_status(sess.session_key, SessionStatus.IN_PROGRESS)
-                    admitted.append((sess, text))
+                    admitted.append((self._reviewed_session(sess, item), text))
                     claimed_queue_ids.append(item.queue_id)
             elif session_keys:
                 # Explicit session_keys keep the historical admission path; any queued
@@ -579,11 +598,19 @@ class WorkflowOrchestrator(RecoveryMixin):
                     used_chars += len(text)
                     admitted.append((sess, text))
                     self.db.update_session_status(sess.session_key, SessionStatus.IN_PROGRESS)
+                    claimed_here: list[DistillQueueItem] = []
                     for item in self.db.list_session_queue_items(
                         sess.session_key, statuses=[QueueStatus.QUEUED]
                     ):
                         if self._claim_queue_item(item, run) is not None:
                             claimed_queue_ids.append(item.queue_id)
+                            claimed_here.append(item)
+                    for item in claimed_here:
+                        reviewed = self._reviewed_session(sess, item)
+                        if reviewed is not sess:
+                            # The brief of the item's first chunk is reviewed with its session.
+                            admitted[-1] = (reviewed, text)
+                            break
             else:
                 # A normal batch claims the prioritized backlog of `distill_queue`.
                 for item in self.db.list_queued_items_prioritized(limit=max_sess):
@@ -599,7 +626,7 @@ class WorkflowOrchestrator(RecoveryMixin):
                         continue
                     used_chars += len(text)
                     self.db.update_session_status(sess.session_key, SessionStatus.IN_PROGRESS)
-                    admitted.append((sess, text))
+                    admitted.append((self._reviewed_session(sess, item), text))
                     claimed_queue_ids.append(item.queue_id)
                 if not admitted:
                     # A database seeded without queue rows still runs: the P00 bridge
@@ -700,6 +727,12 @@ class WorkflowOrchestrator(RecoveryMixin):
             review_findings["governance_only_session_keys"] = self._declared_keys(
                 run.admitted_sessions, frozenset({DISTILL_MODE_GOVERNANCE_ONLY})
             )
+            # What the review found that stands on its own (a delivery, an incident, a decision,
+            # a domain fact). A runner that reports none, or a shape that is not a list, means none.
+            review_events = [
+                event for event in (review_findings.get("events") or []) if isinstance(event, dict)
+            ] if isinstance(review_findings.get("events"), list) else []
+            review_findings["events"] = review_events
 
             wf_candidates = len(review_findings.get("repeated_workflows", []))
             logger.info(
@@ -731,7 +764,7 @@ class WorkflowOrchestrator(RecoveryMixin):
                             "written": False,
                         },
                     },
-                    {"name": "重复流程与 Skill 线索扫描", "status": "PASS", "detail": {"candidates": wf_candidates}},
+                    {"name": "重复流程与 Skill 线索扫描", "status": "PASS", "detail": {"candidates": wf_candidates, "events": len(review_events)}},
                     {"name": "问题线索关联", "status": "PASS", "detail": {"open_retros": len(open_retros)}},
                 ],
                 payload={
@@ -753,6 +786,11 @@ class WorkflowOrchestrator(RecoveryMixin):
                 self.cfg.workflow.max_writes_per_run,
                 self.cfg.knowledge_sink.max_write_set,
             )
+            # The planner's item cap (`max_ws`) counts the items that are not project-domain pages;
+            # domain pages are counted under a cap of their own. The physical paths a batch writes
+            # — a document and the index entries it needs — are bounded by the sink alone, whoever
+            # planned them: the bound holds on the merged plan.
+            max_physical_paths = max(1, int(self.cfg.knowledge_sink.max_write_set))
             default_prefix = (
                 self.cfg.knowledge_sink.allowed_write_prefixes[0]
                 if self.cfg.knowledge_sink.allowed_write_prefixes
@@ -899,14 +937,14 @@ class WorkflowOrchestrator(RecoveryMixin):
                     candidate_paths = {new_rel}
                     if side_effect and side_effect.get("status") == "update":
                         candidate_paths.add(str(side_effect["target_path"]))
-                    if len(knowledge_write_paths | candidate_paths) > max_ws:
+                    if len(knowledge_write_paths | candidate_paths) > max_physical_paths:
                         index_capacity_drops.append(
                             {
                                 "title": w.title,
                                 "relative_path": new_rel,
                                 "reason": "WRITE_SET_TOTAL_LIMIT",
                                 "planned_paths": sorted(candidate_paths),
-                                "limit": max_ws,
+                                "limit": max_physical_paths,
                             }
                         )
                         continue
@@ -941,9 +979,9 @@ class WorkflowOrchestrator(RecoveryMixin):
                     actor="wiki_gate",
                     summary=(
                         f"{len(index_capacity_drops)} 篇笔记连同项目索引超过单批 "
-                        f"{max_ws} 个物理写入路径，未列入计划"
+                        f"{max_physical_paths} 个物理写入路径，未列入计划"
                     ),
-                    payload={"dropped": index_capacity_drops, "limit": max_ws},
+                    payload={"dropped": index_capacity_drops, "limit": max_physical_paths},
                 )
             if plan_info.deferred_skill_candidates:
                 self.db.append_audit_event(
@@ -966,7 +1004,11 @@ class WorkflowOrchestrator(RecoveryMixin):
                     actor="wiki_gate",
                     summary=(
                         f"{len(routed_docs)} 篇笔记已确定归属："
-                        + "；".join(f"{doc['title']} → {doc['route']['project']}" for doc in routed_docs[:6])
+                        + "；".join(
+                            # An incident card belongs to no project: its page type says where it went.
+                            f"{doc['title']} → {doc['route']['project'] or doc['route']['page_type']}"
+                            for doc in routed_docs[:6]
+                        )
                     ),
                     payload={"routed_docs": routed_docs},
                 )
@@ -1000,6 +1042,10 @@ class WorkflowOrchestrator(RecoveryMixin):
                 if domain_docs
                 else ""
             )
+            incident_docs = [doc for doc in routed_docs if doc["route"].get("page_type") == INCIDENT_PAGE_TYPE]
+            incident_note = (
+                f"；其中 {len(incident_docs)} 项为事故卡（敏感写入，待人工审批）" if incident_docs else ""
+            )
             invalid_items = len(plan_info.dropped_items) - plan_info.over_limit_count
             dropped_note = ""
             if plan_info.dropped_items:
@@ -1023,7 +1069,7 @@ class WorkflowOrchestrator(RecoveryMixin):
                     f"计划来源：{PLAN_SOURCE_LABELS.get(plan_info.source, plan_info.source)}；"
                     f"查重比对 {len(existing_rules)} 条规则与 {len(existing_skills)} 个技能，"
                     f"整理出 {len(planned_writes)} 项建议（含 {skill_plans} 项 Skill 封装/优化）"
-                    f"{dropped_note}{unrouted_note}{capacity_note}{domain_note}{deferred_note}{governance_note}"
+                    f"{dropped_note}{unrouted_note}{capacity_note}{domain_note}{incident_note}{deferred_note}{governance_note}"
                 ),
                 internal_checks=[
                     {"name": "规则与技能查重", "status": "PASS"},
@@ -1035,7 +1081,7 @@ class WorkflowOrchestrator(RecoveryMixin):
                             "planned": len(planned_writes),
                             "physical_knowledge_paths": len(knowledge_write_paths),
                             "index_capacity_dropped": len(index_capacity_drops),
-                            "limit": max_ws,
+                            "limit": max_physical_paths,
                         },
                     },
                     {
@@ -1074,6 +1120,7 @@ class WorkflowOrchestrator(RecoveryMixin):
                                     "evidence": sum(1 for d in routed_docs if d["route"]["source"] == ROUTE_EVIDENCE),
                                     "unrouted": len(unrouted_docs),
                                     **({"domain_pages": len(domain_docs)} if domain_docs else {}),
+                                    **({"incident_cards": len(incident_docs)} if incident_docs else {}),
                                 },
                             }
                         ]

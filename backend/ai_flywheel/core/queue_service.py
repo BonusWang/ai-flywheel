@@ -32,7 +32,10 @@ from ai_flywheel.core.triage import (
     derive_readable_title,
     extract_jsonl_metadata,
     has_explicit_opt_out,
+    is_antigravity_client,
     map_triage_reason_code,
+    scan_quiet_window_seconds,
+    transcript_is_active,
     triage_session,
 )
 from ai_flywheel.models import (
@@ -113,6 +116,11 @@ HAND_DISTILLED_META_KEYS = (
     "hand_distilled_skip",
     "hand_distilled_at",
 )
+
+#: Why a passive pass archived nothing: the transcript was still being written. Antigravity
+#: has no archive directory, so its transcripts are left alone until they have gone quiet.
+#: The pass answers ``skipped`` with this code and touches neither session nor queue.
+QUIET_WINDOW_ACTIVE = "QUIET_WINDOW_ACTIVE"
 
 
 def _shanghai_now_iso() -> str:
@@ -532,6 +540,19 @@ class DistillQueueService:
     @property
     def max_retries(self) -> int:
         return max(0, int(self.cfg.sessions.queue_max_retries))
+
+    def _transcript_is_being_written(
+        self, path: Path | None, client: str, *, now_ts: float | None
+    ) -> bool:
+        """Whether ``path`` is an Antigravity transcript written too recently to archive.
+
+        Only the Antigravity client has no archive event to wait for; for every other
+        client this is always ``False``, and so it is when the quiet window is off.
+        """
+        if path is None or not is_antigravity_client(client):
+            return False
+        quiet_seconds = scan_quiet_window_seconds(self.cfg)
+        return transcript_is_active(_safe_mtime(path), quiet_seconds=quiet_seconds, now_ts=now_ts)
 
     def _notify(
         self,
@@ -1273,14 +1294,26 @@ class DistillQueueService:
         source_path: str | None = None,
         parent_session_key: str = "",
         is_subagent: bool = False,
+        now_ts: float | None = None,
     ) -> dict[str, Any]:
-        """An archived conversation: opt-out veto, delta check, triage, then queue."""
+        """An archived conversation: opt-out veto, delta check, triage, then queue.
+
+        ``now_ts`` is the clock the Antigravity quiet window is measured against (epoch
+        seconds; the wall clock when omitted).
+
+        A transcript that is still being written is not an archived conversation. Antigravity
+        has no archive directory — its transcript is simply a file that keeps growing — so one
+        inside the quiet window (``sessions.scan_quiet_window_seconds``) answers ``skipped``
+        with ``QUIET_WINDOW_ACTIVE`` before anything about the session or its queue history
+        is touched; a later pass archives it once it has gone quiet. An explicit enqueue is a
+        person's decision and is never held back (see ``on_explicit_enqueue``).
+        """
         client_name = (client or "generic").strip() or "generic"
         sid = (session_id or "").strip()
         t_path = Path(transcript_path) if transcript_path else (Path(source_path) if source_path else None)
         meta: dict[str, Any] = {}
         if t_path and t_path.exists() and t_path.suffix.lower() == ".jsonl":
-            meta = extract_jsonl_metadata(t_path)
+            meta = extract_jsonl_metadata(t_path, client=client_name)
             canonical_id = meta.get("canonical_session_id")
             if canonical_id:
                 sid = canonical_id
@@ -1298,6 +1331,16 @@ class DistillQueueService:
 
         if not sid:
             return {"action": "skipped", "reason_code": "MISSING_SESSION_ID", "items": []}
+
+        # Gate 0: a transcript still being written is only half a conversation.
+        if self._transcript_is_being_written(t_path, client_name, now_ts=now_ts):
+            logger.info(
+                "queue: transcript still being written, left for a later pass: %s:%s",
+                client_name,
+                sid,
+            )
+            return {"action": "skipped", "reason_code": QUIET_WINDOW_ACTIVE, "items": []}
+
         skey = f"{client_name}:{sid}"
         existing = self.db.get_session(skey)
         resolved_title = derive_readable_title(
@@ -1814,7 +1857,7 @@ class DistillQueueService:
 
             meta: dict[str, Any] = {}
             if source_file and source_file.suffix.lower() == ".jsonl":
-                meta = extract_jsonl_metadata(source_file)
+                meta = extract_jsonl_metadata(source_file, client=item.client)
 
             canonical_id = meta.get("canonical_session_id")
             if not canonical_id and item.client == "codex":
@@ -2005,7 +2048,9 @@ class DistillQueueService:
         """Sync the configured Codex archive sources with the queue inventory.
 
         A file that appears (or grows) is archived in; a still-queued item whose
-        archived file was removed is withdrawn automatically.
+        archived file was removed is withdrawn automatically. A transcript still being
+        written (an Antigravity one inside its quiet window) is counted under
+        ``skipped_active`` and left for a later pass.
         """
         report: dict[str, Any] = {
             "sources": [],
@@ -2014,6 +2059,7 @@ class DistillQueueService:
             "excluded": 0,
             "unchanged": 0,
             "withdrawn": 0,
+            "skipped_active": 0,
             "errors": [],
         }
         sources = self.cfg.sessions.codex_archive_sources
@@ -2030,6 +2076,7 @@ class DistillQueueService:
                 "excluded": 0,
                 "unchanged": 0,
                 "withdrawn": 0,
+                "skipped_active": 0,
             }
             if not root.exists():
                 report["errors"].append(f"archive_source_missing:{src_client}:{src_path}")
@@ -2040,7 +2087,7 @@ class DistillQueueService:
             for path in files[:MAX_ARCHIVE_FILES_PER_SOURCE]:
                 source_report["scanned"] += 1
                 try:
-                    meta = extract_jsonl_metadata(path)
+                    meta = extract_jsonl_metadata(path, client=src_client)
                     canonical_id = meta.get("canonical_session_id") or path.stem
                     ws = meta.get("workspace") or ""
                     title = derive_readable_title(
@@ -2076,6 +2123,9 @@ class DistillQueueService:
                     source_report["enqueued"] += 1
                 elif action == "excluded":
                     source_report["excluded"] += 1
+                elif result.get("reason_code") == QUIET_WINDOW_ACTIVE:
+                    # Not "unchanged": the file was never read this pass.
+                    source_report["skipped_active"] += 1
                 else:
                     source_report["unchanged"] += 1
 
@@ -2100,7 +2150,7 @@ class DistillQueueService:
                 )
                 source_report["withdrawn"] += len(removed)
 
-            for key in ("scanned", "enqueued", "excluded", "unchanged", "withdrawn"):
+            for key in ("scanned", "enqueued", "excluded", "unchanged", "withdrawn", "skipped_active"):
                 report[key] += source_report[key]
             report["sources"].append(source_report)
         return report

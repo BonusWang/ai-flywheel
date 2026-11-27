@@ -387,6 +387,16 @@ SENSITIVE_ACTIONS = frozenset({"delete", "overwrite_core"})
 SENSITIVE_CONFIG_PAGE_TYPE = "project-config"
 PRIVATE_SENSITIVITY = "private_sensitive"
 
+# The page type of a Wiki's incident ledger, and the name fragment of the directory a ledger
+# is kept under. An incident page records what went wrong and why: it is a sensitive write
+# whatever the batch size, so the `smart` approval gate holds it for a human as it holds a
+# configuration page.
+INCIDENT_PAGE_TYPE = "incident"
+INCIDENT_DIRECTORY_MARKER = "ai-incidents"
+# The reason every surface states for holding an incident page: the plan when it is
+# normalised, the route when the contract recognises the page, the approval gate.
+INCIDENT_APPROVAL_REASON = "事故卡属于敏感写入，需人工确认后才会落盘"
+
 # The leading frontmatter block of a draft, and the two lines in it that mark a private page.
 _DRAFT_FRONTMATTER_RE = re.compile(r"\A(?:\ufeff)?---[ \t]*\r?\n(.*?)\r?\n?---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
 _SENSITIVITY_LINE_RE = re.compile(r"^\s*sensitivity:\s*[\"']?([A-Za-z0-9_-]+)", re.MULTILINE)
@@ -411,6 +421,59 @@ def declares_private_page(content_preview: str | None) -> bool:
     )
 
 
+def _write_fields(write: "PlannedWrite | dict[str, Any]") -> dict[str, Any] | None:
+    """What the sensitivity predicates read off a planned write, in one shape for both inputs.
+
+    ``None`` for anything that is neither a :class:`PlannedWrite` nor a dict.
+    ``page_type`` is the item's own top-level declaration, which only a dict can carry.
+    """
+    if isinstance(write, PlannedWrite):
+        return {
+            "target_kind": write.target_kind,
+            "requires_approval": bool(write.requires_approval),
+            "action": write.action,
+            "wiki_route": write.wiki_route,
+            "content_preview": write.content_preview,
+            "relative_path": write.relative_path,
+            "page_type": None,
+        }
+    if isinstance(write, dict):
+        return {
+            "target_kind": write.get("target_kind"),
+            "requires_approval": bool(write.get("requires_approval")),
+            "action": write.get("action"),
+            "wiki_route": write.get("wiki_route"),
+            "content_preview": write.get("content_preview"),
+            "relative_path": write.get("relative_path"),
+            "page_type": write.get("page_type"),
+        }
+    return None
+
+
+def _is_incident(fields: dict[str, Any]) -> bool:
+    route = fields["wiki_route"]
+    route_type = str(route.get("page_type") or "").strip().lower() if isinstance(route, dict) else ""
+    own_type = str(fields["page_type"] or "").strip().lower()
+    path = str(fields["relative_path"] or "").replace("\\", "/").lower()
+    return (
+        route_type == INCIDENT_PAGE_TYPE
+        or own_type == INCIDENT_PAGE_TYPE
+        or INCIDENT_DIRECTORY_MARKER in path
+    )
+
+
+def is_incident_write(write: "PlannedWrite | dict[str, Any]") -> bool:
+    """Whether a planned write is a page of a Wiki's incident ledger.
+
+    Any one of three grounds is enough: the routing declaration names the incident
+    page type, the item's own payload names it, or the target path lies in an incident
+    directory. The last two hold even when no Wiki gate routed the item, so a page that
+    reaches the ledger by another road is still recognised.
+    """
+    fields = _write_fields(write)
+    return fields is not None and _is_incident(fields)
+
+
 def is_sensitive_write(write: "PlannedWrite | dict[str, Any]") -> bool:
     """The one canonical sensitivity predicate for a planned write.
 
@@ -421,29 +484,27 @@ def is_sensitive_write(write: "PlannedWrite | dict[str, Any]") -> bool:
     Accepts both a :class:`PlannedWrite` and the plain dict the Feishu card
     renders, so both sides of the boundary share one implementation.
 
-    A knowledge document is sensitive when it is declared as the project
-    configuration page, or when its draft declares itself a private page. A write
-    the pipeline recognised as one through the mounted Wiki's contract carries
-    ``requires_approval`` and is covered by that flag.
+    A knowledge document is sensitive when it is a page of a Wiki's incident
+    ledger, when it is declared as the project configuration page, or when its
+    draft declares itself a private page. A write the pipeline recognised as one
+    through the mounted Wiki's contract carries ``requires_approval`` and is
+    covered by that flag.
     """
-    if isinstance(write, PlannedWrite):
-        target_kind = write.target_kind
-        requires_approval = bool(write.requires_approval)
-        action = write.action
-        wiki_route = write.wiki_route
-        content_preview = write.content_preview
-    elif isinstance(write, dict):
-        target_kind = write.get("target_kind")
-        requires_approval = bool(write.get("requires_approval"))
-        action = write.get("action")
-        wiki_route = write.get("wiki_route")
-        content_preview = write.get("content_preview")
-    else:  # pragma: no cover - defensive: an unknown shape is never "routine"
+    fields = _write_fields(write)
+    if fields is None:  # defensive: an unknown shape is never "routine"
         return True
-    if target_kind == "skill_improvement" or requires_approval or action in SENSITIVE_ACTIONS:
+    target_kind = fields["target_kind"]
+    if (
+        target_kind == "skill_improvement"
+        or fields["requires_approval"]
+        or fields["action"] in SENSITIVE_ACTIONS
+        or _is_incident(fields)
+    ):
         return True
     if target_kind != "knowledge_doc":
         return False
+    wiki_route = fields["wiki_route"]
+    content_preview = fields["content_preview"]
     page_type = str(wiki_route.get("page_type") or "").strip().lower() if isinstance(wiki_route, dict) else ""
     return page_type == SENSITIVE_CONFIG_PAGE_TYPE or declares_private_page(
         content_preview if isinstance(content_preview, str) else ""

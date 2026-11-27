@@ -84,6 +84,12 @@ class SessionsConfig(BaseModel):
     queue_max_item_chars: int = 24000
     queue_max_retries: int = 3
     codex_archive_sync_interval_seconds: int = 60
+    # How long an Antigravity transcript must have gone unchanged before a
+    # passive scan reads it, in seconds (900 = 15 minutes). Antigravity keeps no
+    # archive directory that marks a finished conversation, so a transcript that
+    # still changes in place is an ongoing one: the scan leaves it out of the
+    # pass and picks it up once it has gone quiet. 0 switches the window off.
+    scan_quiet_window_seconds: int = Field(default=900, ge=0)
 
 
 class KnowledgeSinkConfig(BaseModel):
@@ -151,6 +157,14 @@ class WorkflowConfig(BaseModel):
     approval_mode: str = "always"  # smart | always | auto
     high_write_count_threshold: int = 6
     max_writes_per_run: int = 8
+    # Project-domain increment pages (the table / configuration / architecture /
+    # algorithm pages the mounted Wiki's `deposit_routing` names) are counted
+    # apart from every other write item, under this cap: an investigation that
+    # touches several tables must not crowd the main experience card or a rule
+    # out of the plan. 0 plans no domain page. Whatever the two caps allow, the
+    # batch as a whole still ends at `knowledge_sink.max_write_set` physical
+    # paths, and the high-write approval threshold counts the final items.
+    max_domain_writes_per_run: int = Field(default=8, ge=0, le=32)
     auto_approve_writes: bool = False
     max_sessions_per_run: int = 10
     max_chars_per_run: int = 180000
@@ -187,6 +201,20 @@ class ApiRunnerConfig(BaseModel):
     # How many times a timed-out or refused connection is retried at once (no backoff).
     # 0 disables the retry; 1 means one extra attempt after the first one.
     transport_retries: int = 1
+    # How much of one session's text the P02 review prompt may carry, in
+    # characters (default 16000, range 2000..64000). A session longer than this
+    # keeps its head and its tail around one explicit omission marker; a session
+    # within the budget is carried whole, so a root cause in the middle of a long
+    # investigation reaches the reviewer.
+    p02_session_char_limit: int = Field(default=16000, ge=2000, le=64000)
+    # Per-stage model layering. Each key falls back to `model` / `reasoning_effort`
+    # when empty, so a configuration written before these keys existed keeps its
+    # meaning. The effective pair of a stage enters the api_cache key: switching
+    # a stage to another model never reuses the reply the old one produced.
+    review_model: str = ""
+    review_reasoning_effort: str = ""
+    plan_model: str = ""
+    plan_reasoning_effort: str = ""
 
 
 class RunnerConfig(BaseModel):

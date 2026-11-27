@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Any, Callable
 
@@ -26,10 +27,15 @@ from ai_flywheel.adapters.wiki.schema import (
     normalize_relative_path,
     split_frontmatter,
 )
+from ai_flywheel.adapters.wiki.t5_adapter import INCIDENT_SECTIONS, build_incident_card
 from ai_flywheel.config import KnowledgeSinkConfig
 from ai_flywheel.core.privacy import find_secret_shape
 from ai_flywheel.core.time_utils import shanghai_today_ymd
-from ai_flywheel.models import declares_private_page
+from ai_flywheel.models import (
+    INCIDENT_DIRECTORY_MARKER,
+    INCIDENT_PAGE_TYPE,
+    declares_private_page,
+)
 
 # Who decided the page type and the project of a knowledge document.
 ROUTE_DECLARED = "declared"  # the planner declared them; evidence only validated the declaration
@@ -61,6 +67,13 @@ UNROUTED_REASON_TEXT = {
     "increment_invalid": "增量内容无法无损并入目标页",
     "domain_page_invalid": "按模板生成的领域页未通过挂载 Wiki 的写前门禁",
     "secret_leak_blocked": "增量内容命中密码、Token 或私钥明文形态，密钥门禁阻断",
+    # A page of the Wiki's incident ledger. The ledger is closed until the sink is allowed
+    # to write into it, and a card enters it by a declaration alone.
+    "incident_prefix_not_allowed": "事故台账目录未在 knowledge_sink.allowed_write_prefixes 中放行",
+    "incident_path_mismatch": "目标路径不在挂载 Wiki 声明的事故台账目录内",
+    "incident_file_name_invalid": "事故卡文件名须为 <YYYY-MM-DD>-<名称>.md（可带序号前缀）且日期不晚于今天",
+    "incident_card_invalid": "按标准章节框架整理的事故卡未通过挂载 Wiki 的写前门禁",
+    "incident_target_exists": "事故卡只支持新建，目标页面已存在",
 }
 # Short label of every reason code, for node and audit summaries.
 UNROUTED_REASON_LABEL = {
@@ -83,6 +96,11 @@ UNROUTED_REASON_LABEL = {
     "increment_invalid": "增量格式不符",
     "domain_page_invalid": "领域页未过门禁",
     "secret_leak_blocked": "密钥门禁阻断",
+    "incident_prefix_not_allowed": "事故前缀未放行",
+    "incident_path_mismatch": "事故卡路径不符",
+    "incident_file_name_invalid": "事故卡文件名不符",
+    "incident_card_invalid": "事故卡未过门禁",
+    "incident_target_exists": "事故卡目标已存在",
 }
 # How many existing page names per domain a candidate project carries into the planning prompt.
 DOMAIN_INVENTORY_LIMIT = 100
@@ -115,9 +133,131 @@ _GENERIC_PROJECT_WORDS = {
 }
 _LEADING_ASCII_RE = re.compile(r"[A-Za-z0-9]+")
 
+# The name of a page of the incident ledger: the day, a slug, and a sequence number the
+# Wiki may put in front of the day.
+INCIDENT_FILE_NAME_RE = re.compile(r"^(?:(\d{1,4})-)?(\d{4}-\d{2}-\d{2})-([^/\\]+)\.md$")
+# The first character of a `path_pattern` that stops a run of plain letters.
+_PATTERN_METACHARS_RE = re.compile(r"[\\.()\[\]{}*+?|^$]")
+
 
 def _mapping(raw: Any) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
+
+
+def _plain_directory(name: str) -> bool:
+    """Whether ``name`` is a plain directory path: real segments, none of them excluded."""
+    segments = [segment for segment in name.split("/") if segment]
+    return bool(segments) and all(
+        segment not in {".", ".."} and segment == segment.strip()
+        and segment not in FORBIDDEN_PATH_SEGMENTS
+        and not segment.startswith("archive-")
+        for segment in segments
+    )
+
+
+def write_prefix_allows(directory: str, prefixes: list[str]) -> bool:
+    """Whether ``knowledge_sink.allowed_write_prefixes`` lets the sink write into ``directory``.
+
+    The writer's own rule: a path may be written when it starts with one of the prefixes,
+    so a directory may be written into when the pages under it would pass. An empty list
+    restrains nothing, and therefore opens nothing by name: for a directory that is closed
+    until it is opened explicitly, that is not enough.
+    """
+    allowed = [str(prefix).replace("\\", "/").lstrip("/") for prefix in (prefixes or [])]
+    target = f"{str(directory).strip('/')}/"
+    return bool(allowed) and any(target.startswith(prefix) for prefix in allowed)
+
+
+def _literal_directory(path_pattern: Any) -> str:
+    """The directory a ``path_pattern`` names in plain letters ahead of its first wildcard.
+
+    ``^ai-incidents/[^/]+\\.md$`` names ``ai-incidents``, and so does
+    ``^ai-incidents/INC-[^/]+\\.md$``: a page's own name may begin in plain letters, and the
+    directory is what stands before it. A pattern whose plain part holds no slash names none.
+    """
+    plain = _PATTERN_METACHARS_RE.split(str(path_pattern or "").lstrip("^"), maxsplit=1)[0]
+    directory = plain[: plain.rfind("/")] if "/" in plain else ""
+    return directory if _plain_directory(directory) else ""
+
+
+@dataclass
+class IncidentRouting:
+    """The Wiki's incident ledger as its contract declares it, resolved for routing and planning.
+
+    Read off ``content_contract.page_types.incident`` and the partition it names: the
+    directory the ledger is kept under, and what the contract requires of such a page.
+    Nothing here is hardcoded: a Wiki that keeps its ledger elsewhere gets that directory.
+
+    ``writable`` records whether ``knowledge_sink.allowed_write_prefixes`` lets the sink
+    write into the ledger. It is the second of two locks: the contract declares the page
+    type, the configuration opens the directory, and only both together offer the ledger.
+    """
+
+    directory: str
+    required_fields: list[str] = field(default_factory=list)
+    allowed_status: list[str] = field(default_factory=list)
+    load_policy: str = ""
+    writable: bool = False
+
+    @classmethod
+    def from_schema(
+        cls, schema: dict[str, Any], sink: KnowledgeSinkConfig | None = None
+    ) -> IncidentRouting | None:
+        """The ledger a contract declares, or None when it declares none that can be located.
+
+        The directory is the one the page type's ``path_pattern`` names in plain letters;
+        else the partition sub-directory whose name starts with the incident marker, among
+        the sub-directories the partition declares; else the partition root itself. A
+        partition that declares sub-directories and none of that name locates no ledger.
+        """
+        content = _mapping(schema.get("content_contract"))
+        type_cfg = _mapping(_mapping(content.get("page_types")).get(INCIDENT_PAGE_TYPE))
+        if not type_cfg:
+            return None
+        partition_id = str(type_cfg.get("partition") or "")
+        partition = _mapping(_mapping(_mapping(schema.get("partition_contract")).get("partitions")).get(partition_id))
+        root = str(partition.get("root") or "").replace("\\", "/").strip("/")
+        if not root:
+            return None
+        subdirs = [
+            name
+            for name in (
+                str(raw).replace("\\", "/").strip("/") for raw in (partition.get("allowed_subdirectories") or []) if isinstance(raw, str)
+            )
+            if name
+        ]
+        literal = _literal_directory(type_cfg.get("path_pattern"))
+        if literal:
+            directory = f"{root}/{literal}"
+        elif not subdirs:
+            directory = root
+        else:
+            named = next(
+                (name for name in subdirs if name.split("/")[0].lower().startswith(INCIDENT_DIRECTORY_MARKER) and _plain_directory(name)),
+                "",
+            )
+            if not named:
+                return None
+            directory = f"{root}/{named}"
+        core = [str(name) for name in (_mapping(schema.get("core_contract")).get("required_fields") or [])]
+        own = [str(name) for name in (type_cfg.get("required_fields") or [])]
+        ledger = cls(
+            directory=directory,
+            required_fields=list(dict.fromkeys([*core, *own])),
+            allowed_status=[str(value) for value in (type_cfg.get("allowed_status") or [])],
+            load_policy=str(type_cfg.get("load_policy") or "").strip(),
+        )
+        ledger.writable = sink is not None and write_prefix_allows(directory, sink.allowed_write_prefixes)
+        return ledger
+
+    def to_dict(self) -> dict[str, Any]:
+        """The form the planning prompt carries."""
+        return {
+            "page_type": INCIDENT_PAGE_TYPE,
+            "directory": f"{self.directory}/",
+            "file_name": "<YYYY-MM-DD>-<slug>.md",
+            "sections": list(INCIDENT_SECTIONS),
+        }
 
 
 @dataclass
@@ -216,21 +356,34 @@ class RoutingCandidates:
     evidence_page_types: list[str] = field(default_factory=list)
     # The Wiki's declared project-domain deposit routing; None when the contract declares none.
     deposit_routing: DepositRouting | None = None
+    # The Wiki's incident ledger; None when the contract declares no incident page type it
+    # can locate. It is offered only while `writable` says the sink may write into it.
+    incident: IncidentRouting | None = None
+
+    @property
+    def incident_offered(self) -> bool:
+        """Whether the planner may plan an incident card: the contract declares the ledger
+        and the sink's write prefixes open it. Closed by default."""
+        return self.incident is not None and self.incident.writable
 
     @property
     def routable(self) -> bool:
-        return bool(self.page_types and self.projects)
+        return bool(self.page_types and self.projects) or self.incident_offered
 
     @property
     def fallback_page_types(self) -> list[str]:
-        """What the evidence fallback may choose: the evidence page types, else every page type."""
-        return list(self.evidence_page_types or self.page_types)
+        """What the evidence fallback may choose: the evidence page types, else every page type.
+
+        An incident page is never among them: the ledger is reached by a declaration alone.
+        """
+        types = self.evidence_page_types or self.page_types
+        return [page_type for page_type in types if page_type != INCIDENT_PAGE_TYPE]
 
     def to_dict(self, *, description_limit: int = 0) -> dict[str, Any]:
         """Serialisable form; ``description_limit`` caps each project description (0 keeps it whole).
 
-        The deposit routing and each project's domain inventory appear only when the Wiki
-        declares the routing: a Wiki that does not keeps exactly the prompt it had.
+        The deposit routing, each project's domain inventory and the incident ledger appear
+        only when the Wiki declares them: a Wiki that does not keeps exactly the prompt it had.
         """
         payload: dict[str, Any] = {
             "page_types": list(self.page_types),
@@ -251,6 +404,8 @@ class RoutingCandidates:
             payload["projects"].append(entry)
         if self.deposit_routing is not None:
             payload["deposit_routing"] = self.deposit_routing.to_dict()
+        if self.incident is not None and self.incident_offered:
+            payload["incident_pages"] = self.incident.to_dict()
         return payload
 
 
@@ -272,7 +427,8 @@ class RouteDecision:
     passthrough: bool = False
     # A project-domain page (content_contract.deposit_routing): the domain it was routed to,
     # whether the write merges an increment into the existing page, and whether it is a sensitive
-    # write (the project's configuration page, or a page that declares itself private).
+    # write (the project's configuration page, or a page that declares itself private). An
+    # incident card is sensitive too, by the kind of page it is.
     domain: str = ""
     incremental: bool = False
     sensitive: bool = False
@@ -311,6 +467,9 @@ class RouteDecision:
                 relabel=self.relabel,
                 duplicates=self.duplicates,
             )
+        elif self.sensitive:
+            # Sensitive by the kind of page it is (an incident card), not by the domain it sits in.
+            payload["sensitive"] = self.sensitive
         return payload
 
 
@@ -600,7 +759,7 @@ def evaluate_route(
 
     ``action`` matters for a project-domain page only: there an ``update`` is merged into
     the page that exists and a ``create`` makes a new one, recording ``source_sessions``
-    as its provenance.
+    as its provenance. An incident card is always created, and records them the same way.
     """
     candidates = candidates if candidates is not None else context.candidates
     declared = _declared_route(wiki_route)
@@ -633,6 +792,29 @@ def evaluate_route(
         )
 
     check = context.validate_document(rel, content) if rel else None
+
+    # A page of the incident ledger is judged by its own rules, before any other: it belongs
+    # to no project, and no evidence may pick it. The branch is taken when the contract
+    # declares the ledger and the plan names it — by its declaration, or by the page type
+    # the draft itself states.
+    incident = candidates.incident
+    if incident is not None and (
+        (has_declaration and declared["page_type"] == INCIDENT_PAGE_TYPE)
+        or (not has_declaration and _frontmatter_field(content, "type").strip().lower() == INCIDENT_PAGE_TYPE)
+    ):
+        return _evaluate_incident_route(
+            context=context,
+            incident=incident,
+            declared=declared,
+            has_declaration=has_declaration,
+            rel=rel,
+            title=title,
+            summary=summary,
+            content=content,
+            action=action,
+            verdict=verdict,
+            source_sessions=source_sessions or [],
+        )
 
     # 0. A project-domain page follows the Wiki's deposit contract: the same project checks as a
     #    card, then the page's own (the domain's directory, an update merged, a create built).
@@ -700,6 +882,9 @@ def evaluate_route(
     if not has_declaration:
         if not allow_evidence_fallback:
             return verdict(False, code="declaration_missing")
+        if not candidates.fallback_page_types:
+            # Only the incident ledger is offered, and evidence never picks it.
+            return verdict(False, code="no_routable_target")
         chosen = select_practice_project(
             candidates.projects,
             haystack,
@@ -711,6 +896,14 @@ def evaluate_route(
         return verdict(True, source=ROUTE_EVIDENCE, page_type=candidates.fallback_page_types[0], project=chosen)
 
     # 4. A declaration is validated, never corrected.
+    if declared["page_type"] == INCIDENT_PAGE_TYPE:
+        # Reached only when the contract declares no ledger the engine can locate, so the
+        # planner was never offered this page type: say that, not that the plan declared no project.
+        return verdict(
+            False,
+            code="declaration_invalid",
+            detail=f"声明的页面类型 {INCIDENT_PAGE_TYPE} 不在可路由类型内（挂载 Wiki 未声明可定位的事故台账）",
+        )
     state, declared_project_match = declared_project(declared["project"], candidates.projects)
     if state == "none":
         return verdict(False, code="declared_none")
@@ -782,6 +975,139 @@ def _domain_template(domain: dict[str, Any], content: str) -> tuple[dict[str, An
     if kind:
         return None, f"草稿的 knowledge_kind「{kind}」不属于领域 {domain['domain']}（可为：{'、'.join(by_kind)}）"
     return None, f"领域 {domain['domain']} 有多个模板（{'、'.join(by_kind)}），草稿须声明 knowledge_kind"
+
+
+def _incident_file_name_problem(file_name: str, today: str) -> str:
+    """Why the file name of a ledger page is not a legal one, or '' when it is.
+
+    Legal is ``<YYYY-MM-DD>-<slug>.md``, with a sequence number and a dash allowed in front:
+    a real day no later than today, and a slug that names a page.
+    """
+    text = UNROUTED_REASON_TEXT["incident_file_name_invalid"]
+    match = INCIDENT_FILE_NAME_RE.fullmatch(file_name or "")
+    if not match:
+        return f"{text}：{file_name or '（空）'}"
+    try:
+        day = date.fromisoformat(match.group(2))
+    except ValueError:
+        return f"{text}：{file_name} 的日期不是真实日期"
+    if day > date.fromisoformat(today):
+        return f"{text}：{file_name} 的日期晚于今天"
+    slug = match.group(3).strip()
+    if not slug or slug.startswith(".") or slug.lower().startswith("archive-"):
+        return f"{text}：{file_name}"
+    return ""
+
+
+def _evaluate_incident_route(
+    *,
+    context: RouteContext,
+    incident: IncidentRouting,
+    declared: dict[str, str],
+    has_declaration: bool,
+    rel: str,
+    title: str,
+    summary: str,
+    content: str,
+    action: str,
+    verdict: Callable[..., RouteDecision],
+    source_sessions: list[str] | None = None,
+) -> RouteDecision:
+    """Route a page of the Wiki's incident ledger. Every check refuses; none of them corrects the plan.
+
+    The ledger is closed unless the sink is allowed to write into it, and a card enters it
+    by a declaration alone. The path the planner named is validated as it stands — inside
+    the ledger, named after a day, not already a page — and the card is then the draft's
+    own text under the standard section frame with the metadata the engine can know. It is
+    always a sensitive write: under the ``smart`` and ``always`` approval modes it waits for a
+    human like any other sensitive page, and whether ``auto`` does is the approval contract's.
+    """
+    candidates = context.candidates
+    ledger = incident.directory
+    # 1. The second lock: the sink's write prefixes must open the ledger. Read from the
+    #    configuration as it is now, not as it was when the candidates were discovered.
+    if not write_prefix_allows(ledger, context.sink.allowed_write_prefixes):
+        return verdict(
+            False,
+            code="incident_prefix_not_allowed",
+            detail=f"{UNROUTED_REASON_TEXT['incident_prefix_not_allowed']}：{ledger}/",
+        )
+    # 2. By declaration alone: no evidence ever picks the ledger.
+    if not has_declaration:
+        return verdict(
+            False,
+            code="declaration_missing",
+            detail=f"{UNROUTED_REASON_TEXT['declaration_missing']}：事故卡只能经路由声明进入台账",
+        )
+    # The project is optional on an incident card; a declared one is validated, never corrected.
+    state, project = declared_project(declared["project"], candidates.projects)
+    if state == "invalid":
+        return verdict(
+            False,
+            code="declaration_invalid",
+            detail=f"声明的项目 {declared['project'] or '（空）'} 不能唯一匹配候选项目",
+        )
+    if action != "create":
+        return verdict(
+            False, code="declaration_invalid", detail=f"事故卡只支持新建（create），计划动作为「{action or '空'}」"
+        )
+    draft_type = _frontmatter_field(content, "type")
+    if draft_type and draft_type != INCIDENT_PAGE_TYPE:
+        return verdict(
+            False,
+            code="declaration_invalid",
+            detail=f"声明的页面类型「{INCIDENT_PAGE_TYPE}」与草稿页面的类型「{draft_type}」不一致",
+        )
+
+    # 3. The path names one page directly inside the ledger.
+    parent, _, file_name = rel.rpartition("/")
+    if parent != ledger:
+        return verdict(
+            False,
+            code="incident_path_mismatch",
+            detail=f"{UNROUTED_REASON_TEXT['incident_path_mismatch']}：目标路径须为 "
+            f"{ledger}/<YYYY-MM-DD>-<名称>.md，实际为 {rel or '（空）'}",
+        )
+    today = shanghai_today_ymd()
+    problem = _incident_file_name_problem(file_name, today)
+    if problem:
+        return verdict(False, code="incident_file_name_invalid", detail=problem)
+    if context.read_document is not None and context.read_document(rel) is not None:
+        # An incident card is a record of one event: an existing one is never written over.
+        return verdict(False, code="incident_target_exists", detail=f"{UNROUTED_REASON_TEXT['incident_target_exists']}：{rel}")
+
+    # 4. The ledger is sensitive, so its pages are read by the strict privacy check.
+    shape = find_secret_shape(content, strict=True)
+    if shape:
+        return verdict(
+            False,
+            code="secret_leak_blocked",
+            detail=f"{SECRET_LEAK_BLOCKED}：事故卡草稿命中密码、Token 或私钥明文形态（{shape}），密钥门禁阻断",
+        )
+
+    # 5. The card, then the contract's own verdict on it.
+    page, problems = build_incident_card(
+        title=title,
+        summary=summary,
+        content=content,
+        required_fields=incident.required_fields,
+        allowed_status=incident.allowed_status,
+        load_policy=incident.load_policy,
+        today=today,
+        source_sessions=list(source_sessions or []),
+    )
+    gate_issues = [{"code": "INCIDENT_PAGE_BUILD", "message": note} for note in problems]
+    if not gate_issues:
+        gate = context.validate_document(rel, page)
+        gate_issues = list(gate.issues) if not gate.ok else []
+    if gate_issues:
+        placement = [issue for issue in gate_issues if issue.get("code") in _PLACEMENT_ISSUE_CODES]
+        code = "path_pattern_mismatch" if placement else "incident_card_invalid"
+        return verdict(False, code=code, detail=f"{UNROUTED_REASON_TEXT[code]}：{_issue_text(placement or gate_issues)}")
+    decision = verdict(True, source=ROUTE_DECLARED, page_type=INCIDENT_PAGE_TYPE, project=project)
+    decision.sensitive = True
+    decision.page = page
+    return decision
 
 
 def _evaluate_deposit_route(

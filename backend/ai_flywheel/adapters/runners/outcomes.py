@@ -27,7 +27,12 @@ from ai_flywheel.adapters.runners.contracts import (
     ReviewUnavailableError,
     _json_error_note,
 )
-from ai_flywheel.adapters.runners.normalizers import _item_brief, _normalize_plan_item, normalize_domain_signals
+from ai_flywheel.adapters.runners.normalizers import (
+    _item_brief,
+    _normalize_plan_item,
+    normalize_domain_signals,
+    normalize_review_events,
+)
 from ai_flywheel.adapters.wiki.router import RoutingCandidates
 from ai_flywheel.models import PlannedWrite
 
@@ -92,27 +97,51 @@ def _plan_from_items(
     cache_file_present: bool = False,
     reply_trace: dict[str, Any] | None = None,
     domain_page_types: frozenset[str] = frozenset(),
+    max_domain_writes: int | None = None,
+    total_write_set: int | None = None,
+    model: str = "",
 ) -> PlanOutcome:
     """Normalize every item a model or CLI returned. Raises `PlanUnavailableError` when none of them is usable.
 
     Within the batch cap the main experience card keeps its slot: the items of a project-domain
     page (``domain_page_types``, the page types the Wiki's deposit contract declares) are read
     after every other item, whatever order the reply used, so an item beyond the cap is theirs.
+
+    ``max_write_set`` caps the items that are not project-domain pages. When a Wiki's deposit
+    contract declares domain pages, the runner also names ``max_domain_writes`` (how many of
+    them this batch may plan, a quota of their own) and ``total_write_set`` (the ceiling over
+    both kinds together); without them one cap covers everything, as before. An item counts
+    against the quotas only once it is kept, so an invalid item never spends the slot of a
+    valid one behind it.
     """
     diagnostics = PlanDiagnostics(
         source=source,
         returned_count=len(raw_items),
         cache_file=cache_file if cache_file_present else None,
         cache_hit=cache_hit,
+        model=model,
     )
     _apply_reply_trace(diagnostics, reply_trace)
     planned: list[PlannedWrite] = []
+    split_quotas = max_domain_writes is not None and total_write_set is not None
+    domain_cap = max(0, int(max_domain_writes or 0))
+    total_cap = max(1, int(total_write_set or 0))
+    if split_quotas:
+        diagnostics.write_caps = {"other": max(0, int(max_write_set)), "domain": domain_cap, "total": total_cap}
+    kept_domain = 0
     reading_order = sorted(
         range(len(raw_items)), key=lambda index: _is_domain_page_item(raw_items[index], domain_page_types)
     )
     for index in reading_order:
         raw_item = raw_items[index]
-        if len(planned) >= max_write_set:
+        domain_item = _is_domain_page_item(raw_item, domain_page_types)
+        # A domain page is read after every other item, so by then `planned` holds the other items kept.
+        if split_quotas:
+            own_quota = kept_domain >= domain_cap if domain_item else len(planned) >= max_write_set
+            over_quota = len(planned) >= total_cap or own_quota
+        else:
+            over_quota = len(planned) >= max_write_set
+        if over_quota:
             # The quota counts the writes that were kept, not the items that were read:
             # an invalid item must not use up the slot of a valid one behind it.
             diagnostics.over_limit_count += 1
@@ -137,6 +166,7 @@ def _plan_from_items(
             )
             continue
         planned.append(pw)
+        kept_domain += 1 if domain_item else 0
         diagnostics.relabeled_skill_actions.extend(notes)
         if not pw.source_session_keys:
             diagnostics.missing_source_session_keys += 1
@@ -174,6 +204,9 @@ def _plan_from_runner_output(
     cache_file_present: bool = False,
     reply_trace: dict[str, Any] | None = None,
     domain_page_types: frozenset[str] = frozenset(),
+    max_domain_writes: int | None = None,
+    total_write_set: int | None = None,
+    model: str = "",
 ) -> PlanOutcome:
     """Turn a parsed model/CLI reply into a plan. Never substitutes the heuristic planner."""
     if not (isinstance(parsed, dict) and isinstance(parsed.get("planned_writes"), list)):
@@ -182,6 +215,7 @@ def _plan_from_runner_output(
             source=source,
             cache_file=cache_file if cache_file_present else None,
             cache_hit=cache_hit,
+            model=model,
         )
         _apply_reply_trace(diagnostics, reply_trace)
         raise PlanUnavailableError(
@@ -199,6 +233,9 @@ def _plan_from_runner_output(
         cache_file_present=cache_file_present,
         reply_trace=reply_trace,
         domain_page_types=domain_page_types,
+        max_domain_writes=max_domain_writes,
+        total_write_set=total_write_set,
+        model=model,
     )
 
 
@@ -282,6 +319,9 @@ def _review_from_runner_output(
     diagnostics = _diagnostics(None, finding_count=len(findings), usable=True)
     for key in ("mistakes", "dissents", "repeated_workflows"):
         parsed.setdefault(key, [])
+    # Optional in the review contract too: the things a session did that stand on their own
+    # (a delivery, an incident, a decision, a domain fact). Absent means none was recorded.
+    parsed["events"] = normalize_review_events(parsed.get("events"))
     for finding in findings:
         if isinstance(finding, dict):
             # Optional in the review contract, present afterwards: a planner reads one shape.

@@ -6,6 +6,10 @@
 
 最后一节覆盖挂载 Wiki 声明 `content_contract.deposit_routing` 时的 P03 输入与领域页计划项
 （feat-project-domain-incremental-deposit）：示例项目 alpha 的 `orders` 表结构页与 `database` 配置页。
+
+再往后的几节覆盖文档深度、事件分卡与领域页独立预算（feat-agy-ingest-and-high-fidelity-distill）：
+知识文档不再限 220-450 字、审查的 `events` 进入计划提示词、`max_domain_writes_per_run` 单独计数，
+以及事故卡在计划规范化时就被标记为敏感写入。同样只用虚构示例，不发出任何真实模型请求。
 """
 from __future__ import annotations
 
@@ -17,24 +21,30 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from ai_flywheel.adapters.runners import (
     P03_ITEM_REQUIRED_KEYS,
     P03_REPAIR_SCHEMA_HINT,
+    P03_REPAIR_SCHEMA_HINT_WITH_ROUTE,
     PLAN_SOURCE_CLI,
     PLAN_SOURCE_HEURISTIC,
     PLAN_SOURCE_MODEL,
     CliSubprocessRunner,
     DryRunHeuristicRunner,
     OpenAICompatibleRunner,
+    PlanDiagnostics,
     PlanUnavailableError,
     _build_p03_prompt,
     _plan_from_items,
+    _plan_from_runner_output,
     build_runner,
     deposit_page_types,
 )
+from ai_flywheel.adapters.runners.clients import _plan_write_caps
+from ai_flywheel.adapters.wiki.router import INCIDENT_SECTIONS, IncidentRouting, write_prefix_allows
 from ai_flywheel.adapters.wiki_gate import RoutingCandidates, WikiGate, page_section_sketch, preserves_existing
-from ai_flywheel.config import FlywheelConfig
+from ai_flywheel.config import FlywheelConfig, WorkflowConfig
 from ai_flywheel.core.pipeline.helpers import domain_signal_names
 from ai_flywheel.models import (
     NodeExecution,
@@ -1479,3 +1489,576 @@ def test_a_rejected_configuration_increment_leaves_the_page_as_it_was(tmp_path: 
     assert rejected.status == RunStatus.CANCELLED
     assert target.read_bytes() == before
     assert rt.db.get_session("codex:plan-1").status == SessionStatus.PENDING
+
+# ---------------------------------------------------------------- document depth, events and the two quotas
+# (feat-agy-ingest-and-high-fidelity-distill)
+
+INCIDENT_ROOT = "wiki-知识库/incidents-事故台账"
+INCIDENT_DIRECTORY = f"{INCIDENT_ROOT}/ai-incidents"
+DOMAIN_PAGE_TYPES = frozenset({"project-algorithm", "project-architecture", "project-config"})
+
+
+def _event(kind: str, title: str, session_key: str = "codex:s-1") -> dict[str, str]:
+    return {"event_id": f"ev-{kind}", "kind": kind, "title": title, "summary": f"{title}：做了什么、确立了什么。", "session_key": session_key}
+
+
+EVENTS = [
+    _event("delivery", "交付：对账任务"),
+    _event("incident", "事故：静默改错测试库配置"),
+    _event("decision", "决策：金额以分为单位"),
+    _event("domain_fact", "事实：ledger_entries 主键"),
+]
+
+
+def _ledger(writable: bool = True) -> RoutingCandidates:
+    """The candidates of a Wiki whose contract declares the incident ledger; closed unless ``writable``."""
+    return RoutingCandidates(
+        page_types=["project-practice-note", *(["incident"] if writable else [])],
+        projects=[],
+        evidence_page_types=["project-practice-note"],
+        incident=IncidentRouting(directory=INCIDENT_DIRECTORY, writable=writable),
+    )
+
+
+def _candidates_named(name: str, tmp_path: Path) -> RoutingCandidates | None:
+    """Three Wikis a plan may be written for: no contract, cards only, and one that declares domain pages."""
+    if name == "no-contract":
+        return None
+    if name == "cards-only":
+        return _card_only_candidates()
+    return _deposit_gate(tmp_path).routing_candidates()
+
+
+# ---- the planning contract
+
+
+@pytest.mark.parametrize("wiki", ["no-contract", "cards-only", "deposit"])
+def test_the_plan_asks_for_a_complete_document_and_never_a_shallow_summary(tmp_path: Path, wiki: str):
+    candidates = _candidates_named(wiki, tmp_path)
+
+    prompt, _ = _planner_input({**_signalled_review(), "events": EVENTS}, candidates)
+
+    assert "220-450" not in prompt
+    depth = prompt[prompt.index("DOCUMENT DEPTH:") : prompt.index("Allowed target_kind values:")]
+    for needle in (
+        "written for a reader who was not in the session",
+        "must be able to act without the transcript",
+        "the complete structured body of the document",
+        "every name, value, step, condition and boundary the session verified, each stated once",
+        "no restatement of the review, no filler",
+        "Its length follows its content",
+        "a project experience card (实战经验卡) stays within 80 lines and a lite card (轻记卡) within 20 lines",
+        "only the difference the session verified (已证差量)",
+    ):
+        assert needle in depth, needle
+    assert "content_preview=the complete structured markdown body of the document (see DOCUMENT DEPTH)" in prompt
+    # The format repair carries the same contract.
+    for hint in (P03_REPAIR_SCHEMA_HINT, P03_REPAIR_SCHEMA_HINT_WITH_ROUTE):
+        assert "220-450" not in hint
+
+
+def test_the_events_of_a_review_enter_the_plan_prompt_only_when_there_are_any():
+    candidates = _card_only_candidates()
+    plain = _signalled_review()
+    assert set(plain) == {"findings", "eligible_promotions", "repeated_workflows"}  # a review may hold no event at all
+
+    baseline, baseline_payload = _planner_input(plain, candidates)
+    assert "events" not in baseline_payload and "EVENTS:" not in baseline
+
+    prompt, payload = _planner_input({**plain, "events": EVENTS}, candidates)
+
+    assert payload["events"] == EVENTS
+    assert {key: value for key, value in payload.items() if key != "events"} == baseline_payload
+    paragraph = prompt[prompt.index("EVENTS:") : prompt.index("DOCUMENT DEPTH:")]
+    for needle in (
+        '"events" in the input: event_id, kind, title, summary, session_key',
+        "Plan by event, not by session",
+        "a delivery or a decision event that deserves a document gets an experience card of its own, built from that event alone",
+        "a domain_fact event is recorded once",
+        "Two events are never merged into one card",
+        "an incident card must not swallow the business a session delivered",
+        "a delivery's card must not carry the incident that happened on the way",
+        'Copy the event\'s session_key into "source_session_keys"',
+        "name the event in the title",
+    ):
+        assert needle in paragraph, needle
+    # The paragraph is all the events add to the instructions.
+    assert prompt.replace(paragraph, "", 1).rsplit("\n\n", 1)[0] == baseline.rsplit("\n\n", 1)[0]
+
+    # Nothing usable in the field: the prompt is the one a review without the key always yielded, byte for byte.
+    for nothing in (None, [], ["not an object", 3, None]):
+        assert _planner_input({**plain, "events": nothing}, candidates) == (baseline, baseline_payload)
+
+
+@pytest.mark.parametrize("ledger", [None, False, True], ids=["no-ledger", "ledger-closed", "ledger-open"])
+def test_an_incident_event_is_planned_by_whether_the_ledger_is_open(ledger):
+    candidates = _card_only_candidates()
+    if ledger is not None:
+        candidates.incident = IncidentRouting(directory=INCIDENT_DIRECTORY, writable=ledger)
+        if ledger:
+            candidates.page_types.append("incident")
+    prompt, _ = _planner_input({**_signalled_review(), "events": [_event("incident", "事故：静默改错测试库配置")]}, candidates)
+    said = "and name the event in the title."
+    clause = prompt[prompt.index(said) + len(said) :]
+    clause = clause[: clause.index("\n")]
+
+    if ledger:
+        assert clause == (
+            " An incident event becomes one incident card of its own, as INCIDENT PAGES describes, in addition to "
+            "whatever else its session deserves."
+        )
+        assert "INCIDENT PAGES:" in prompt
+    else:
+        assert clause == (
+            ' This Wiki offers no incident page (see routing_candidates.page_types): an incident stays in the '
+            "review's mistakes, and no knowledge_doc may claim the page type \"incident\"."
+        )
+        assert "INCIDENT PAGES" not in prompt
+    # A Wiki without a contract at all is told the same.
+    (without_contract, _) = _planner_input({**_signalled_review(), "events": EVENTS[:1]}, None)
+    assert "EVENTS:" in without_contract and "INCIDENT PAGES" not in without_contract
+
+
+def test_the_plan_is_told_where_the_ledger_lies_only_while_it_is_open():
+    prompt, payload = _planner_input(_signalled_review(), _ledger())
+
+    assert payload["routing_candidates"] == {
+        "page_types": ["project-practice-note", "incident"],
+        "projects": [],
+        "incident_pages": {
+            "page_type": "incident",
+            "directory": f"{INCIDENT_DIRECTORY}/",
+            "file_name": "<YYYY-MM-DD>-<slug>.md",
+            "sections": list(INCIDENT_SECTIONS),
+        },
+    }
+    paragraph = prompt[prompt.index("INCIDENT PAGES:") : prompt.index("DOCUMENT DEPTH:")]
+    for needle in (
+        f'"relative_path" is "{INCIDENT_DIRECTORY}/<YYYY-MM-DD>-<slug>.md"',
+        '"NNN-YYYY-MM-DD-<slug>.md"',
+        '"wiki_route" is {"page_type": "incident", "project": null, "reason": "..."}',
+        "the one case in which a null project is routed",
+        'whose "action" is "create"',
+        'no "# " title',
+        "frontmatter is optional",
+        "the engine completes what the contract requires and keeps a value the draft states",
+        "exactly these level-2 sections, in this order",
+        '"## 定性"',
+        '"## 事实核验"',
+        '"## 根因"',
+        '"## 治本规则"',
+        '"## 证据指针"',
+        "never a credential",
+        "State only what the session shows",
+        "say so instead of guessing",
+        "leave a section you cannot fill empty rather than inventing it",
+        "An incident page is a sensitive write: it is flagged for a human approval.",
+    ):
+        assert needle in paragraph, needle
+    assert paragraph.index('"## 定性"') < paragraph.index('"## 事实核验"') < paragraph.index('"## 根因"') < paragraph.index('"## 治本规则"') < paragraph.index('"## 证据指针"')
+    assert '"routing_candidates.incident_pages"' in paragraph
+    assert prompt.index("WIKI ROUTING:") < prompt.index("INCIDENT PAGES:") < prompt.index("DOCUMENT DEPTH:") < prompt.index("Allowed target_kind values:")
+
+    # A closed ledger leaves no trace in the prompt: the Wiki reads as one that declares no incident page type.
+    closed_prompt, closed_payload = _planner_input(_signalled_review(), _ledger(writable=False))
+    assert "INCIDENT PAGES" not in closed_prompt
+    assert "incident_pages" not in json.dumps(closed_payload, ensure_ascii=False)
+    assert closed_payload["routing_candidates"]["page_types"] == ["project-practice-note"]
+    no_ledger = RoutingCandidates(page_types=["project-practice-note"], evidence_page_types=["project-practice-note"])
+    assert closed_prompt == _planner_input(_signalled_review(), no_ledger)[0]
+
+
+def test_the_paragraphs_keep_their_order_on_a_wiki_that_offers_everything(tmp_path: Path):
+    candidates = _deposit_gate(tmp_path).routing_candidates()
+    candidates.incident = IncidentRouting(directory=INCIDENT_DIRECTORY, writable=True)
+    candidates.page_types = [*candidates.page_types, "incident"]
+
+    prompt, payload = _planner_input({**_signalled_review(), "events": EVENTS}, candidates)
+
+    order = [prompt.index(marker) for marker in ("WIKI ROUTING:", "PROJECT DOMAIN PAGES:", "INCIDENT PAGES:", "EVENTS:", "DOCUMENT DEPTH:", "Allowed target_kind values:")]
+    assert order == sorted(order)
+    assert payload["routing_candidates"]["page_types"] == ["project-practice-note", "project-algorithm", "project-architecture", "project-config", "incident"]
+    assert payload["routing_candidates"]["incident_pages"]["directory"] == f"{INCIDENT_DIRECTORY}/"
+    # No cap of its own passed in (a caller that names none): the single cap the prompt always had.
+    assert "IMPORTANT: Output at most 5 total items. " in prompt
+    assert "Only inside the item cap, plan one" in prompt
+
+
+# ---- the two quotas
+
+
+def _table_page(table: str, session_key: str = "codex:s-1") -> dict[str, Any]:
+    """A plan item for a table page of project alpha that does not exist yet."""
+    item = _table_item()
+    item.update(
+        title=f"{table} 表结构",
+        summary=f"新表 {table} 的实战已证字段",
+        relative_path=f"{PROJECTS}/{ALPHA_DIR}/数据库结构/{table}.md",
+        source_session_keys=[session_key],
+        content_preview=(
+            f"## 用途一行\n\n{table} 表：一行一条记录。\n\n"
+            "## 字段语义表\n\n| 字段 | 类型 | 含义 | 备注 |\n| --- | --- | --- | --- |\n| id | bigint | 主键 | 自增 |\n"
+        ),
+    )
+    return item
+
+
+def _card(number: int) -> dict[str, Any]:
+    return _doc(title=f"经验卡{number}", slug=f"card-{number}", with_summary=True)
+
+
+def _card_item(number: int) -> dict[str, Any]:
+    """A routable experience card of project alpha in the deposit Wiki."""
+    title = f"连库排查复盘{number}"
+    return {
+        "target_kind": "knowledge_doc",
+        "action": "create",
+        "title": title,
+        "summary": f"沉淀第 {number} 次连库排查的经验。",
+        "relative_path": f"{PROJECTS}/2026-11-27-{title}.md",
+        "source_session_keys": ["codex:plan-1"],
+        "content_preview": (
+            f"---\ntitle: {title}\ntags: [alpha]\n---\n\n# {title}\n"
+            "- 未支付订单的 paid_at 为 NULL，不能拿它当时间过滤条件。\n"
+            "- payments 与 orders 不在同一分片，跨库关联只能在应用层做。\n"
+        ),
+        "wiki_route": {"page_type": "project-practice-note", "project": ALPHA_DIR, "reason": "本项目订单表排查的复盘"},
+    }
+
+
+def _plan_of(items: list[Any], *, other: int, page_types: frozenset[str], domain: int | None = None, total: int | None = None):
+    """Read a reply under the given caps: the two quotas when ``domain`` is given, the single cap otherwise."""
+    return _plan_from_items(
+        items,
+        source=PLAN_SOURCE_MODEL,
+        max_write_set=other,
+        default_doc_prefix="lessons/",
+        skills_root=None,
+        domain_page_types=page_types,
+        max_domain_writes=domain,
+        total_write_set=total,
+        model="strong-plan-model" if domain is not None else "",
+    )
+
+
+def _split_plan(items: list[Any], *, other: int = 4, domain: int = 6, total: int = 12):
+    return _plan_of(items, other=other, page_types=DOMAIN_PAGE_TYPES, domain=domain, total=total)
+
+
+def _titles(outcome: Any) -> list[str]:
+    return [write.title for write in outcome.planned_writes]
+
+
+def _dropped(outcome: Any) -> list[tuple[int, list[str]]]:
+    return [(dropped["index"], dropped["reasons"]) for dropped in outcome.diagnostics.dropped_items]
+
+
+def test_a_card_and_four_table_pages_are_all_planned_under_the_two_quotas():
+    """规格场景：1 张经验卡 + 4 张表结构页，other=4、domain=6、total=12，全部进入计划。"""
+    tables = [_table_page(table) for table in ("payments", "invoices", "ledger_entries", "payouts")]
+    items = [*tables, _card(1)]  # the reply puts the domain pages first
+
+    outcome = _split_plan(items)
+
+    assert _titles(outcome) == ["经验卡1", *(item["title"] for item in tables)]
+    assert (outcome.diagnostics.kept_count, outcome.diagnostics.over_limit_count) == (5, 0)
+    assert outcome.diagnostics.dropped_items == []
+    assert outcome.diagnostics.write_caps == {"other": 4, "domain": 6, "total": 12}
+    assert outcome.diagnostics.model == "strong-plan-model"
+    assert [str((write.wiki_route or {}).get("page_type") or "") for write in outcome.planned_writes] == ["", *["project-algorithm"] * 4]
+
+    # Under the one cap this reply loses a page, and the plan states no caps of its own.
+    single = _plan_of(items, other=4, page_types=DOMAIN_PAGE_TYPES)
+    assert _titles(single) == ["经验卡1", *(item["title"] for item in tables[:3])]
+    assert (single.diagnostics.kept_count, single.diagnostics.over_limit_count) == (4, 1)
+    assert _dropped(single) == [(3, ["OVER_LIMIT"])]
+    assert single.diagnostics.write_caps is None
+    assert single.diagnostics.model == ""
+
+
+def test_each_quota_counts_its_own_kind_and_the_whole_plan_stays_within_the_write_set():
+    tables = [_table_page(table) for table in ("payments", "invoices", "settlements", "payouts", "refunds", "ledger_entries", "fees")]
+    cards = [_card(number) for number in range(1, 7)]
+
+    # Everything else over its own cap: the table pages are not pushed out by the cards.
+    outcome = _split_plan([*cards, tables[0], tables[1]])
+    assert _titles(outcome) == [card["title"] for card in cards[:4]] + [tables[0]["title"], tables[1]["title"]]
+    assert _dropped(outcome) == [(4, ["OVER_LIMIT"]), (5, ["OVER_LIMIT"])]
+
+    # Domain pages over theirs: the card keeps its slot and the seventh table page waits for another batch.
+    outcome = _split_plan([*tables, cards[0]])
+    assert _titles(outcome) == [cards[0]["title"], *(item["title"] for item in tables[:6])]
+    assert _dropped(outcome) == [(6, ["OVER_LIMIT"])]
+
+    # The bound over both kinds together: four cards, then two of the six table pages.
+    outcome = _split_plan([*cards, *tables[:6]], total=6)
+    assert _titles(outcome) == [card["title"] for card in cards[:4]] + [item["title"] for item in tables[:2]]
+    assert [dropped[0] for dropped in _dropped(outcome)] == [4, 5, 8, 9, 10, 11]
+    assert {tuple(dropped[1]) for dropped in _dropped(outcome)} == {("OVER_LIMIT",)}
+    assert len(outcome.planned_writes) == outcome.diagnostics.write_caps["total"] == 6
+
+    # A domain cap of 0 plans no domain page at all; the other items are untouched by it.
+    outcome = _split_plan([tables[0], cards[0], tables[1]], domain=0)
+    assert _titles(outcome) == [cards[0]["title"]]
+    assert _dropped(outcome) == [(0, ["OVER_LIMIT"]), (2, ["OVER_LIMIT"])]
+    assert outcome.diagnostics.write_caps == {"other": 4, "domain": 0, "total": 12}
+
+
+def test_a_reply_of_domain_pages_only_fails_the_plan_when_their_cap_is_zero():
+    """The standing contract: a plan of which nothing is listed fails the node, it never passes as an empty one."""
+    tables = [_table_page("payments"), _table_page("invoices")]
+
+    with pytest.raises(PlanUnavailableError) as refused:
+        _split_plan(tables, domain=0)
+
+    assert "模型返回的写入计划 2 项全部未列入（2 项超出单批上限），本批不写入。" in str(refused.value)
+    assert (refused.value.diagnostics.over_limit_count, refused.value.diagnostics.kept_count) == (2, 0)
+    assert refused.value.diagnostics.write_caps == {"other": 4, "domain": 0, "total": 12}
+
+    # With room for one, the plan holds one and says which page waited.
+    outcome = _split_plan(tables, domain=1)
+    assert _titles(outcome) == ["payments 表结构"]
+    assert _dropped(outcome) == [(1, ["OVER_LIMIT"])]
+
+
+def test_an_invalid_item_spends_no_slot_of_either_quota():
+    invalid = {"target_kind": "knowledge_doc", "action": "create"}  # no title and no summary to complete them from
+    unusable = ["FIELD_MISSING: title", "FIELD_MISSING: summary"]
+    invalid_page = {**invalid, "wiki_route": {"page_type": "project-algorithm", "project": "alpha"}}
+
+    # Two slots for everything else, an invalid item ahead of each good one.
+    outcome = _split_plan([invalid, _card(1), invalid, _card(2)], other=2)
+    assert _titles(outcome) == ["经验卡1", "经验卡2"]
+    assert _dropped(outcome) == [(0, unusable), (2, unusable)]
+    assert outcome.diagnostics.over_limit_count == 0
+
+    # The same for the domain quota.
+    outcome = _split_plan([invalid_page, _table_page("payments"), invalid_page, _table_page("invoices")], domain=2)
+    assert _titles(outcome) == ["payments 表结构", "invoices 表结构"]
+    assert [dropped[1] for dropped in _dropped(outcome)] == [unusable, unusable]
+    assert outcome.diagnostics.over_limit_count == 0
+
+    # A third good item does meet the quota the invalid items left untouched.
+    outcome = _split_plan([invalid, _card(1), _card(2), _card(3)], other=2)
+    assert _titles(outcome) == ["经验卡1", "经验卡2"]
+    assert _dropped(outcome) == [(0, unusable), (3, ["OVER_LIMIT"])]
+
+
+def test_the_runner_output_path_counts_under_the_same_two_quotas():
+    parsed = {"planned_writes": [_table_page("payments"), _table_page("invoices"), _table_page("payouts"), _table_page("fees"), _card(1)]}
+
+    outcome = _plan_from_runner_output(
+        parsed,
+        source=PLAN_SOURCE_MODEL,
+        max_write_set=4,
+        default_doc_prefix="lessons/",
+        skills_root=None,
+        domain_page_types=DOMAIN_PAGE_TYPES,
+        max_domain_writes=6,
+        total_write_set=12,
+        model="strong-plan-model",
+    )
+
+    assert len(outcome.planned_writes) == 5
+    stated = outcome.diagnostics.to_dict()
+    assert (stated["write_caps"], stated["model"]) == ({"other": 4, "domain": 6, "total": 12}, "strong-plan-model")
+
+    # The page types the Wiki declares decide what counts as a domain page: without them one cap covers all.
+    plain = _plan_from_runner_output(parsed, source=PLAN_SOURCE_MODEL, max_write_set=4, default_doc_prefix="lessons/", skills_root=None)
+    assert _titles(plain) == [item["title"] for item in parsed["planned_writes"][:4]]
+    assert plain.diagnostics.write_caps is None
+
+
+def test_plan_diagnostics_name_the_model_and_the_caps_they_counted_under():
+    stated = PlanDiagnostics(source=PLAN_SOURCE_MODEL, model="strong-plan-model", write_caps={"other": 4, "domain": 6, "total": 12}).to_dict()
+    assert (stated["model"], stated["write_caps"]) == ("strong-plan-model", {"other": 4, "domain": 6, "total": 12})
+
+    bare = PlanDiagnostics(source=PLAN_SOURCE_MODEL).to_dict()
+    assert (bare["model"], bare["write_caps"]) == ("", None)
+
+
+def test_the_caps_come_from_the_configuration_and_never_exceed_the_write_set(tmp_path: Path):
+    assert WorkflowConfig().max_domain_writes_per_run == 8
+    for out_of_range in (-1, 33):
+        with pytest.raises(ValidationError):
+            WorkflowConfig(max_domain_writes_per_run=out_of_range)
+
+    cfg = _deposit_config(tmp_path)
+    offered = _deposit_gate(tmp_path).routing_candidates()
+
+    assert _plan_write_caps(cfg, offered) == (8, 8)  # the defaults: eight domain pages inside a write set of eight
+    cfg.workflow.max_domain_writes_per_run = 20
+    assert _plan_write_caps(cfg, offered) == (8, 8)  # cut to the sink's bound
+    cfg.knowledge_sink.max_write_set = 3
+    assert _plan_write_caps(cfg, offered) == (3, 3)
+    cfg.workflow.max_domain_writes_per_run = 0
+    assert _plan_write_caps(cfg, offered) == (0, 3)
+    # A plan that can hold no domain page is counted by the single cap it always had.
+    for without_domain_pages in (None, _card_only_candidates(), RoutingCandidates()):
+        assert _plan_write_caps(cfg, without_domain_pages) == (None, None)
+
+
+def test_both_runners_tell_the_planner_the_caps_they_count_under(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    offered = _deposit_gate(tmp_path).routing_candidates()
+    rt, _ = _runtime(tmp_path)
+    runner = OpenAICompatibleRunner(rt.cfg, rt.fs_store)
+    seen: list[str] = []
+
+    def chat(prompt: str, system_prompt: str) -> str:
+        seen.append(prompt)
+        return '{"planned_writes": []}'
+
+    runner._call_chat_completion = chat
+    rt.cfg.workflow.max_domain_writes_per_run = 6
+    rt.cfg.knowledge_sink.max_write_set = 12
+    runner.plan_writes_detailed(_signalled_review(), [], 4, routing_candidates=offered)
+
+    (prompt,) = seen
+    both = "IMPORTANT: Output at most 4 items that are not project-domain pages, and at most 6 project-domain pages (12 items in all). "
+    assert both in prompt
+    assert "Domain pages are counted under a cap of their own, apart from every other item (see IMPORTANT below). " in prompt
+    assert 'Plan one "knowledge_doc" per domain page that the findings\' "domain_signals" name, at most 6 of them, and only for a fact the session verified.' in prompt
+
+    # A Wiki that declares no domain page keeps the one sentence it had.
+    seen.clear()
+    runner.plan_writes_detailed(_signalled_review(), [], 4, routing_candidates=_card_only_candidates())
+    assert "IMPORTANT: Output at most 4 total items. " in seen[0]
+    assert "project-domain pages, and at most" not in seen[0]
+
+    # A domain cap of 0 is said in so many words.
+    seen.clear()
+    rt.cfg.workflow.max_domain_writes_per_run = 0
+    runner.plan_writes_detailed(_signalled_review(), [], 4, routing_candidates=offered)
+    assert "IMPORTANT: Output at most 4 items that are not project-domain pages, and at most 0 project-domain pages (12 items in all). " in seen[0]
+    assert "No domain page is planned in this batch: their cap is 0." in seen[0]
+
+    # The local CLI runner plans under the same caps.
+    cfg = FlywheelConfig(base_dir=tmp_path)
+    cfg.runner.mode = "cli"
+    cfg.runner.cli.command = "mock-cli"
+    cfg.workflow.max_domain_writes_per_run = 6
+    cfg.knowledge_sink.max_write_set = 12
+    cli = CliSubprocessRunner(cfg, ImmutableFileStore(tmp_path / "cli-receipts"))
+    cli_prompts: list[str] = []
+    reply = {"planned_writes": [_table_page(table) for table in ("payments", "invoices", "payouts", "fees", "refunds")] + [_card(1)]}
+
+    def invoke(stage: str, prompt: str, reply_trace: dict[str, Any] | None = None) -> dict[str, Any]:
+        cli_prompts.append(prompt)
+        return reply
+
+    monkeypatch.setattr(cli, "_invoke_cli", invoke)
+    outcome = cli.plan_writes_detailed(_signalled_review(), [], 4, routing_candidates=offered)
+
+    (cli_prompt,) = cli_prompts
+    assert both in cli_prompt
+    assert len(outcome.planned_writes) == 6  # one card under its cap, five table pages under theirs
+    assert outcome.diagnostics.write_caps == {"other": 4, "domain": 6, "total": 12}
+    assert outcome.diagnostics.source == "cli"
+
+
+def test_an_incident_card_is_flagged_for_a_human_before_anyone_approves_it():
+    def incident_item(**overrides: Any) -> dict[str, Any]:
+        item = _doc(title="静默改错测试库配置", slug="wrong-config", with_summary=True)
+        item.update(
+            relative_path=f"{INCIDENT_DIRECTORY}/2026-11-20-wrong-config.md",
+            wiki_route={"page_type": "incident", "project": None, "reason": "一次协作事故"},
+        )
+        item.update(overrides)
+        return item
+
+    def plan(item: dict[str, Any]):
+        return _plan_from_items([item], source=PLAN_SOURCE_MODEL, max_write_set=8, default_doc_prefix="lessons/", skills_root=None).planned_writes
+
+    (card,) = plan(incident_item())
+    assert (card.requires_approval, card.approval_reason) == (True, "事故卡属于敏感写入，需人工确认后才会落盘")
+    assert is_sensitive_write(card) is True
+
+    # The model's own reason is kept; the flag is set all the same, however the page type is spelled.
+    (kept,) = plan(incident_item(approval_reason="改错了测试库配置，未告知"))
+    assert (kept.requires_approval, kept.approval_reason) == (True, "改错了测试库配置，未告知")
+    (spelled,) = plan(incident_item(wiki_route={"page_type": " Incident ", "project": None, "reason": "一次协作事故"}))
+    assert (spelled.requires_approval, is_sensitive_write(spelled)) == (True, True)
+
+    # A card of any other type is not touched.
+    (routine,) = plan(_doc(with_summary=True))
+    assert (routine.requires_approval, routine.approval_reason, is_sensitive_write(routine)) == (False, "", False)
+
+
+def test_write_prefixes_open_a_directory_only_by_name():
+    ledger = f"{INCIDENT_ROOT}/ai-incidents"
+
+    assert write_prefix_allows(ledger, ["wiki-知识库"]) is True
+    assert write_prefix_allows(ledger, ["wiki-知识库/incidents-事故台账"]) is True
+    assert write_prefix_allows(ledger, ["/wiki-知识库\\incidents-事故台账"]) is True
+    assert write_prefix_allows(ledger, ["wiki-知识库/incidents-事故台账/ai-incidents"]) is True
+    assert write_prefix_allows(ledger, ["wiki-知识库/incidents-事故台账/ai-incidents-archive"]) is False  # a sibling is not the ledger
+    assert write_prefix_allows(ledger, ["wiki-知识库/projects-项目"]) is False
+    assert write_prefix_allows(ledger, []) is False  # an empty list restrains nothing, and so opens nothing by name
+    assert write_prefix_allows(ledger, None) is False
+
+
+# ---- the run, under both quotas
+
+# The project index page, as the deposit contract of this file does not declare it: a card
+# is written together with its entry there, so an approved card needs the page type.
+INDEX_PAGE_TYPE = (
+    "    project-practice-index:\n"
+    "      partition: projects\n"
+    '      path_pattern: "^[^/]+/实战笔记/笔记索引\\\\.md$"\n'
+    "      allowed_status: [active, deprecated, archived]\n"
+)
+
+
+def _runtime_whose_index_page_is_declared(tmp_path: Path) -> FlywheelRuntime:
+    """The deposit runtime, under a contract that also declares the project index page.
+
+    An experience card is written together with its entry in the project index. The plain
+    deposit contract declares no such page type, so an approved card could never land.
+    """
+    rt = _deposit_runtime(tmp_path)
+    marker = "    project-practice-note:\n"
+    extended = DEPOSIT_SCHEMA.replace(marker, INDEX_PAGE_TYPE + marker, 1)
+    assert extended != DEPOSIT_SCHEMA
+    (tmp_path / "deposit-wiki" / ".wiki-schema.md").write_bytes(extended.encode("utf-8"))  # read at the first use
+    return rt
+
+
+def test_a_card_and_four_table_pages_fill_the_two_quotas_and_still_ask_for_a_human(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """规格场景：max_writes_per_run=4、max_domain_writes_per_run=6、knowledge_sink.max_write_set=12 时，
+    1 张经验卡 + 4 张表结构页全部进入计划，高写入阈值按最终总数触发。"""
+    rt = _runtime_whose_index_page_is_declared(tmp_path)  # `smart`: only a sensitive write or a large batch pauses the run
+    rt.cfg.workflow.max_writes_per_run = 4
+    rt.cfg.workflow.max_domain_writes_per_run = 6
+    rt.cfg.knowledge_sink.max_write_set = 12
+    rt.cfg.workflow.high_write_count_threshold = 4
+    _register_troubleshooting(rt)
+    project_dir = tmp_path / "deposit-wiki" / PROJECTS / ALPHA_DIR
+    table_dir = project_dir / "数据库结构"
+    pages = ["payments", "invoices", "ledger_entries", "payouts"]
+    model = _DepositModel([*(_table_page(table, "codex:plan-1") for table in pages), _card_item(1)])
+    monkeypatch.setattr(OpenAICompatibleRunner, "_call_chat_completion", model)
+    before = sorted(path.name for path in table_dir.iterdir())
+    assert before == [".draft-payments.md", "archive-refunds.md", "orders.md"]
+
+    run = rt.orchestrator.start_run(trigger="test", phase="daily", session_keys=["codex:plan-1"])
+
+    assert run.status == RunStatus.AWAITING_APPROVAL, run.error
+    assert [write.title for write in run.planned_writes] == [_card_item(1)["title"], *(_table_page(page)["title"] for page in pages)]
+    assert all(not is_sensitive_write(write) for write in run.planned_writes)  # the count alone holds the batch
+    assert _payload_of(rt, run, "awaiting_approval")["reasons"] == ["本批建议写入共 5 项（超过自动放行阈值 4）"]
+    p03 = _node(run, "P03_ROUTE_PLAN")
+    assert p03.status == NodeStatus.PASS
+    assert p03.payload["plan_diagnostics"]["write_caps"] == {"other": 4, "domain": 6, "total": 12}
+    assert "其中 4 项为项目领域页（增量更新 0、新建 4、敏感待审批 0）" in p03.summary
+    assert "IMPORTANT: Output at most 4 items that are not project-domain pages, and at most 6 project-domain pages (12 items in all). " in model.prompts[1]
+    assert sorted(path.name for path in table_dir.iterdir()) == before  # nothing while it waits
+
+    finished = rt.orchestrator.approve_and_resume(run.run_id)
+
+    assert finished.status == RunStatus.PASS, finished.error
+    assert sorted(path.name for path in table_dir.iterdir()) == sorted([*before, *(f"{page}.md" for page in pages)])
+    practice = project_dir / "实战笔记"
+    (card,) = [path for path in practice.iterdir() if path.name != "笔记索引.md"]
+    assert card.name.endswith("-连库排查复盘1.md")  # the card landed under the day it was written
+    assert "连库排查复盘1" in (practice / "笔记索引.md").read_text(encoding="utf-8")  # and its entry joined the index
+    assert rt.db.get_session("codex:plan-1").status == SessionStatus.PROCESSED

@@ -29,6 +29,7 @@ from ai_flywheel.adapters.wiki.router import (
     RouteDecision,
     RoutingCandidates,
     DepositRouting,
+    IncidentRouting,
     _domain_path_parts,
     _domain_template,
     _frontmatter_field,
@@ -46,7 +47,7 @@ from ai_flywheel.adapters.wiki.schema import (
 from ai_flywheel.adapters.wiki.t5_adapter import _CARD_BODY_MAPPERS, normalize_planned_document
 from ai_flywheel.adapters.wiki.validator import WikiGateResult, validate_document
 from ai_flywheel.config import FlywheelConfig, KnowledgeSinkConfig
-from ai_flywheel.models import SENSITIVE_CONFIG_PAGE_TYPE, declares_private_page
+from ai_flywheel.models import INCIDENT_PAGE_TYPE, SENSITIVE_CONFIG_PAGE_TYPE, declares_private_page
 
 
 class WikiGate:
@@ -122,20 +123,31 @@ class WikiGate:
 
         Practice card types are always offered. The page types of the Wiki's declared
         project-domain deposit routing are offered with them, each project carrying the
-        domain pages it already holds.
+        domain pages it already holds. The incident ledger is offered only while the sink
+        is allowed to write into it: it is closed until the configuration opens it.
         """
         root_rel, projects_root = self._projects_root(schema)
         deposit = DepositRouting.from_schema(schema)
         if deposit is not None:
             deposit.projects_root = root_rel
+        incident = IncidentRouting.from_schema(schema, sink=self.sink)
         card_types = self._routable_page_types(schema)
         return RoutingCandidates(
-            page_types=list(dict.fromkeys([*card_types, *(deposit.page_types if deposit is not None else [])])),
+            page_types=list(
+                dict.fromkeys(
+                    [
+                        *card_types,
+                        *(deposit.page_types if deposit is not None else []),
+                        *([INCIDENT_PAGE_TYPE] if incident is not None and incident.writable else []),
+                    ]
+                )
+            ),
             projects=self._discover_practice_projects(
                 projects_root, domain_subdirs=deposit.subdirs if deposit is not None else ()
             ),
             evidence_page_types=card_types,
             deposit_routing=deposit,
+            incident=incident,
         )
 
     def domain_page_template(self, relative_path: str, content: str = "") -> dict[str, Any] | None:
@@ -344,7 +356,8 @@ class WikiGate:
 
         A project-domain page (the verdict carries a ``domain``) has no generic draft to
         adapt: an update writes the increment the verdict merged and a create the page the
-        verdict built, both free of anything the Wiki already holds.
+        verdict built, both free of anything the Wiki already holds. An incident card is
+        the page the verdict built as well: the draft under the standard section frame.
         """
         rel = self._normalize(relative_path or "")
         if not self.applicable:
@@ -374,6 +387,8 @@ class WikiGate:
             return rel, content
         if route.domain:
             return rel, (route.increment if route.incremental else route.page)
+        if route.page_type == INCIDENT_PAGE_TYPE:
+            return rel, route.page
 
         # If already valid against the mounted schema, keep as-is
         if rel and self.validate_document(rel, content).ok:

@@ -103,6 +103,12 @@ class PlanDiagnostics:
     repair_parse_error: str | None = None
     repair_error: str | None = None
     call_telemetry: dict[str, Any] | None = None
+    # The model the plan was asked of (the runner's own name when no stage model is set), so
+    # a plan can be traced to what produced it without reading the call telemetry.
+    model: str = ""
+    # The item quotas this plan was read under, when the Wiki's deposit contract gives
+    # project-domain pages a quota of their own: `other`, `domain` and `total`. Else None.
+    write_caps: dict[str, int] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -123,6 +129,8 @@ class PlanDiagnostics:
             "repair_parse_error": self.repair_parse_error,
             "repair_error": self.repair_error,
             "call_telemetry": dict(self.call_telemetry) if self.call_telemetry else None,
+            "model": self.model,
+            "write_caps": dict(self.write_caps) if self.write_caps is not None else None,
         }
 
 

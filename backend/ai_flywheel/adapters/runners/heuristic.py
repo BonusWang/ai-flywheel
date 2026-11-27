@@ -164,6 +164,8 @@ class DryRunHeuristicRunner(BaseWorkflowRunner):
             "repeated_workflows": repeated_workflows,
             "mistakes": mistakes,
             "dissents": dissents,
+            # Keyword rules read no delivery, incident or decision off a session: nothing to split.
+            "events": [],
             # The local reviewer reads every admitted session, so every one of them was reviewed.
             "sent_session_keys": [s.session_key for s, _ in sessions],
         }

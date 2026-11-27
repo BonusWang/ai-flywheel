@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import {
+  AlertTriangle,
   ArrowRight,
   Bell,
   Calendar,
@@ -86,6 +87,15 @@ function humanPreview(preset: CronPreset, hour: string, minute: string): string 
   return '自定义排程 · 上海时间'
 }
 
+/** How long after its time a scheduled batch may still run, as one short phrase. */
+function formatCatchupWindow(seconds: number | null | undefined): string {
+  if (seconds == null || !Number.isFinite(Number(seconds))) return '—'
+  const total = Math.max(0, Math.round(Number(seconds)))
+  if (total % 3600 === 0 && total > 0) return `${total / 3600} 小时`
+  if (total % 60 === 0 && total > 0) return `${total / 60} 分钟`
+  return `${total} 秒`
+}
+
 function AutomationsSkeleton() {
   return (
     <div className="mx-auto max-w-[var(--page-max-wide)] space-y-5" aria-busy="true">
@@ -134,6 +144,8 @@ export const AutomationsPage: React.FC<Props> = ({
   const [dreamStatus, setDreamStatus] = useState<DreamStatusPayload | null>(null)
   const [dreamResult, setDreamResult] = useState<DreamResult | null>(null)
   const [dreamBusy, setDreamBusy] = useState(false)
+  // When the snapshot on screen was read. The catch-up deadline is compared with it.
+  const [fetchedAt, setFetchedAt] = useState(0)
 
   const syncDraftFromSnapshot = useCallback((snap: AutomationsSnapshot) => {
     const expr = snap.scheduler.cron || '0 20 * * *'
@@ -153,6 +165,7 @@ export const AutomationsPage: React.FC<Props> = ({
           api.getDream().catch(() => null),
         ])
         setData(snap)
+        setFetchedAt(Date.now())
         if (dream) setDreamStatus(dream)
         if (syncEditor) syncDraftFromSnapshot(snap)
         setError(null)
@@ -375,9 +388,93 @@ export const AutomationsPage: React.FC<Props> = ({
   const isRunning = Boolean(sched?.running)
   const isLocked = Boolean(data?.lock)
 
+  // How a scheduled fire this process was not awake for is handled.
+  const catchupEnabled = sched?.catchup_missed_schedule === true
+  const catchupStateLabel =
+    sched?.catchup_missed_schedule === true
+      ? '已开启'
+      : sched?.catchup_missed_schedule === false
+        ? '已关闭'
+        : '未知'
+  const catchupWindow = formatCatchupWindow(sched?.misfire_grace_seconds)
+  const catchupWindowKnown = sched?.misfire_grace_seconds != null
+  const missedToday = Boolean(sched?.missed_today)
+  // The fire still counts as missed after a person ran a batch by hand — only a
+  // scheduled one clears it — unless that attempt failed or was cancelled.
+  const lastRunStatus = sched?.last_run_status ?? null
+  const manualRunSinceFire =
+    missedToday &&
+    Boolean(sched?.scheduled_today) &&
+    Boolean(sched?.last_run_at) &&
+    sched?.last_run_trigger !== 'scheduled' &&
+    Date.parse(String(sched?.last_run_at)) >= Date.parse(String(sched?.scheduled_today))
+  const missedFireHandledByHand =
+    manualRunSinceFire && lastRunStatus !== 'FAILED' && lastRunStatus !== 'CANCELLED'
+  const manualRunInProgress =
+    missedFireHandledByHand && (lastRunStatus === 'PENDING' || lastRunStatus === 'RUNNING')
+  // The recovery loop catches a lost fire up only until the grace window closes.
+  // The backend states that as a deadline, so compare it with the clock at the
+  // moment the snapshot was read.
+  const catchupWindowClosed =
+    Boolean(sched?.catchup_window_until) &&
+    fetchedAt > Date.parse(String(sched?.catchup_window_until))
+  const missedSchedule = (sched?.human_schedule || '').replace('（上海时间）', '')
+  const missedLead = `${missedSchedule} 的定时批次今天没有运行。`
+  const missedGrace = catchupWindowKnown ? `，补跑宽限 ${catchupWindow}` : ''
+  const missedFire = !missedToday
+    ? null
+    : missedFireHandledByHand
+      ? {
+          headline: manualRunInProgress ? '今日定时已错过 · 手动补跑进行中' : '今日定时已错过 · 已手动补跑',
+          title: manualRunInProgress ? '当日定时已错过，手动补跑进行中' : '当日定时已错过，已手动补跑',
+          detail: manualRunInProgress
+            ? `${missedLead}已在 ${formatShanghaiTimestamp(sched?.last_run_at)} 手动发起整理，正在运行。`
+            : `${missedLead}已在 ${formatShanghaiTimestamp(sched?.last_run_at)} 手动整理。`,
+          actionable: false,
+        }
+      : policy && !policy.workflow_enabled
+        ? {
+            headline: '今日定时已错过 · 自动整理已暂停',
+            title: '当日定时已错过，自动整理已暂停',
+            detail: `${missedLead}后台自动整理总开关已关闭，定时与补跑都已暂停；开启后再手动执行一轮。`,
+            actionable: false,
+          }
+        : !catchupEnabled
+          ? {
+              headline: '今日定时已错过 · 待手动执行',
+              title: '当日定时已错过，自动补跑已关闭',
+              detail: `${missedLead}自动补跑已关闭${missedGrace}，后台巡检不会补跑这一轮，请手动执行一轮。`,
+              actionable: true,
+            }
+          : !sched?.role_active
+            ? {
+                headline: '今日定时已错过 · 待手动执行',
+                title: '当日定时已错过，当前进程不会自动补跑',
+                detail: `${missedLead}自动补跑已开启，但当前进程不常驻后台，不会自动补跑；请手动执行一轮。`,
+                actionable: true,
+              }
+            : catchupWindowClosed
+              ? {
+                  headline: '今日定时已错过 · 待手动执行',
+                  title: '当日定时已错过，补跑窗口已结束',
+                  detail: `${missedLead}自动补跑已开启${missedGrace}，但补跑窗口已结束，后台巡检不会再补跑这一轮；请手动执行一轮。`,
+                  actionable: true,
+                }
+              : {
+                  headline: '今日定时已错过 · 等待补跑',
+                  title: '当日定时已错过，等待补跑或手动执行',
+                  detail: `${missedLead}自动补跑已开启${missedGrace}${
+                    sched?.catchup_window_until
+                      ? `，补跑窗口至 ${formatShanghaiTimestamp(sched.catchup_window_until)}`
+                      : ''
+                  }：如仍有待整理内容，后台巡检会补跑一次，也可以现在手动执行。`,
+                  actionable: true,
+                }
+
   const todayHeadline = (() => {
     if (!metrics) return '—'
     if (metrics.today_awaiting_count > 0) return `待审批 (${metrics.today_awaiting_count} 批)`
+    if (missedFire) return missedFire.headline
     if (metrics.today_passed_count > 0)
       return `今日已整理 (${metrics.today_passed_count}/${metrics.today_runs_count})`
     if (metrics.today_failed_count > 0) return `今日异常 (${metrics.today_failed_count} 批)`
@@ -389,6 +486,7 @@ export const AutomationsPage: React.FC<Props> = ({
   const todayColorClass = (() => {
     if (!metrics) return 'text-ink'
     if (metrics.today_awaiting_count > 0) return 'text-amber-ink'
+    if (missedToday) return 'text-amber-ink'
     if (metrics.today_passed_count > 0) return 'text-ok'
     if (metrics.today_failed_count > 0) return 'text-hot'
     return 'text-ink-2'
@@ -494,6 +592,37 @@ export const AutomationsPage: React.FC<Props> = ({
           </div>
         </div>
 
+        {/* A scheduled fire that was lost: say so, and offer the way out. */}
+        {missedFire && (
+          <div
+            role="alert"
+            className="flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius-tile)] border border-amber/45 bg-amber-soft px-4 py-3"
+          >
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 text-[13.5px] font-semibold text-amber-ink">
+                <AlertTriangle className="w-4 h-4 shrink-0" />
+                <span>{missedFire.title}</span>
+              </div>
+              <p className="mt-1 text-[12.5px] text-amber-ink">{missedFire.detail}</p>
+            </div>
+            {missedFire.actionable && (
+              <button
+                type="button"
+                disabled={Boolean(runningPhase) || isLocked}
+                onClick={() => handleManualRun('auto')}
+                className="pressable inline-flex items-center gap-1.5 h-8 shrink-0 px-3.5 rounded-[var(--radius-control)] bg-amber text-amber-contrast text-[12.5px] font-semibold hover:opacity-90 disabled:opacity-50"
+              >
+                {runningPhase === 'auto' ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Play className="w-3.5 h-3.5" />
+                )}
+                <span>{isLocked ? '已有批次整理中' : '手动补跑一轮'}</span>
+              </button>
+            )}
+          </div>
+        )}
+
         {/* Live Status Strip */}
         <div className="flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius-tile)] border border-line-soft bg-bg-sunk/70 px-4 py-3 text-[12.5px]">
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -526,6 +655,22 @@ export const AutomationsPage: React.FC<Props> = ({
                 ? `暂停中（开启后 ${formatShanghaiTimestamp(sched.preview_next_run_at)}）`
                 : '未排程'}
           </span>
+          {/* When this process came up, and how a fire it slept through is caught up. */}
+          <div className="flex w-full flex-wrap items-center gap-x-4 gap-y-1 border-t border-line-soft pt-2 text-[12px] text-ink-3">
+            <span>
+              服务启动
+              <span className="num ml-1.5 font-medium text-ink-2">
+                {formatShanghaiTimestamp(sched?.started_at)}
+              </span>
+            </span>
+            <span>
+              补跑宽限
+              <span className="num ml-1.5 font-medium text-ink-2">{catchupWindow}</span>
+              <span className="mx-1.5">·</span>
+              自动补跑
+              <span className="ml-1.5 font-medium text-ink-2">{catchupStateLabel}</span>
+            </span>
+          </div>
         </div>
       </section>
 

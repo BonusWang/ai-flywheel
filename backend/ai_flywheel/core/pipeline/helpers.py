@@ -19,7 +19,7 @@ from ai_flywheel.adapters.wiki_gate import (
     RouteDecision,
     RoutingCandidates,
 )
-from ai_flywheel.models import PlannedWrite, SessionRecord, WorkflowRunRecord
+from ai_flywheel.models import INCIDENT_APPROVAL_REASON, PlannedWrite, SessionRecord, WorkflowRunRecord
 from ai_flywheel.storage.db import FlywheelDB, SEVERITY_RANK, normalize_root_cause_key
 
 
@@ -240,12 +240,22 @@ def route_knowledge_doc(
 def apply_route_decision(write: PlannedWrite, decision: RouteDecision) -> list[str]:
     """Carry what the route verdict decided onto the planned write; returns the traces it leaves.
 
-    Only a project-domain page changes anything. A sensitive page is flagged for the
+    A project-domain page is what changes most. A sensitive page is flagged for the
     approval gate: the mounted contract knows which directory that is, and the write then
     carries the flag, so the gate, the portal and the Feishu card read one answer. A
     create that met an existing page is shown as the update it became.
+
+    An incident card is sensitive by the kind of page it is. The plan was already flagged
+    when its routing declaration named the incident page type; this is the same flag for a
+    card the contract recognised by another road, and it leaves no trace of its own.
     """
-    if not decision.routed or not decision.domain:
+    if not decision.routed:
+        return []
+    if not decision.domain:
+        if decision.sensitive and not write.requires_approval:
+            write.requires_approval = True
+            base = write.approval_reason.strip().rstrip("。；; ")
+            write.approval_reason = "；".join(part for part in (base, INCIDENT_APPROVAL_REASON) if part)
         return []
     traces: list[str] = []
     reasons: list[str] = []

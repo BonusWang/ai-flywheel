@@ -8,7 +8,8 @@
 2. **提示词骨架**：P03 的两个修复骨架必须是合法 JSON，且带齐每个必填键
    （带路由的变体还要带 `wiki_route`）。
 3. **跨层契约**：版本号四处一致、示例配置与运行器默认值一致、前端状态联合与后端枚举一致、
-   前端标签覆盖全部节点与信号种类、飞书卡片与后端对"敏感情项"的判定一致。
+   前端标签覆盖全部节点与信号种类、飞书卡片与后端对"敏感情项"的判定一致、事故卡在三处
+   同为敏感且计划 / 路由 / 审批门给出同一条理由。
 4. **真实 serve 角色**：以 `process_role="serve"` 起服务，`/health`、核心索引卡、
    `flywheel-recovery` 线程都要真的活着，退出时不报错。
 5. **Windows 契约**：反斜杠工作区路径要切干净，写出的文档必须是 LF。
@@ -39,19 +40,26 @@ from ai_flywheel.adapters.runners import (
     P03_ITEM_REQUIRED_KEYS,
     P03_REPAIR_SCHEMA_HINT,
     P03_REPAIR_SCHEMA_HINT_WITH_ROUTE,
+    PLAN_SOURCE_MODEL,
     OpenAICompatibleRunner,
+    _plan_from_items,
 )
 from ai_flywheel.adapters.wiki import _workspace_segments
+from ai_flywheel.adapters.wiki.router import RouteDecision
 from ai_flywheel.app import create_app
 from ai_flywheel.config import ApiRunnerConfig, FlywheelConfig
 from ai_flywheel.core.feishu_card import is_sensitive
-from ai_flywheel.core.orchestrator import NODE_TEMPLATES
+from ai_flywheel.core.orchestrator import NODE_TEMPLATES, WorkflowOrchestrator
+from ai_flywheel.core.pipeline.helpers import apply_route_decision
 from ai_flywheel.models import (
+    INCIDENT_APPROVAL_REASON,
     IngressChannel,
+    PlannedWrite,
     QueueStatus,
     RuleStatus,
     RunStatus,
     SignalKind,
+    is_incident_write,
     is_sensitive_write,
 )
 from ai_flywheel.runtime import FlywheelRuntime
@@ -737,3 +745,116 @@ def test_the_hygiene_scan_covers_the_authoritative_ddl():
     """权威 DDL 也是公开仓文本，必须纳入卫生扫描后缀。"""
     assert ".sql" in verify_repo.SCAN_SUFFIXES
     assert (REPO_ROOT / "docs" / "schema.sql").is_file()
+
+# ---------------------------------------------------------------- the incident ledger and the new review and plan settings
+# (feat-agy-ingest-and-high-fidelity-distill)
+
+
+LEDGER_PATH = "wiki/incidents/ai-incidents/2026-11-27-wrong-config.md"
+# The three grounds on which a planned write is a page of the incident ledger; any one is enough.
+INCIDENT_GROUNDS = {
+    "the routing declaration names the page type": {"wiki_route": {"page_type": "Incident", "project": None}},
+    "the item's own payload names it": {"page_type": "incident"},
+    "the target path lies in a ledger directory": {"relative_path": LEDGER_PATH},
+}
+
+
+def test_an_incident_card_is_sensitive_on_every_surface_by_any_of_its_three_grounds():
+    """事故卡在卡片、审批门与门户三处是同一个答案：三条依据任一成立即为敏感。"""
+    for ground, fields in INCIDENT_GROUNDS.items():
+        for action in ("create", "update"):
+            write: dict[str, Any] = {
+                "target_kind": "knowledge_doc",
+                "action": action,
+                "requires_approval": False,
+                "title": "改错测试库配置复盘",
+                "summary": "s",
+                **fields,
+            }
+            assert (is_incident_write(write), is_sensitive(write), is_sensitive_write(write)) == (True, True, True), (ground, write)
+            if "page_type" in fields:
+                continue  # the item's own top-level declaration is a shape only the card's dict carries
+            # The shape the pipeline carries reads the same answer.
+            as_model = PlannedWrite(**write)
+            assert (is_incident_write(as_model), is_sensitive(as_model), is_sensitive_write(as_model)) == (True, True, True), (ground, as_model)
+
+    # The path ground holds whatever the spelling of the path, with no declaration anywhere.
+    for path in (r"wiki\incidents\AI-Incidents\2026-11-27-x.md", "wiki/incidents/ai-incidents-2026/x.md"):
+        assert is_incident_write({"target_kind": "knowledge_doc", "relative_path": path}) is True
+
+    # A note that only talks about the ledger is a routine note; so is a page outside it.
+    for routine in (
+        {
+            "target_kind": "knowledge_doc",
+            "action": "create",
+            "requires_approval": False,
+            "title": "事故复盘",
+            "summary": "s",
+            "relative_path": "lessons/2026-11-27-incident-note.md",
+            "content_preview": "## 事实\n\n- 这次事故记入了 ai-incidents 台账。\n",
+        },
+        {
+            "target_kind": "knowledge_doc",
+            "action": "create",
+            "requires_approval": False,
+            "title": "事故复盘",
+            "summary": "s",
+            "relative_path": "wiki/incidents/2026-11-27-x.md",
+            "wiki_route": {"page_type": "project-practice-note", "project": "alpha"},
+        },
+    ):
+        assert (is_incident_write(routine), is_sensitive(routine), is_sensitive_write(routine)) == (False, False, False), routine
+
+
+def test_the_plan_the_route_and_the_approval_gate_name_the_same_reason_for_an_incident_card():
+    """计划、路由、审批门三处对事故卡给出同一条理由，门户与卡片上不会出现两种说法。"""
+    item = {
+        "target_kind": "knowledge_doc",
+        "action": "create",
+        "title": "改错测试库配置复盘",
+        "summary": "助手改错了测试库配置且未告知。",
+        "relative_path": LEDGER_PATH,
+        "source_session_keys": ["codex:s-1"],
+        "content_preview": "## 定性\n\n严重：助手改错了测试库配置且未告知。\n",
+        "wiki_route": {"page_type": "incident", "project": None, "reason": "一次协作事故"},
+    }
+
+    (planned,) = _plan_from_items(
+        [item], source=PLAN_SOURCE_MODEL, max_write_set=8, default_doc_prefix="lessons/", skills_root=None
+    ).planned_writes
+    assert (planned.requires_approval, planned.approval_reason) == (True, INCIDENT_APPROVAL_REASON)
+
+    # A card the plan did not flag gets the same words when the route recognises it.
+    unflagged = planned.model_copy(update={"requires_approval": False, "approval_reason": ""})
+    assert apply_route_decision(unflagged, RouteDecision(routed=True, page_type="incident", sensitive=True)) == []
+    assert (unflagged.requires_approval, unflagged.approval_reason) == (True, INCIDENT_APPROVAL_REASON)
+
+    # The gate repeats that reason to the human, and nothing else.
+    assert WorkflowOrchestrator._needs_manual_approval([planned], "smart") == (True, [INCIDENT_APPROVAL_REASON])
+
+
+def test_the_example_config_matches_the_defaults_of_the_new_review_and_plan_settings():
+    """示例配置必须写全新增的键（会话文本预算、分阶段模型、领域页配额），并与代码默认值一致。"""
+    import yaml
+
+    from ai_flywheel.config import WorkflowConfig
+
+    example = FlywheelConfig.model_validate(
+        yaml.safe_load((REPO_ROOT / "flywheel.yaml.example").read_text(encoding="utf-8"))
+    )
+    api, workflow = ApiRunnerConfig(), WorkflowConfig()
+
+    assert api.p02_session_char_limit == 16000
+    assert example.runner.api.p02_session_char_limit == api.p02_session_char_limit
+    # Empty means the stage runs on the configured `model` / `reasoning_effort`: a template must not pick a model.
+    for key in ("review_model", "review_reasoning_effort", "plan_model", "plan_reasoning_effort"):
+        assert getattr(api, key) == "", key
+        assert getattr(example.runner.api, key) == "", key
+    assert workflow.max_domain_writes_per_run == 8
+    assert example.workflow.max_domain_writes_per_run == workflow.max_domain_writes_per_run
+    # The bounds: a budget too small to review with or too large to send, and a quota beyond the write set.
+    for rejected in ({"p02_session_char_limit": 1999}, {"p02_session_char_limit": 64001}):
+        with pytest.raises(ValueError):
+            ApiRunnerConfig(**rejected)
+    with pytest.raises(ValueError):
+        WorkflowConfig(max_domain_writes_per_run=33)

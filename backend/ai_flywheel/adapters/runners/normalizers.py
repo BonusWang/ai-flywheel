@@ -32,7 +32,7 @@ from ai_flywheel.adapters.runners.contracts import (
 )
 from ai_flywheel.core.privacy import SecretLeakError, mask_credential_shapes, sanitize_and_check_secrets
 from ai_flywheel.core.time_utils import shanghai_today_ymd
-from ai_flywheel.models import SENSITIVE_CONFIG_PAGE_TYPE, PlannedWrite
+from ai_flywheel.models import INCIDENT_APPROVAL_REASON, INCIDENT_PAGE_TYPE, SENSITIVE_CONFIG_PAGE_TYPE, PlannedWrite
 
 
 class _DropItem(Exception):
@@ -284,6 +284,52 @@ def normalize_domain_signals(raw: Any) -> dict[str, list[Any]]:
     return signals
 
 
+# ---------------- P02: the events of a review ----------------
+
+# What a review event may be: something a session did that stands on its own.
+REVIEW_EVENT_KINDS = ("delivery", "incident", "decision", "domain_fact")
+_EVENT_LIMIT = 24  # events kept per review
+_EVENT_TITLE_LIMIT = 80  # characters kept per title
+_EVENT_SUMMARY_LIMIT = 600  # characters kept per summary
+_EVENT_KEY_LIMIT = 120  # characters kept per session key
+
+
+def normalize_review_events(raw: Any) -> list[dict[str, str]]:
+    """The optional ``events`` of a review, in the one shape a planner reads.
+
+    Each event is ``{"event_id", "kind", "title", "summary", "session_key"}``. The field is
+    optional in the review contract, so whatever came back (nothing, another type, a
+    malformed entry) yields a list, never a failed review. An entry is kept when it names
+    one of `REVIEW_EVENT_KINDS`, the session it belongs to, and something to say; its id
+    is its place in the list, so two events never share one and the same reply always
+    yields the same ids. A credential shape in a title or a summary is masked. Applying
+    this to its own output changes nothing.
+    """
+    events: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    if not isinstance(raw, list):
+        return events
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        kind = _as_text(entry.get("kind")).strip().lower()
+        session_key = mask_credential_shapes(_as_text(entry.get("session_key"))).strip()[:_EVENT_KEY_LIMIT]
+        if kind not in REVIEW_EVENT_KINDS or not session_key:
+            continue
+        title = mask_credential_shapes(_as_text(entry.get("title"))).strip()[:_EVENT_TITLE_LIMIT]
+        summary = mask_credential_shapes(_as_text(entry.get("summary"))).strip()[:_EVENT_SUMMARY_LIMIT]
+        if not title and not summary:
+            continue
+        signature = (kind, title, summary, session_key)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        events.append({"event_id": f"ev-{len(events) + 1}", "kind": kind, "title": title, "summary": summary, "session_key": session_key})
+        if len(events) >= _EVENT_LIMIT:
+            break
+    return events
+
+
 def _normalize_planned_write(
     raw_item: dict[str, Any],
     default_doc_prefix: str,
@@ -404,6 +450,11 @@ def _normalize_planned_write(
             # flagged here, so the approval preview already says so before the Wiki gate routes it.
             pw.requires_approval = True
             pw.approval_reason = pw.approval_reason or "项目配置页属于敏感写入，需人工确认后才会落盘"
+        if page_type == INCIDENT_PAGE_TYPE and not pw.requires_approval:
+            # An incident page is a sensitive write too: it states what went wrong and why, so
+            # it is flagged like the configuration page, whatever the batch size.
+            pw.requires_approval = True
+            pw.approval_reason = pw.approval_reason or INCIDENT_APPROVAL_REASON
     return pw
 
 

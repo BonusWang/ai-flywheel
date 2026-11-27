@@ -13,16 +13,26 @@ from typing import Any
 from ai_flywheel.adapters.runners.contracts import P02_MAX_SESSIONS
 from ai_flywheel.adapters.skills import inspect_skill_at
 from ai_flywheel.adapters.wiki.router import RoutingCandidates
+from ai_flywheel.core.privacy import mask_credential_shapes
 from ai_flywheel.core.time_utils import shanghai_today_ymd
 from ai_flywheel.models import RetroItem, RuleRecord, SessionRecord
 
-# How much of one session the P02 prompt carries. A long session is excerpted head + tail:
-# the conclusions, the fixes and the verifications live at its end, and a plain prefix
-# would drop exactly the part the reviewer needs.
-P02_SESSION_TEXT_LIMIT = 3000
-P02_SESSION_HEAD_CHARS = 1450
-P02_SESSION_TAIL_CHARS = 1450
+# How much of one session's dialogue the P02 prompt carries, unless the configuration sets
+# another budget (`runner.api.p02_session_char_limit`). A longer session is excerpted head +
+# tail: the conclusions, the fixes and the verifications live at its end, and a plain prefix
+# would drop exactly the part the reviewer needs. 16000 carries a long investigation whole;
+# the two halves leave room for the omission marker inside the budget.
+P02_SESSION_TEXT_LIMIT = 16000
+P02_SESSION_HEAD_CHARS = 7800
+P02_SESSION_TAIL_CHARS = 7800
 P02_MIDDLE_OMITTED = "\n...[middle omitted]...\n"
+
+# The client's structured brief of a session: the heading the prompt carries it under, and
+# the header line of the block the queue writes after the dialogue of a queue item.
+P02_BRIEF_MARKER = "[structured_brief]"
+P02_APPENDED_BRIEF_HEADER = (
+    "flywheel-brief: structured brief submitted by the client (evidence for the review, not dialogue)"
+)
 
 
 def excerpt_session_text(text: str, limit: int = P02_SESSION_TEXT_LIMIT) -> str:
@@ -30,13 +40,102 @@ def excerpt_session_text(text: str, limit: int = P02_SESSION_TEXT_LIMIT) -> str:
 
     Short texts are passed through unchanged; longer ones keep their opening and their
     closing, with the omitted middle marked so the reviewer knows it is not the whole text.
+    The marker counts against the budget: the excerpt never exceeds ``limit``.
     """
     body = text or ""
     if len(body) <= limit:
         return body
-    head_chars = min(P02_SESSION_HEAD_CHARS, limit // 2)
-    tail_chars = min(P02_SESSION_TAIL_CHARS, limit - head_chars)
-    return f"{body[:head_chars]}{P02_MIDDLE_OMITTED}{body[-tail_chars:]}"
+    marker = len(P02_MIDDLE_OMITTED)
+    head_chars = min(P02_SESSION_HEAD_CHARS, max(0, (limit - marker) // 2))
+    tail_chars = min(P02_SESSION_TAIL_CHARS, max(0, limit - marker - head_chars))
+    return f"{body[:head_chars]}{P02_MIDDLE_OMITTED}{body[-tail_chars:]}" if tail_chars else body[:head_chars]
+
+
+def split_appended_brief(text: str) -> tuple[str, str]:
+    """``(dialogue, brief)`` of a session text that ends with the brief the queue appended to it.
+
+    The queue writes a client's structured brief after the dialogue of a queue item, as one
+    last block: a header line, then indented entries. A text that does not end with such a
+    block is returned as it is, with an empty brief.
+    """
+    body = text or ""
+    start = body.rfind("\n" + P02_APPENDED_BRIEF_HEADER)
+    if start != -1:
+        start += 1
+    elif body.startswith(P02_APPENDED_BRIEF_HEADER):
+        start = 0
+    else:
+        return body, ""
+    lines = body[start:].split("\n")
+    if lines[0] != P02_APPENDED_BRIEF_HEADER or any(not line.startswith("  - ") for line in lines[1:]):
+        return body, ""
+    return body[:start].rstrip("\n"), body[start:]
+
+
+def _mask_credential_named_value(key: Any, entry: Any) -> Any:
+    """The value under a key that names a credential, masked when it is one."""
+    if not isinstance(entry, str) or not entry.strip():
+        return entry
+    assignment = f"{key}={entry}"
+    return "[REDACTED]" if mask_credential_shapes(assignment) != assignment else entry
+
+
+def _mask_brief_values(value: Any) -> Any:
+    """A brief with the value of every key that names a credential masked, at any depth."""
+    if isinstance(value, dict):
+        return {key: _mask_brief_values(_mask_credential_named_value(key, entry)) for key, entry in value.items()}
+    if isinstance(value, list):
+        return [_mask_brief_values(entry) for entry in value]
+    return value
+
+
+def _render_structured_brief(brief: Any) -> str:
+    """A session's structured brief as the prompt carries it, or ``''`` when there is none.
+
+    A mapping is written as JSON, in the order the client gave its keys; a text is taken as
+    the brief itself. Either stands under one heading, and a credential is masked in it as
+    it is in every other text that leaves for the model. The queue redacts a brief when it
+    is submitted; this is the second net, on the same patterns: a value given as an
+    assignment inside a text, and the value of a key that names a credential — which JSON
+    writes as ``"key": "value"``, a shape no assignment pattern matches.
+    """
+    if isinstance(brief, str):
+        content = brief.strip()
+    elif isinstance(brief, dict) and brief:
+        content = json.dumps(_mask_brief_values(brief), ensure_ascii=False, indent=2, default=str)
+    else:
+        return ""
+    if not content:
+        return ""
+    if content.startswith(P02_BRIEF_MARKER):
+        content = content[len(P02_BRIEF_MARKER) :].lstrip("\n")
+    return f"{P02_BRIEF_MARKER}\n{mask_credential_shapes(content)}"
+
+
+def _p02_session_entry(session: SessionRecord, text: str, limit: int) -> dict[str, str]:
+    """One session of the P02 input: what identifies it, its structured brief, then its dialogue.
+
+    The brief is the client's own account of what the session established. It comes before
+    the dialogue and is carried whole: only the dialogue is excerpted to the budget
+    (``limit``), so the middle of a long conversation can never take the brief with it. A
+    brief the queue already appended to the text is read off the end of that text, which
+    leaves it neither cut by the excerpt nor carried twice.
+    """
+    dialogue, appended = split_appended_brief(text)
+    metadata = session.metadata if isinstance(session.metadata, dict) else {}
+    brief = _render_structured_brief(metadata.get("structured_brief")) or (
+        f"{P02_BRIEF_MARKER}\n{mask_credential_shapes(appended)}" if appended else ""
+    )
+    entry = {
+        "session_key": session.session_key,
+        "client": session.client,
+        "project": session.project,
+        "title": session.title,
+    }
+    if brief:
+        entry["structured_brief"] = brief
+    entry["text"] = excerpt_session_text(dialogue, limit)
+    return entry
 
 
 def _build_p02_prompt(
@@ -44,17 +143,16 @@ def _build_p02_prompt(
     open_retros: list[RetroItem],
     existing_skills: list[dict[str, Any]] | None,
     phase: str,
+    *,
+    session_char_limit: int | None = None,
 ) -> str:
-    payload = [
-        {
-            "session_key": s.session_key,
-            "client": s.client,
-            "project": s.project,
-            "title": s.title,
-            "text": excerpt_session_text(t),
-        }
-        for s, t in sessions[:P02_MAX_SESSIONS]
-    ]
+    """The P02 prompt of a batch.
+
+    ``session_char_limit`` is how much of one session's dialogue it may carry; a caller that
+    passes none gets `P02_SESSION_TEXT_LIMIT`.
+    """
+    limit = P02_SESSION_TEXT_LIMIT if session_char_limit is None else max(1, int(session_char_limit))
+    payload = [_p02_session_entry(s, t, limit) for s, t in sessions[:P02_MAX_SESSIONS]]
     skills_brief = [
         {"name": sk.get("name", ""), "description": str(sk.get("description", ""))[:120]}
         for sk in (existing_skills or [])[:60]
@@ -87,6 +185,19 @@ def _build_p02_prompt(
         "algorithms and statistical calibers settled or verified. Leave a domain the session did not touch empty ([]) "
         "and never infer, generalise or pad it; omit the whole field when a finding has no such clue. NEVER write a "
         "password, token or private key into project_configs, not even partly masked: name where it is kept instead.\n"
+        "STRUCTURED BRIEF: a session entry may carry \"structured_brief\" ahead of its \"text\". It is the client's own "
+        "account of what the session established: the tables, configuration, root causes and decisions it made sure of. "
+        "It is evidence the client submitted, not dialogue: read it first, weigh it against the dialogue, and quote "
+        "the dialogue, never the brief, as something the session said.\n"
+        "EVENTS: one session can hold several things that stand on their own. List each as one entry of the top-level "
+        "\"events\" array, in the order the session tells them: \"event_id\" (ev-1, ev-2, ...), \"kind\" "
+        "(delivery|incident|decision|domain_fact), \"title\" (clean concise Chinese), \"summary\" (what happened and what "
+        "it established, in Chinese) and \"session_key\" (copied verbatim). An incident is a collaboration accident: a "
+        "silent failure, a wrong write or a mistaken claim an AI assistant caused or met. One entry per event, never "
+        "one for two: a business delivery and the incident that happened on the way are two events, and so are two "
+        "unrelated deliveries. Record every incident as its own event, whatever else its session holds; record a "
+        "delivery, a decision or a domain fact as an event when it stands apart from the session's other events. "
+        "Leave the array empty ([]) when there is no such event.\n"
         "Return STRICT JSON ONLY:\n"
         '{"findings":[{"session_key":"...","client":"...","project":"...","title":"简洁中文标题",'
         '"worthy":true,"category":"project|knowledge|workflow|temp_chat","skip_reason":"",'
@@ -95,6 +206,8 @@ def _build_p02_prompt(
         '"domain_signals":{"database_tables":[{"table":"table_name","verified_fields":["..."],"enums":["..."],'
         '"join_keys":["..."],"pitfalls":["..."]}],"project_configs":[{"topic":"config_topic","facts":["..."],'
         '"pitfalls":["..."]}],"architecture_flows":["..."],"business_calibers":["..."]}}],'
+        '"events":[{"event_id":"ev-1","kind":"delivery|incident|decision|domain_fact","title":"简洁中文标题",'
+        '"summary":"...","session_key":"..."}],'
         '"mistakes":[{"root_cause_key":"kebab-case-root-cause","severity_grade":"red_silent|yellow_caught|green_minor",'
         '"title":"简短错题标题","phenomenon":"发生了什么","truth":"正确做法","thinking_root_cause":"思维盲点",'
         '"caught_by":"user|tool|self","session_key":"..."}],'
@@ -157,16 +270,102 @@ def _domain_pages_offered(routing_candidates: RoutingCandidates | None) -> bool:
     return deposit is not None and bool(deposit.domains)
 
 
-def _p03_deposit_text(routing_candidates: RoutingCandidates | None) -> str:
+def _incident_pages_offered(routing_candidates: RoutingCandidates | None) -> bool:
+    """Whether the planner is told about the Wiki's incident ledger.
+
+    Only a Wiki whose contract declares the incident page type and whose ledger this sink
+    is allowed to write into offers it (see `RoutingCandidates.incident_offered`).
+    """
+    return routing_candidates is not None and routing_candidates.incident_offered
+
+
+def _p03_incident_text(routing_candidates: RoutingCandidates | None) -> str:
+    """How an incident card is planned, for a Wiki that offers the page type; nothing otherwise."""
+    if not _incident_pages_offered(routing_candidates) or routing_candidates is None:
+        return ""
+    directory = routing_candidates.incident.directory
+    return (
+        "INCIDENT PAGES: this Wiki keeps a ledger of collaboration incidents and offers the page type "
+        f'"incident" for it ("routing_candidates.incident_pages"). An incident card is a "knowledge_doc" whose '
+        f'"relative_path" is "{directory}/<YYYY-MM-DD>-<slug>.md" (a sequence number and a dash may come first: '
+        '"NNN-YYYY-MM-DD-<slug>.md"), whose "wiki_route" is {"page_type": "incident", "project": null, "reason": "..."} '
+        '— the one case in which a null project is routed — and whose "action" is "create". Its "content_preview" is '
+        'the card itself: no "# " title; frontmatter is optional (the engine completes what the contract requires and '
+        "keeps a value the draft states); and exactly these level-2 sections, in this order: "
+        '"## 定性" (what kind of incident it is and how severe), "## 事实核验" (what was checked and found, each '
+        'fact as verified), "## 根因" (why it happened), "## 治本规则" (the rule or the change that removes the '
+        'cause) and "## 证据指针" (where the evidence lives: session keys, paths, log names — never a credential). '
+        "State only what the session shows: where the root cause is not established, say so instead of guessing, and "
+        "leave a section you cannot fill empty rather than inventing it. "
+        "An incident page is a sensitive write: it is flagged for a human approval.\n"
+    )
+
+
+def _p03_events_text(events: list[Any], routing_candidates: RoutingCandidates | None) -> str:
+    """How a review that split sessions into events is planned; nothing when it holds no event."""
+    if not events:
+        return ""
+    if _incident_pages_offered(routing_candidates):
+        incident_clause = (
+            " An incident event becomes one incident card of its own, as INCIDENT PAGES describes, in addition to "
+            "whatever else its session deserves."
+        )
+    else:
+        incident_clause = (
+            ' This Wiki offers no incident page (see routing_candidates.page_types): an incident stays in the '
+            "review's mistakes, and no knowledge_doc may claim the page type \"incident\"."
+        )
+    return (
+        "EVENTS: the review split some sessions into events that stand on their own (\"events\" in the input: "
+        'event_id, kind, title, summary, session_key). Plan by event, not by session: a delivery or a decision '
+        "event that deserves a document gets an experience card of its own, built from that event alone; a "
+        "domain_fact event is recorded once, in the domain pages the Wiki declares (PROJECT DOMAIN PAGES) when "
+        "there are any and otherwise with its session's card. Two events are never merged into one card: above "
+        "all, an incident card must not swallow the business a session delivered, and a delivery's card must not "
+        'carry the incident that happened on the way. Copy the event\'s session_key into "source_session_keys" '
+        "and name the event in the title." + incident_clause + "\n"
+    )
+
+
+def _p03_deposit_text(
+    routing_candidates: RoutingCandidates | None,
+    *,
+    max_domain_writes: int | None = None,
+    total_write_set: int | None = None,
+) -> str:
     """The gradual-completion rules of a Wiki that declares a project-domain deposit routing.
 
     Nothing when the Wiki declares none: such a Wiki keeps the prompt it had, byte for
     byte. Everything the rules refer to (domain names, target paths, page types,
     templates) is read by the model off ``routing_candidates.deposit_routing``; none of
     it is written here.
+
+    ``max_domain_writes`` and ``total_write_set``, when given, are the caps domain pages
+    are counted under: apart from every other item, and within the batch's write set.
     """
     if not _domain_pages_offered(routing_candidates):
         return ""
+    counted_apart = max_domain_writes is not None and total_write_set is not None
+    if counted_apart:
+        domain_cap = max(0, int(max_domain_writes))
+        if domain_cap:
+            planned = (
+                f'Plan one "knowledge_doc" per domain page that the findings\' "domain_signals" name, at most '
+                f"{domain_cap} of them, and only for a fact the session verified."
+            )
+        else:
+            planned = "No domain page is planned in this batch: their cap is 0."
+        rule_one = (
+            "1. Keep at least one slot for the main experience card of rule 1: a domain page must not crowd it "
+            "out. Domain pages are counted under a cap of their own, apart from every other item (see IMPORTANT "
+            f"below). {planned} Never plan a domain page from a guess.\n"
+        )
+    else:
+        rule_one = (
+            '1. Keep at least one slot for the main experience card of rule 1: a domain page must not crowd it out. Only '
+            'inside the item cap, plan one "knowledge_doc" per domain page that the findings\' "domain_signals" name, and '
+            "only for a fact the session verified. Never plan a domain page from a guess.\n"
+        )
     return (
         "PROJECT DOMAIN PAGES: this Wiki also files what a session VERIFIED about one project into that project's "
         'domain pages. "routing_candidates.deposit_routing" declares them (domains, triggers, target_path, page_types '
@@ -174,9 +373,7 @@ def _p03_deposit_text(routing_candidates: RoutingCandidates | None) -> str:
         'already holds per directory; "domain_page_sections", where present, shows a page\'s sections and the header '
         "row of each of its tables.\n"
         "GRADUAL COMPLETION RULES:\n"
-        '1. Keep at least one slot for the main experience card of rule 1: a domain page must not crowd it out. Only '
-        'inside the item cap, plan one "knowledge_doc" per domain page that the findings\' "domain_signals" name, and '
-        "only for a fact the session verified. Never plan a domain page from a guess.\n"
+        f"{rule_one}"
         "2. database_tables, ONE TABLE PER PAGE: when the table name is listed in that project's domain_inventory, "
         'action="update" and relative_path is that existing page; otherwise action="create" with a page named after the '
         "table alone. Record only the verified fields, enum values, join keys and pitfalls: a full DDL is never "
@@ -233,7 +430,16 @@ def _build_p03_prompt(
     *,
     routing_candidates: RoutingCandidates | None = None,
     existing_skill_sections: dict[str, list[str]] | None = None,
+    max_domain_writes: int | None = None,
+    total_write_set: int | None = None,
 ) -> str:
+    """The P03 prompt of a batch.
+
+    ``max_write_set`` is the cap on the items that are not project-domain pages. When the
+    plan may hold domain pages, ``max_domain_writes`` is the cap they are counted under,
+    apart from the others, and ``total_write_set`` the bound on the plan as a whole;
+    without them a Wiki that declares domain pages keeps the single cap it had.
+    """
     existing_summary = [{"rule_id": r.rule_id, "title": r.title, "status": r.status.value} for r in existing_rules]
     skill_names = [sk.get("name", "") for sk in (existing_skills or [])[:60] if sk.get("name")]
     # The prompt's cap is the batch's own cap: a configured max_writes_per_run must not be
@@ -241,7 +447,12 @@ def _build_p03_prompt(
     capped_items = max(1, max_write_set)
     today = shanghai_today_ymd()
     routing_paragraph, knowledge_doc_routing = _p03_routing_text(routing_candidates)
-    deposit_paragraph = _p03_deposit_text(routing_candidates)
+    deposit_paragraph = _p03_deposit_text(
+        routing_candidates, max_domain_writes=max_domain_writes, total_write_set=total_write_set
+    )
+    incident_paragraph = _p03_incident_text(routing_candidates)
+    events = [event for event in (review_findings.get("events") or []) if isinstance(event, dict)]
+    events_paragraph = _p03_events_text(events, routing_candidates)
     routable = routing_candidates is not None and routing_candidates.routable
     skill_sections = {str(name): list(headings or []) for name, headings in (existing_skill_sections or {}).items()}
     domain_pages_offered = _domain_pages_offered(routing_candidates)
@@ -263,6 +474,10 @@ def _build_p03_prompt(
         "existing_skill_names": skill_names,
         "existing_skill_sections": skill_sections,
     }
+    if events:
+        # The review's events enter the input only when there are any: every other batch gets
+        # the prompt it always had, byte for byte.
+        payload["events"] = events
     if routing_candidates is not None:
         payload["routing_candidates"] = routing_candidates.to_dict(description_limit=120)
     # Sessions the client wrote up by hand (hand_distilled): their knowledge is in the Wiki
@@ -288,6 +503,14 @@ def _build_p03_prompt(
         if skill_sections
         else ""
     )
+    if domain_pages_offered and max_domain_writes is not None and total_write_set is not None:
+        # Domain pages are counted apart: the prompt names their cap and the bound on the whole.
+        caps_sentence = (
+            f"IMPORTANT: Output at most {capped_items} items that are not project-domain pages, and at most "
+            f"{max(0, int(max_domain_writes))} project-domain pages ({max(1, int(total_write_set))} items in all). "
+        )
+    else:
+        caps_sentence = f"IMPORTANT: Output at most {capped_items} total items. "
     return (
         "You are the P03 Route & Write-Plan Worker of AI Flywheel.\n"
         "Deduplicate against existing_rules and existing_skills, then return the top highest-value writes in Chinese.\n"
@@ -300,12 +523,21 @@ def _build_p03_prompt(
         'If nothing is worth writing, return {"planned_writes": []}.\n'
         f"{routing_paragraph}"
         f"{deposit_paragraph}"
+        f"{incident_paragraph}"
+        f"{events_paragraph}"
+        "DOCUMENT DEPTH: a knowledge_doc is written for a reader who was not in the session and must be able to act "
+        "without the transcript. Its content_preview is the complete structured body of the document: every name, "
+        "value, step, condition and boundary the session verified, each stated once, in the document's own words — "
+        "no restatement of the review, no filler, no summary of what its headings already say. Its length follows "
+        "its content, within the limits the knowledge base sets for the page type: a project experience card "
+        "(实战经验卡) stays within 80 lines and a lite card (轻记卡) within 20 lines; a project-domain page carries "
+        "only the difference the session verified (已证差量), never a restatement of what the page already holds.\n"
         f"{skill_sections_note}"
         f"{hand_distilled_note}"
         "Allowed target_kind values:\n"
         f'1. "knowledge_doc": relative_path under "{default_doc_prefix}{today}-slug.md", action="create|update", '
-        f'content_preview=concise structured markdown (220-450 chars) with frontmatter including '
-        f'freshness_tier (volatile|evolving|evergreen), last_verified: {today}, valid_until, '
+        "content_preview=the complete structured markdown body of the document (see DOCUMENT DEPTH) with frontmatter "
+        f"including freshness_tier (volatile|evolving|evergreen), last_verified: {today}, valid_until, "
         f'and sections "## 适用前提与失效条件" and "## 分歧与反例"{knowledge_doc_routing}.\n'
         '2. "flywheel_rule": ONLY emit for items in eligible_promotions (either red_silent or occurrence_count>=3). '
         'relative_path=null, action="register_rule", MUST include rule_payload with EXACT keys: '
@@ -321,7 +553,7 @@ def _build_p03_prompt(
         'YAML frontmatter "---\\nname: <slug>\\ndescription: ...\\n---\\n\\n# ..." (250-500 chars); for action="update" it MUST be '
         'ONLY the incremental Markdown section to append at the END of the existing SKILL.md, starting with a "## " heading '
         "(200-500 chars), with NO frontmatter, NO \"# \" title and NO re-writing of the existing sections.\n"
-        f"IMPORTANT: Output at most {capped_items} total items. Keep content_preview concise so JSON completes cleanly. "
+        f"{caps_sentence}"
         "Reserve at least one slot for a worthy knowledge_doc item: a rule or a Skill must not crowd out the "
         "experience card of a session that deserves one. "
         "Return STRICT JSON ONLY:\n"

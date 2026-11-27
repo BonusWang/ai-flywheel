@@ -6,10 +6,15 @@ from typing import Any
 
 from ai_flywheel.config import FlywheelConfig
 from ai_flywheel.core.triage import (
+    antigravity_dialogue_text,
     derive_readable_title,
     extract_jsonl_metadata,
     extract_jsonl_workspace,
+    is_antigravity_client,
+    is_antigravity_record,
     is_subagent_filename,
+    scan_quiet_window_seconds,
+    transcript_is_active,
     triage_session,
 )
 from ai_flywheel.models import RegisterSessionRequest, SessionRecord, SessionStatus
@@ -18,7 +23,7 @@ from ai_flywheel.storage.fs_store import redact_text
 
 
 def read_transcript_excerpt(path: Path, max_chars: int = 24000) -> str:
-    """Read local JSONL (Codex/Claude Code) or Markdown/text session transcript safely."""
+    """Read local JSONL (Codex/Claude Code/Antigravity) or Markdown/text session transcript safely."""
     if not path.exists() or not path.is_file():
         return ""
     if path.suffix.lower() == ".jsonl":
@@ -91,6 +96,10 @@ def _extract_jsonl_text(obj: dict[str, Any]) -> str:
     # Support common Codex rollout / Claude Code transcript JSONL shapes,
     # strictly skipping developer/system prompt boilerplate and raw tool outputs
     # so triage, compaction and P02 see real human/assistant dialogue.
+    # An Antigravity step is read by its step type: only the request and the answer
+    # are dialogue, and no other step reaches the generic branches below.
+    if is_antigravity_record(obj):
+        return antigravity_dialogue_text(obj)
     role = str(obj.get("role") or obj.get("type") or "").strip().lower()
     if role in _SKIPPED_RECORD_TYPES:
         return ""
@@ -149,23 +158,46 @@ class SessionAdapter:
         self.cfg = cfg
         self.db = db
 
-    def reconcile_scan_sources(self) -> dict[str, Any]:
+    def reconcile_scan_sources(self, now_ts: float | None = None) -> dict[str, Any]:
+        """Register the sessions a passive scan of the configured sources finds.
+
+        ``now_ts`` is the clock the Antigravity quiet window is measured against
+        (epoch seconds; the wall clock when omitted). Its report keeps
+        ``scanned`` / ``newly_registered`` / ``filtered_fragments`` / ``gaps`` and
+        adds ``skipped_active``: transcripts still being written, left out of this
+        pass and of ``scanned`` until they have gone quiet.
+        """
         scanned = 0
         registered = 0
         filtered_out = 0
+        skipped_active = 0
         gaps: list[str] = []
         triage_cfg = self.cfg.sessions.triage
+        quiet_seconds = scan_quiet_window_seconds(self.cfg)
         for src in self.cfg.sessions.scan_sources:
             root = self.cfg.resolve_path(src.path)
             if not root.exists():
                 gaps.append(f"scan_source_missing:{src.client}:{src.path}")
                 continue
-            files = sorted(root.glob(src.glob), key=lambda p: p.stat().st_mtime, reverse=True)[:40]
+            files = sorted(root.glob(src.glob), key=lambda p: p.stat().st_mtime, reverse=True)
+            if quiet_seconds > 0 and is_antigravity_client(src.client):
+                # Antigravity has no archive directory: a transcript is only finished once it
+                # has stopped changing. One still being written is left out here, before the
+                # newest-files cut — so it is neither registered nor given one of the slots —
+                # and a later pass picks it up once it has gone quiet.
+                quiet_files: list[Path] = []
+                for fp in files:
+                    if transcript_is_active(fp.stat().st_mtime, quiet_seconds=quiet_seconds, now_ts=now_ts):
+                        skipped_active += 1
+                    else:
+                        quiet_files.append(fp)
+                files = quiet_files
+            files = files[:40]
             for fp in files:
                 if not fp.is_file():
                     continue
                 scanned += 1
-                meta = extract_jsonl_metadata(fp) if fp.suffix.lower() == ".jsonl" else {}
+                meta = extract_jsonl_metadata(fp, client=src.client) if fp.suffix.lower() == ".jsonl" else {}
                 is_sub = bool(meta.get("is_subagent"))
                 parent_sid = meta.get("parent_session_id", "")
                 parent_skey = f"{src.client}:{parent_sid}" if parent_sid else ""
@@ -212,6 +244,7 @@ class SessionAdapter:
             "scanned": scanned,
             "newly_registered": registered,
             "filtered_fragments": filtered_out,
+            "skipped_active": skipped_active,
             "gaps": gaps,
         }
 

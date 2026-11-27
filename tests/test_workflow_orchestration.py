@@ -8,6 +8,10 @@
 另覆盖：等待审批期间才声明手工沉淀（P04 兜底）、来源为空的文档、计划被过滤成空、纯函数单测，
 以及规划器被告知哪些会话已手工沉淀。模型回复全部是虚构的固定样例；知识库与 Skill 目录
 都落在临时目录，不触碰任何真实 Wiki。
+
+末尾一节属于 `feat-agy-ingest-and-high-fidelity-distill`：客户端随会话提交的结构化简报经队列与
+协调器到达 P02 提示词；审查拆出的事件到达 P02 节点与 P03 提示词；事故卡在路由与审批门上的
+敏感标记。
 """
 from __future__ import annotations
 
@@ -20,19 +24,27 @@ from typing import Any
 import pytest
 
 from ai_flywheel.adapters.runners import OpenAICompatibleRunner, _build_p03_prompt
+from ai_flywheel.adapters.runners.prompts import P02_APPENDED_BRIEF_HEADER, P02_BRIEF_MARKER
+from ai_flywheel.adapters.wiki.router import RouteDecision
 from ai_flywheel.config import FlywheelConfig
+from ai_flywheel.core.orchestrator import WorkflowOrchestrator
 from ai_flywheel.core.pipeline.helpers import (
     GOVERNANCE_ONLY_SKIP_REASON,
     GOVERNANCE_ONLY_SKIP_STATUS,
+    apply_route_decision,
     filter_governance_only_docs,
     governance_only_skip_receipt,
 )
 from ai_flywheel.models import (
+    INCIDENT_APPROVAL_REASON,
+    DistillQueueItem,
     PlannedWrite,
     RegisterSessionRequest,
     RunStatus,
+    SessionRecord,
     SessionStatus,
     WorkflowRunRecord,
+    is_sensitive_write,
 )
 from ai_flywheel.runtime import FlywheelRuntime
 
@@ -595,3 +607,199 @@ def test_the_planner_prompt_only_changes_when_a_session_was_hand_distilled():
     payload = json.loads(told_payload)
     assert payload.pop("governance_only_session_keys") == [HAND]
     assert payload == json.loads(plain_payload)
+
+# ---------------------------------------------------------------- the brief, the events and the incident card through a run
+# (feat-agy-ingest-and-high-fidelity-distill)
+
+
+BRIEF = {
+    "tables_verified": ["ledger_entries: entry_id 主键，amount 以分为单位"],
+    "root_cause": "连接池上限过小，不是接口超时",
+    "decisions": [{"what": "连接池上限调到 50", "why": "压测下请求排队超时"}],
+}
+INCIDENT_EVENT = {
+    "event_id": "ev-2",
+    "kind": "incident",
+    "title": "事故：改错了测试库配置",
+    "summary": "助手改错了测试库配置且未告知；改配置前先确认环境，改完回读。",
+    "session_key": "codex:s-events",
+}
+LEDGER_PATH = "wiki/incidents/ai-incidents/2026-11-27-wrong-config.md"
+# The runner numbers the events of one review in order, whatever ids the model used.
+NUMBERED_EVENT = {**INCIDENT_EVENT, "event_id": "ev-1"}
+
+
+def _long_dialogue() -> str:
+    """A dialogue the queue splits into two chunks (above its 24000-character chunk limit)."""
+    turn = "[assistant] " + "核对记录。" * 389
+    return "\n\n".join([turn] * 14)
+
+
+def test_a_structured_brief_submitted_with_a_session_reaches_the_review_on_top_of_its_first_chunk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """规格场景（链路侧）：客户端随会话提交的结构化简报经队列到达 P02 提示词，置于第一段会话正文之前。"""
+    rt, _ = _runtime(tmp_path)
+    items = rt.queue.on_explicit_enqueue(
+        client="codex", session_id="s-brief", title="对账复盘", content=_long_dialogue(), structured_brief=BRIEF
+    )
+    assert [item.chunk_index for item in items] == [1, 2]
+    model = _use_model(monkeypatch, _FakeModel(_review("codex:s-brief"), [_doc("brief-note", "codex:s-brief")]))
+
+    run = rt.orchestrator.start_run(trigger="test", phase="daily")
+
+    assert run.status == RunStatus.AWAITING_APPROVAL, run.error
+    assert run.admitted_sessions == ["codex:s-brief"]
+    (prompt,) = [p for p in model.prompts if p.startswith("You are the P02 Review Worker")]
+    first, second = json.loads(prompt.rsplit("\n\n", 1)[1])["sessions"]
+    assert (first["session_key"], second["session_key"]) == ("codex:s-brief", "codex:s-brief")
+    # The brief sits ahead of the dialogue's text, as JSON in the order the client gave its keys, and whole.
+    assert list(first) == ["session_key", "client", "project", "title", "structured_brief", "text"]
+    assert first["structured_brief"] == f"{P02_BRIEF_MARKER}\n{json.dumps(BRIEF, ensure_ascii=False, indent=2)}"
+    assert P02_APPENDED_BRIEF_HEADER not in first["text"]  # lifted out of the chunk the queue appended it to
+    assert "STRUCTURED BRIEF:" in prompt
+    # The second chunk carries dialogue only: the review reads the brief once, with the first part.
+    assert "structured_brief" not in second
+    assert P02_APPENDED_BRIEF_HEADER not in second["text"]
+    # Nothing about the brief is kept on the stored session: the copy lives as long as the batch.
+    assert "structured_brief" not in (rt.db.get_session("codex:s-brief").metadata or {})
+
+
+@pytest.mark.parametrize(
+    "events, carried",
+    [
+        pytest.param([INCIDENT_EVENT], [NUMBERED_EVENT], id="events"),
+        pytest.param([INCIDENT_EVENT, "incident", None], [NUMBERED_EVENT], id="anything-but-a-mapping-is-dropped"),
+        pytest.param({"kind": "incident"}, [], id="a-mapping-is-no-list"),
+        pytest.param(None, [], id="no-key-at-all"),
+    ],
+)
+def test_the_events_of_a_review_reach_the_review_node_and_the_planner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, events: Any, carried: list[dict[str, Any]]
+):
+    """审查拆出的事件经运行器整形（顺序编号）后到达 P02 节点与 P03 提示词；没有事件时规划器不会多看到一个键。"""
+    rt, _ = _runtime(tmp_path)
+    _register(rt, "s-events")
+    review = _review("codex:s-events") if events is None else {**_review("codex:s-events"), "events": events}
+    model = _use_model(monkeypatch, _FakeModel(review, [_doc("events-note", "codex:s-events")]))
+
+    run = rt.orchestrator.start_run(trigger="test", phase="daily", session_keys=["codex:s-events"])
+
+    assert run.status == RunStatus.AWAITING_APPROVAL, run.error
+    assert _node(run, "P02_REVIEW")["payload"]["events"] == carried
+    (prompt,) = model.p03_prompts
+    payload = json.loads(prompt.rsplit("\n\n", 1)[1])
+    assert payload.get("events", []) == carried
+    assert ("EVENTS:" in prompt) is bool(carried)
+
+
+def _stored_session(**overrides: Any) -> SessionRecord:
+    return SessionRecord.model_validate(
+        {"session_key": "codex:s1", "client": "codex", "session_id": "s1", "title": "对账复盘", "project": "demo", **overrides}
+    )
+
+
+def _chunk(chunk_index: int, payload: dict[str, Any] | None = None) -> DistillQueueItem:
+    return DistillQueueItem(
+        queue_id=f"q{chunk_index}",
+        session_key="codex:s1",
+        client="codex",
+        chunk_index=chunk_index,
+        chunk_total=2,
+        payload={"structured_brief": BRIEF} if payload is None else payload,
+    )
+
+
+def test_the_reviewed_session_carries_the_brief_of_the_first_chunk_and_leaves_the_stored_record_alone():
+    """简报只随队列首块进入审查；会话记录本身不被改写，落库的记录与简报无关。"""
+    stored = _stored_session()
+    before = stored.model_dump()
+
+    reviewed = WorkflowOrchestrator._reviewed_session(stored, _chunk(1))
+
+    assert reviewed is not stored
+    assert reviewed.metadata == {"structured_brief": BRIEF}
+
+    def without_metadata(record: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in record.items() if key != "metadata"}
+
+    assert without_metadata(reviewed.model_dump()) == without_metadata(before)
+    assert stored.model_dump() == before  # the stored record is not the one that carries the brief
+
+    # A later chunk, an item that holds no brief, and an item whose payload is not a mapping: the session as it is.
+    not_a_mapping = _chunk(1)
+    not_a_mapping.payload = "not a mapping"  # type: ignore[assignment]
+    for item in (_chunk(2), _chunk(1, {}), _chunk(1, {"structured_brief": {}}), not_a_mapping):
+        assert WorkflowOrchestrator._reviewed_session(stored, item) is stored
+    # A record whose metadata is not a mapping is returned as it is, never repaired on the way.
+    bare = _stored_session().model_copy(update={"metadata": None})
+    assert WorkflowOrchestrator._reviewed_session(bare, _chunk(1)) is bare
+    # A record that already carries a brief keeps its own: the session record wins over the item.
+    own = _stored_session(metadata={"structured_brief": {"root_cause": "会话记录自带的简报"}})
+    assert WorkflowOrchestrator._reviewed_session(own, _chunk(1)) is own
+
+
+def _incident_write(**overrides: Any) -> PlannedWrite:
+    """A plan item for an incident card that the plan itself did not flag."""
+    fields: dict[str, Any] = {
+        "target_kind": "knowledge_doc",
+        "relative_path": LEDGER_PATH,
+        "action": "create",
+        "title": "改错测试库配置复盘",
+        "summary": "助手改错了测试库配置且未告知。",
+        "source_session_keys": ["codex:s-events"],
+    }
+    fields.update(overrides)
+    return PlannedWrite(**fields)
+
+
+def test_the_route_verdict_flags_an_incident_card_the_plan_did_not_flag():
+    """路由声明之外被契约认出的事故卡，同样带上敏感情标记与统一理由；未路由的计划项不被触碰。"""
+    write = _incident_write(wiki_route=None)
+    assert (write.requires_approval, write.approval_reason) == (False, "")
+
+    traces = apply_route_decision(write, RouteDecision(routed=True, source="declared", page_type="incident", sensitive=True))
+
+    assert traces == []
+    assert (write.requires_approval, write.approval_reason) == (True, INCIDENT_APPROVAL_REASON)
+
+    # The plan's own words are kept; a reason without the flag is completed, never replaced.
+    stated = _incident_write(requires_approval=True, approval_reason="模型给出的事故理由")
+    assert apply_route_decision(stated, RouteDecision(routed=True, page_type="incident", sensitive=True)) == []
+    assert (stated.requires_approval, stated.approval_reason) == (True, "模型给出的事故理由")
+    unfinished = _incident_write(requires_approval=False, approval_reason="模型留下的一句说明。")
+    apply_route_decision(unfinished, RouteDecision(routed=True, page_type="incident", sensitive=True))
+    assert unfinished.approval_reason == f"模型留下的一句说明；{INCIDENT_APPROVAL_REASON}"
+
+    # A refused route, and a routine one, leave the item exactly as the plan wrote it.
+    for decision in (
+        RouteDecision(routed=False, reason_code="incident_prefix_not_allowed"),
+        RouteDecision(routed=True, page_type="project-practice-note", sensitive=False),
+    ):
+        untouched = _incident_write()
+        assert apply_route_decision(untouched, decision) == []
+        assert (untouched.requires_approval, untouched.approval_reason) == (False, "")
+
+
+def test_one_incident_card_pauses_a_smart_batch_on_its_own():
+    """smart 模式下，单独一张事故卡就让批次挂起审批，与批量阈值无关。"""
+    pause = WorkflowOrchestrator._needs_manual_approval
+    card = _incident_write(requires_approval=True, approval_reason=INCIDENT_APPROVAL_REASON)
+    routine = _write("knowledge_doc", ["codex:s-normal"], "lessons/2026-11-25-normal-note.md")
+
+    assert pause([card], "smart") == (True, [INCIDENT_APPROVAL_REASON])
+    assert pause([card], "smart", high_write_threshold=1000) == (True, [INCIDENT_APPROVAL_REASON])
+    assert pause([routine], "smart") == (False, [])
+    # Six routine notes stay under the threshold; with the card the batch is over it and says both.
+    assert pause([routine] * 6, "smart") == (False, [])
+    assert pause([card, *([routine] * 6)], "smart") == (
+        True,
+        [INCIDENT_APPROVAL_REASON, "本批建议写入共 7 项（超过自动放行阈值 6）"],
+    )
+    # A card the plan did not flag still pauses the gate: it reads the same predicate as the card does.
+    unflagged = _incident_write(wiki_route={"page_type": "incident", "project": None, "reason": "一次协作事故"})
+    assert is_sensitive_write(unflagged) is True
+    assert pause([unflagged], "smart") == (True, ["重要变更：改错测试库配置复盘"])
+    # `always` pauses for its own reason; `auto` is the standing contract of that mode (the valve decided before).
+    assert pause([card], "always") == (True, ["当前为每次人工审批模式（共 1 项）"])
+    assert pause([card], "auto") == (False, [])

@@ -49,9 +49,16 @@ sessions:
   #                          dead_letter instead of blocking later batches.
   #   codex_archive_sync_interval_seconds - interval of the lightweight archive
   #                          reconciliation loop that the `serve` role runs.
+  #   scan_quiet_window_seconds - how long an Antigravity transcript must have gone
+  #                          unchanged before a passive scan reads it. Antigravity
+  #                          keeps no archive directory that marks a finished
+  #                          conversation: a transcript still changing in place is
+  #                          left out of the pass and picked up once it is quiet.
+  #                          0 switches the window off; 900 is 15 minutes.
   queue_max_item_chars: 24000
   queue_max_retries: 3
   codex_archive_sync_interval_seconds: 60
+  scan_quiet_window_seconds: 900
 
   # Session triage:
   #   exclude_content_prefixes - session content prefixes to exclude (e.g. headless batch scripts)
@@ -141,6 +148,20 @@ workflow:
   #   auto   - never pause (requires both auto_approve_writes valves)
   approval_mode: "smart"
   high_write_count_threshold: 6
+  # Per-batch caps on the write items of one plan.
+  #   max_writes_per_run        - every item that is not a project-domain page: the main
+  #                               experience card, a rule, a Skill, an incident card.
+  #   max_domain_writes_per_run - project-domain increment pages (the table /
+  #                               configuration / architecture / algorithm pages the
+  #                               mounted Wiki's deposit_routing names). They are counted
+  #                               apart, so an investigation of several tables cannot
+  #                               crowd the experience card or a rule out of the plan.
+  #                               0 plans no domain page.
+  #   Whichever is smaller, a cap or `knowledge_sink.max_write_set`, is the one that
+  #   applies, and a batch never exceeds `knowledge_sink.max_write_set` physical
+  #   paths in all. `high_write_count_threshold` counts the final items of the plan.
+  max_writes_per_run: 8
+  max_domain_writes_per_run: 8
   # Default safe mode: pause after P03 for Diff/rule preview approval in Web UI
   auto_approve_writes: false
   max_sessions_per_run: 10
@@ -175,6 +196,19 @@ runner:
     # How many times a timed-out or refused connection is retried at once, without backoff.
     # 0 disables the retry; 1 means one extra attempt after the first one.
     transport_retries: 1
+    # How much of one session's text the P02 review prompt carries, in characters
+    # (2000..64000). A session within the budget is carried whole, so a root cause
+    # in the middle of a long investigation reaches the reviewer; a longer one keeps
+    # its head and its tail around one explicit omission marker.
+    p02_session_char_limit: 16000
+    # Per-stage model layering. A stage uses its own model and reasoning effort when
+    # they are set and `model` / `reasoning_effort` otherwise. The pair a stage really
+    # runs with is part of the api_cache key, so moving a stage to another model
+    # never reuses the reply the old one produced.
+    review_model: ""
+    review_reasoning_effort: ""
+    plan_model: ""
+    plan_reasoning_effort: ""
   cli:
     # Example for local Codex / Claude CLI:
     # command: "claude"

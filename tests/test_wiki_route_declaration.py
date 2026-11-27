@@ -5,7 +5,9 @@ draft evidence only validate that declaration. These tests cover the gate side: 
 discovery, the deterministic route verdict, and normalization landing on the declared project.
 
 The same contract also declares project-domain pages (content_contract.deposit_routing):
-the last section covers their routing, their increments, and a sandbox replay of a whole run.
+the sections that follow cover their routing, their increments, and a sandbox replay of a
+whole run. The last section covers the incident ledger: a Wiki's declared `incident` page
+type, opened by the sink's write prefixes, entered by a declaration alone, and sensitive.
 """
 
 
@@ -18,7 +20,7 @@ import os
 import re
 import shutil
 import textwrap
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +63,8 @@ from ai_flywheel.adapters.wiki_gate import (
     resolve_bash_executable,
     split_frontmatter,
 )
+from ai_flywheel.adapters.wiki.router import INCIDENT_FILE_NAME_RE, IncidentRouting
+from ai_flywheel.adapters.wiki.t5_adapter import INCIDENT_EMPTY_SECTION, INCIDENT_SECTIONS, build_incident_card
 from ai_flywheel.config import FlywheelConfig
 from ai_flywheel.core import orchestrator
 from ai_flywheel.core.time_utils import shanghai_today_ymd
@@ -2892,3 +2896,934 @@ def test_a_dry_run_plan_on_a_wiki_with_the_deposit_routing_still_writes_its_card
     assert (rt.knowledge.root / ORDERS_REL).read_bytes() == ORDERS_PAGE.encode("utf-8")
     assert (rt.knowledge.root / DATABASE_REL).read_bytes() == DATABASE_PAGE.encode("utf-8")
     assert rt.db.get_session(key).status.value == "processed"
+
+# ---------------------------------------------------------------- the incident ledger: declared, opened, routed, approved
+# (feat-agy-ingest-and-high-fidelity-distill)
+
+INCIDENT_ROOT = "wiki-知识库/incidents-事故台账"
+INCIDENT_LEDGER = f"{INCIDENT_ROOT}/ai-incidents"
+INCIDENT_PARTITION = "    incidents:\n      root: wiki-知识库/incidents-事故台账\n"
+INCIDENT_TYPE = (
+    "    incident:\n"
+    "      partition: incidents\n"
+    "      required_fields: [severity]\n"
+    '      path_pattern: "^ai-incidents/[^/]+\\\\.md$"\n'
+    "      allowed_status: [active, resolved, archived]\n"
+    "      load_policy: on_demand\n"
+)
+INCIDENT_TITLE = "静默改错测试库配置"
+INCIDENT_SLUG = "静默改错测试库配置"
+INCIDENT_SUMMARY = "助手改错了测试库配置且未告知；改配置前先确认环境，改完回读。"
+INCIDENT_ROUTE = {"page_type": "incident", "project": None, "reason": "一次协作事故"}
+INCIDENT_SESSION = "claude-code:alpha-1"
+INCIDENT_FIELDS = ["title", "description", "type", "created", "updated", "severity"]
+INCIDENT_STATUSES = ["active", "resolved", "archived"]
+# What a contract requires when it asks nothing of an incident page beyond the core fields.
+CORE_FIELDS = [name for name in INCIDENT_FIELDS if name != "severity"]
+
+INCIDENT_DRAFT = textwrap.dedent(
+    """\
+    ---
+    severity: high
+    ---
+
+    # 静默改错测试库配置
+
+    ## 定性
+
+    严重：助手改错了测试库配置且未告知，属静默失误。
+
+    ## 事实核验
+
+    - 核对：配置文件第 12 行被改成另一套库的地址。
+    - 核验：变更记录里没有这次修改。
+
+    ## 根因
+
+    助手把两套环境的配置文件名记混了，改完也没有回读。
+
+    ## 治本规则
+
+    改任何配置前先确认目标环境，改完回读实际生效值并告知。
+
+    ## 证据指针
+
+    - 会话记录：见本次会话。
+    """
+)
+
+
+def _day(offset: int) -> str:
+    """The Shanghai date ``offset`` days from today."""
+    return (date.fromisoformat(shanghai_today_ymd()) + timedelta(days=offset)).isoformat()
+
+
+def _file_name(day: str | None = None, slug: str = INCIDENT_SLUG) -> str:
+    return f"{day if day is not None else _day(-1)}-{slug}.md"
+
+
+def _incident_rel(file_name: str | None = None) -> str:
+    return f"{INCIDENT_LEDGER}/{file_name if file_name is not None else _file_name()}"
+
+
+def incident_schema(*, type_decl: Any = _UNSET, partition: Any = _UNSET) -> str:
+    """The test contract with the incident page type and its partition, as given.
+
+    ``type_decl`` and ``partition`` are the YAML of the page type and of its partition entry;
+    None declares none.
+    """
+    declared_type = INCIDENT_TYPE if type_decl is _UNSET else type_decl
+    declared_partition = INCIDENT_PARTITION if partition is _UNSET else partition
+    topics = "    topics:\n      root: wiki-知识库/topics-主题\n"
+    closing = "      allowed_status: [active]\n---\n"
+    assert SCHEMA.count(topics) == 1 and SCHEMA.count(closing) == 1
+    schema = SCHEMA.replace(topics, topics + (declared_partition or ""), 1)
+    return schema.replace(closing, "      allowed_status: [active]\n" + (declared_type or "") + "---\n", 1)
+
+
+def _sink(*prefixes: str) -> Any:
+    sink = FlywheelConfig().knowledge_sink
+    sink.allowed_write_prefixes = list(prefixes)
+    return sink
+
+
+def _incident_runtime(
+    tmp_path: Path,
+    *,
+    prefixes: tuple[str, ...] = ("wiki-知识库",),
+    type_decl: Any = _UNSET,
+    partition: Any = _UNSET,
+    approval_mode: str = "smart",
+    valve: bool | None = None,
+) -> FlywheelRuntime:
+    """A mounted Wiki whose contract declares the incident ledger; the ledger directory itself is left to the write."""
+    (tmp_path / "wiki" / "wiki-知识库" / "projects-项目").mkdir(parents=True)
+    (tmp_path / "wiki" / "wiki-知识库" / "topics-主题").mkdir(parents=True)
+    (tmp_path / "wiki" / INCIDENT_ROOT).mkdir(parents=True)
+    (tmp_path / "wiki" / ".wiki-schema.md").write_text(incident_schema(type_decl=type_decl, partition=partition), encoding="utf-8")
+    cfg = FlywheelConfig(base_dir=tmp_path)
+    cfg.knowledge_sink.type = "local_markdown_wiki"
+    cfg.knowledge_sink.root = str(tmp_path / "wiki")
+    cfg.knowledge_sink.allowed_write_prefixes = list(prefixes)
+    cfg.knowledge_sink.wiki_gate_require_scripts = False
+    cfg.workflow.approval_mode = approval_mode
+    # `auto` only takes effect with the safety valve open: the valve has the last word.
+    cfg.safety_valves.auto_approve_writes = valve if valve is not None else approval_mode == "auto"
+    cfg.runner.mode = "api"
+    cfg.runner.api.base_url = "http://127.0.0.1:9/v1"  # never called: build_runner is replaced
+    cfg.runner.api.model = "test-model"
+    return FlywheelRuntime(cfg)
+
+
+def _ledger_files(rt: FlywheelRuntime) -> list[str]:
+    ledger = rt.knowledge.root / INCIDENT_LEDGER
+    return sorted(path.relative_to(rt.knowledge.root).as_posix() for path in ledger.rglob("*.md")) if ledger.is_dir() else []
+
+
+def _incident_item(session_key: str = INCIDENT_SESSION, **overrides: Any) -> dict[str, Any]:
+    """A plan item for one incident card, as a planner that read the contract writes it."""
+    item: dict[str, Any] = {
+        "target_kind": "knowledge_doc",
+        "action": "create",
+        "title": INCIDENT_TITLE,
+        "summary": INCIDENT_SUMMARY,
+        "relative_path": _incident_rel(),
+        "source_session_keys": [session_key],
+        "content_preview": INCIDENT_DRAFT,
+        "wiki_route": dict(INCIDENT_ROUTE),
+    }
+    item.update(overrides)
+    return item
+
+
+def _incident_route(rt: FlywheelRuntime, **overrides: Any) -> Any:
+    """The route verdict on a plan item that declares an incident card."""
+    params: dict[str, Any] = {
+        "relative_path": _incident_rel(),
+        "title": INCIDENT_TITLE,
+        "summary": INCIDENT_SUMMARY,
+        "content": INCIDENT_DRAFT,
+        "wiki_route": dict(INCIDENT_ROUTE),
+        "action": "create",
+        "allow_evidence_fallback": False,
+        "source_sessions": [INCIDENT_SESSION],
+    }
+    params.update(overrides)
+    return rt.knowledge.wiki_gate.evaluate_route(**params)
+
+
+def _incident_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    plan: Any,
+    *,
+    prefixes: tuple[str, ...] = ("wiki-知识库",),
+    approval_mode: str = "smart",
+    valve: bool | None = None,
+) -> tuple[FlywheelRuntime, _ModelPlanRunner, str]:
+    """Drive a run over a Wiki with the ledger: the real orchestrator and gate, a replayed plan."""
+    rt = _incident_runtime(tmp_path, prefixes=prefixes, approval_mode=approval_mode, valve=valve)
+    _add_project(rt.knowledge.root, *ALPHA)
+    key = _register(rt, "alpha-1", tmp_path / "work" / "alpha-crm")
+    runner = _ModelPlanRunner(plan(key))
+    monkeypatch.setattr(orchestrator, "build_runner", lambda cfg, fs_store: runner)
+    return rt, runner, key
+
+
+def _audit_by_type(rt: FlywheelRuntime, run: Any) -> dict[str, dict[str, Any]]:
+    return {row["event_type"]: row for row in rt.db.list_audit_events(entity_type="workflow_run", entity_id=run.run_id, limit=100)}
+
+
+def _check(node: Any, name: str) -> dict[str, Any]:
+    return next(check for check in node.internal_checks if check["name"] == name)["detail"]
+
+
+# ---- where the ledger is, and when the planner is told about it
+
+
+def test_the_ledger_is_located_from_the_contract_and_nothing_else():
+    ledger = IncidentRouting.from_schema(_schema_of(incident_schema()))
+
+    assert (ledger.directory, ledger.writable) == (INCIDENT_LEDGER, False)  # no sink given: closed
+    assert ledger.required_fields == INCIDENT_FIELDS
+    assert ledger.allowed_status == INCIDENT_STATUSES
+    assert ledger.load_policy == "on_demand"
+    assert ledger.to_dict() == {
+        "page_type": "incident",
+        "directory": f"{INCIDENT_LEDGER}/",
+        "file_name": "<YYYY-MM-DD>-<slug>.md",
+        "sections": list(INCIDENT_SECTIONS),
+    }
+
+    # The directory is wherever the contract keeps it: read off the contract, never assumed.
+    pattern = next(line for line in INCIDENT_TYPE.splitlines(True) if "path_pattern" in line)
+    no_pattern = INCIDENT_TYPE.replace(pattern, "")
+    subdirs = "      allowed_subdirectories: {}\n"
+    located = [
+        ("a pattern naming the directory in plain letters", incident_schema(), INCIDENT_LEDGER),
+        ("a pattern whose page names begin in plain letters", incident_schema(type_decl=INCIDENT_TYPE.replace("^ai-incidents/[^/]+", "^ai-incidents/INC-[^/]+")), INCIDENT_LEDGER),
+        ("a pattern with no directory ahead of its first wildcard", incident_schema(type_decl=INCIDENT_TYPE.replace("^ai-incidents/", "^incident-")), INCIDENT_ROOT),
+        ("no pattern and no sub-directory: the partition root", incident_schema(type_decl=no_pattern), INCIDENT_ROOT),
+        ("a sub-directory named after the ledger", incident_schema(type_decl=no_pattern, partition=INCIDENT_PARTITION + subdirs.format("[复盘, ai-incidents]")), INCIDENT_LEDGER),
+        ("a deeper sub-directory named after the ledger", incident_schema(type_decl=no_pattern, partition=INCIDENT_PARTITION + subdirs.format("[ai-incidents/2026]")), f"{INCIDENT_LEDGER}/2026"),
+    ]
+    for said, schema, directory in located:
+        assert (said, IncidentRouting.from_schema(_schema_of(schema)).directory) == (said, directory), said
+
+    # A pattern whose plain part holds a wildcard early names no directory either: the partition root stands in.
+    early = incident_schema(type_decl=INCIDENT_TYPE.replace("^ai-incidents/", "^ai-(incidents)/"))
+    assert IncidentRouting.from_schema(_schema_of(early)).directory == INCIDENT_ROOT
+
+    # Whether the sink may write into it is the configuration's word, read at the same time.
+    for prefixes, writable in ((("wiki-知识库",), True), (("wiki-知识库/incidents-事故台账",), True), ((), False), (("wiki-知识库/projects-项目",), False)):
+        sink = _sink(*prefixes)
+        assert (prefixes, IncidentRouting.from_schema(_schema_of(incident_schema()), sink=sink).writable) == (prefixes, writable)
+
+    located_none = [
+        ("no incident page type", incident_schema(type_decl=None)),
+        ("a partition the contract does not declare", incident_schema(partition=None)),
+        ("sub-directories declared and none of them the ledger", incident_schema(type_decl=no_pattern, partition=INCIDENT_PARTITION + subdirs.format("[复盘]"))),
+        ("a contract that says nothing about incidents", SCHEMA),
+    ]
+    for said, schema in located_none:
+        assert (said, IncidentRouting.from_schema(_schema_of(schema))) == (said, None), said
+
+
+@pytest.mark.parametrize(
+    "prefixes, offered",
+    [
+        pytest.param(("wiki-知识库",), True, id="the-knowledge-base"),
+        pytest.param(("wiki-知识库/incidents-事故台账",), True, id="the-partition"),
+        pytest.param((INCIDENT_LEDGER,), True, id="the-ledger-itself"),
+        pytest.param(("wiki-知识库/projects-项目",), False, id="another-partition"),
+        pytest.param((f"{INCIDENT_LEDGER}-archive",), False, id="a-sibling-of-the-ledger"),
+        pytest.param((), False, id="nothing-opened-by-name"),
+    ],
+)
+def test_the_ledger_is_offered_to_the_planner_only_while_the_sink_may_write_into_it(tmp_path: Path, prefixes: tuple[str, ...], offered: bool):
+    rt = _incident_runtime(tmp_path, prefixes=prefixes)
+    gate = rt.knowledge.wiki_gate
+    ledger_page = {
+        "page_type": "incident",
+        "directory": f"{INCIDENT_LEDGER}/",
+        "file_name": "<YYYY-MM-DD>-<slug>.md",
+        "sections": list(INCIDENT_SECTIONS),
+    }
+
+    candidates = gate.routing_candidates()
+
+    # The contract locates the ledger either way; only the configuration decides whether it is offered.
+    assert (candidates.incident.directory, candidates.incident_offered) == (INCIDENT_LEDGER, offered)
+    assert ("incident" in candidates.page_types) is offered
+    assert ("incident_pages" in candidates.to_dict()) is offered
+    assert "incident" not in candidates.fallback_page_types  # evidence never picks the ledger
+    assert candidates.routable is offered  # with no project, the ledger alone is what makes the Wiki routable
+    assert ("INCIDENT PAGES:" in _p03_prompt(candidates)) is offered
+
+    _add_project(rt.knowledge.root, *ALPHA)
+    candidates = gate.routing_candidates()
+
+    # Practice cards ignore the write prefixes, as they always did; the ledger is held to them.
+    assert candidates.page_types == ["project-practice-note", *(["incident"] if offered else [])]
+    assert candidates.routable is True
+    prompt = _p03_prompt(candidates)
+    assert ("INCIDENT PAGES:" in prompt) is offered
+    if offered:
+        assert _prompt_payload(prompt)["routing_candidates"]["incident_pages"] == ledger_page
+        assert f'"relative_path" is "{INCIDENT_LEDGER}/<YYYY-MM-DD>-<slug>.md"' in prompt
+    else:
+        assert "incident_pages" not in _prompt_payload(prompt)["routing_candidates"]
+        assert "incident" not in _prompt_payload(prompt)["routing_candidates"]["page_types"]
+
+
+# ---- the card: the draft's own text under the standard frame
+
+
+def _build(
+    content: str,
+    *,
+    title: str = INCIDENT_TITLE,
+    summary: str = INCIDENT_SUMMARY,
+    required: list[str] = INCIDENT_FIELDS,
+    statuses: list[str] = INCIDENT_STATUSES,
+    load_policy: str = "on_demand",
+    sessions: tuple[str, ...] = (INCIDENT_SESSION,),
+) -> tuple[str, list[str]]:
+    return build_incident_card(
+        title=title,
+        summary=summary,
+        content=content,
+        required_fields=list(required),
+        allowed_status=list(statuses),
+        load_policy=load_policy,
+        today="2026-11-28",
+        source_sessions=list(sessions),
+    )
+
+
+def _page_parts(page: str) -> tuple[dict[str, Any], str]:
+    """``(frontmatter, body)`` of a built page."""
+    frontmatter_text, _, body = page[4:].partition("\n---\n\n")
+    return yaml.safe_load(frontmatter_text), body
+
+
+def _headings(body: str) -> list[str]:
+    """The level-2 headings of a page outside its code fences."""
+    names: list[str] = []
+    in_fence = False
+    for line in body.splitlines():
+        in_fence = in_fence != line.startswith("```")
+        if not in_fence and line.startswith("## "):
+            names.append(line[3:])
+    return names
+
+
+def test_the_card_is_the_drafts_text_under_the_frame_and_invents_nothing():
+    page, problems = _build(INCIDENT_DRAFT)
+
+    assert problems == []
+    frontmatter, body = _page_parts(page)
+    # What the engine can know: the page type, the day, the sessions and what the contract prescribes.
+    assert frontmatter == {
+        "severity": "high",  # the draft's own value, kept
+        "title": INCIDENT_TITLE,
+        "type": "incident",
+        "description": INCIDENT_SUMMARY,  # the plan's own summary
+        "created": "2026-11-28",
+        "updated": "2026-11-28",
+        "status": "active",
+        "load_policy": "on_demand",
+        "sources": [f"ai-flywheel session: {INCIDENT_SESSION}"],
+    }
+    assert list(frontmatter) == ["severity", "title", "type", "description", "created", "updated", "status", "load_policy", "sources"]
+    assert body == textwrap.dedent(
+        """\
+        # 静默改错测试库配置
+
+        ## 定性
+
+        严重：助手改错了测试库配置且未告知，属静默失误。
+
+        ## 事实核验
+
+        - 核对：配置文件第 12 行被改成另一套库的地址。
+        - 核验：变更记录里没有这次修改。
+
+        ## 根因
+
+        助手把两套环境的配置文件名记混了，改完也没有回读。
+
+        ## 治本规则
+
+        改任何配置前先确认目标环境，改完回读实际生效值并告知。
+
+        ## 证据指针
+
+        - 会话记录：见本次会话。
+        """
+    )
+    # Building the card again from the card changes nothing.
+    assert _build(page) == (page, [])
+    # A draft saved with CRLF endings reads the same.
+    assert _build(INCIDENT_DRAFT.replace("\n", "\r\n")) == (page, [])
+
+
+def test_a_section_the_draft_did_not_write_says_so_and_is_never_filled_in():
+    draft = textwrap.dedent(
+        """\
+        # 改错配置
+
+        助手改了配置没有说。
+
+        ## 定性（初判）
+
+        静默失误。
+
+        ## 核验记录
+
+        - 第 12 行被改。
+
+        ## 原因
+
+        文件名记混。
+
+        ## 参考链接
+
+        - 变更记录。
+
+        ## 后续动作
+
+        - 补一条变更记录。
+        """
+    )
+
+    page, problems = _build(
+        draft,
+        title="改错配置记录",
+        summary="助手改错了配置。",
+        required=CORE_FIELDS,
+        sessions=(),
+    )
+
+    assert problems == []
+    frontmatter, body = _page_parts(page)
+    # The page's name is the draft's own title line; no session is cited, so the batch is.
+    assert frontmatter == {
+        "title": "改错配置",
+        "type": "incident",
+        "description": "助手改错了配置。",
+        "created": "2026-11-28",
+        "updated": "2026-11-28",
+        "status": "active",
+        "load_policy": "on_demand",
+        "sources": ["ai-flywheel batch 2026-11-28"],
+    }
+    assert body == textwrap.dedent(
+        """\
+        # 改错配置
+
+        助手改了配置没有说。
+
+        ## 定性
+
+        静默失误。
+
+        ## 事实核验
+
+        - 第 12 行被改。
+
+        ## 根因
+
+        文件名记混。
+
+        ## 治本规则
+
+        （本次审查未记录这一节，待补充。）
+
+        ## 证据指针
+
+        - 变更记录。
+
+        ## 后续动作
+
+        - 补一条变更记录。
+        """
+    )
+    # The placeholder is the only line such a section carries, and the frame never grows a fact.
+    assert body.count(INCIDENT_EMPTY_SECTION) == 1
+    assert body.split("## 治本规则\n\n", 1)[1].split("\n## ", 1)[0] == INCIDENT_EMPTY_SECTION + "\n"
+    assert "回读" not in body  # nothing the draft did not say
+
+
+def test_what_the_contract_prescribes_is_added_and_what_it_refuses_is_not_corrected():
+    stated = "---\nseverity: high\ncreated: 2026-11-20\nstatus: resolved\n---\n\n## 定性\n\n已归档的失误。\n"
+    # A value the draft states is kept, even the day; the status is added only when the contract lets a new page carry `active`.
+    kept, problems = _build(stated, statuses=["resolved", "archived"], load_policy="")
+    assert problems == []
+    frontmatter, _ = _page_parts(kept)
+    assert (str(frontmatter["created"]), frontmatter["updated"], frontmatter["status"], frontmatter.get("load_policy")) == ("2026-11-20", "2026-11-28", "resolved", None)
+
+    not_active, problems = _build(stated.replace("status: resolved\n", ""), statuses=["resolved", "archived"])
+    assert problems == []
+    assert "status" not in _page_parts(not_active)[0]  # never invented: the contract does not let a new page start `active`
+
+    # A code fence stays whole with its section, whatever it holds.
+    fenced, problems = _build("## 证据指针\n\n```text\n## 不是小节\n```\n\n- 日志名。\n", required=CORE_FIELDS)
+    assert problems == []
+    assert _page_parts(fenced)[1] == f"# {INCIDENT_TITLE}\n\n" + "".join(
+        f"## {name}\n\n{INCIDENT_EMPTY_SECTION}\n\n" for name in INCIDENT_SECTIONS[:4]
+    ) + "## 证据指针\n\n```text\n## 不是小节\n```\n\n- 日志名。\n"
+    assert _headings(_page_parts(fenced)[1]) == list(INCIDENT_SECTIONS)  # the heading inside the fence is none
+
+
+def test_a_card_the_draft_cannot_support_is_reported_and_never_written():
+    stated = "## 定性\n\n严重。\n"
+    missing, problems = _build(stated)
+    assert problems == ["契约要求字段 severity，草稿未给出，引擎不代填"]
+    assert missing == ""
+
+    nothing, problems = _build("", required=CORE_FIELDS)
+    assert (nothing, problems) == ("", ["草稿没有事故内容：标准小节均为空"])
+    titled_only, problems = _build("---\nseverity: high\n---\n\n# 只有标题\n")
+    assert (titled_only, problems) == ("", ["草稿没有事故内容：标准小节均为空"])
+
+    unreadable, problems = _build("---\nseverity: [high\n---\n\n## 定性\n\n严重。\n")
+    assert unreadable == "" and len(problems) == 1 and problems[0].startswith("草稿的 frontmatter 无法解析：")
+    not_a_mapping, problems = _build("---\n- 甲\n- 乙\n---\n\n## 定性\n\n严重。\n")
+    assert (not_a_mapping, problems) == ("", ["草稿的 frontmatter 不是一个映射"])
+
+
+# ---- the route verdict
+
+
+def test_an_incident_card_declared_into_an_open_ledger_is_routed_as_a_sensitive_write(tmp_path: Path):
+    """规格场景（门禁侧）：页面类型已声明、目录已放行、草稿合规 → 路由通过，且 is_sensitive_write 为 True。"""
+    rt = _incident_runtime(tmp_path)
+    gate = rt.knowledge.wiki_gate
+    rel = _incident_rel()
+
+    decision = _incident_route(rt)
+
+    assert (decision.routed, decision.source, decision.page_type, decision.project, decision.sensitive) == (True, ROUTE_DECLARED, "incident", None, True)
+    assert (decision.reason, decision.reason_code, decision.detail, decision.domain, decision.relabel) == ("一次协作事故", "", "", "", "")
+    stated = decision.to_dict()
+    assert stated["sensitive"] is True and "domain" not in stated
+    assert is_sensitive_write({"target_kind": "knowledge_doc", "wiki_route": decision.declared}) is True
+
+    frontmatter, body = _page_parts(decision.page)
+    today = shanghai_today_ymd()
+    assert frontmatter == {
+        "severity": "high",
+        "title": INCIDENT_TITLE,
+        "type": "incident",
+        "description": INCIDENT_SUMMARY,
+        "created": today,
+        "updated": today,
+        "status": "active",
+        "load_policy": "on_demand",
+        "sources": [f"ai-flywheel session: {INCIDENT_SESSION}"],
+    }
+    assert re.findall(r"^(#{1,6}) (.+)$", body, flags=re.M) == [("#", INCIDENT_TITLE), *(("##", name) for name in INCIDENT_SECTIONS)]
+    draft_lines = [line for line in INCIDENT_DRAFT.splitlines()[3:] if line.strip()]
+    for line in draft_lines[1:]:  # the draft's H1 is written from the title; every other line is verbatim
+        assert line in body
+    assert decision.page.endswith("\n") and not decision.page.endswith("\n\n") and "\r" not in decision.page
+    assert gate.validate_document(rel, decision.page).ok
+    normalized = gate.normalize_planned_document(
+        rel, INCIDENT_TITLE, INCIDENT_SUMMARY, INCIDENT_DRAFT, source_sessions=[INCIDENT_SESSION], route=decision, action="create"
+    )
+    assert normalized == (rel, decision.page)
+
+    # The name of a ledger page: the day and a slug, a sequence number allowed in front.
+    for legal in ("7-" + _file_name(), _file_name(_day(0)), _file_name("2000-01-01"), _file_name(slug="错改配置（测试库）")):
+        assert _incident_route(rt, relative_path=_incident_rel(legal)).routed is True, legal
+    assert INCIDENT_FILE_NAME_RE.fullmatch("12345-2026-11-20-x.md") is None  # at most four digits
+
+    # A declared project is validated and kept on the verdict; the card still belongs to none.
+    _add_project(rt.knowledge.root, *ALPHA)
+    with_project = _incident_route(rt, wiki_route={**INCIDENT_ROUTE, "project": "alpha-crm"})
+    assert (with_project.routed, with_project.page_type, with_project.sensitive, with_project.project["dir_name"]) == (True, "incident", True, ALPHA[0])
+    assert with_project.page == decision.page  # the card is the same card
+
+
+def _refused(name: str, tmp_path: Path) -> tuple[FlywheelRuntime, dict[str, Any], str, str]:
+    """A card the ledger refuses: ``(runtime, what the plan says instead, reason code, how the detail starts)``."""
+    text = UNROUTED_REASON_TEXT
+    if name == "ledger-closed":
+        return _incident_runtime(tmp_path, prefixes=("wiki-知识库/projects-项目",)), {}, "incident_prefix_not_allowed", text["incident_prefix_not_allowed"] + "："
+    rel = _incident_rel()
+    draft_head = "severity: high\n"
+    said: dict[str, tuple[dict[str, Any], str, str]] = {
+        "outside-the-ledger": ({"relative_path": f"{INCIDENT_ROOT}/{_file_name()}"}, "incident_path_mismatch", text["incident_path_mismatch"] + "："),
+        "in-a-sub-directory-of-the-ledger": ({"relative_path": f"{INCIDENT_LEDGER}/归档/{_file_name()}"}, "incident_path_mismatch", text["incident_path_mismatch"] + "："),
+        "in-another-partition": (
+            {"relative_path": f"wiki-知识库/projects-项目/{ALPHA[0]}/实战笔记/{_file_name()}"},
+            "incident_path_mismatch",
+            text["incident_path_mismatch"] + "：",
+        ),
+        "a-name-without-a-day": ({"relative_path": _incident_rel(f"{INCIDENT_SLUG}.md")}, "incident_file_name_invalid", text["incident_file_name_invalid"] + "："),
+        "a-day-that-does-not-exist": (
+            {"relative_path": _incident_rel(f"{_day(-400)[:4]}-02-30-{INCIDENT_SLUG}.md")},
+            "incident_file_name_invalid",
+            text["incident_file_name_invalid"] + "：",
+        ),
+        "a-day-ahead": ({"relative_path": _incident_rel(_file_name(_day(1)))}, "incident_file_name_invalid", text["incident_file_name_invalid"] + "："),
+        "no-name": ({"relative_path": _incident_rel(f"{_day(-1)}-.md")}, "incident_file_name_invalid", text["incident_file_name_invalid"] + "："),
+        "a-hidden-name": ({"relative_path": _incident_rel(f"{_day(-1)}-.notes.md")}, "incident_file_name_invalid", text["incident_file_name_invalid"] + "："),
+        "an-archived-name": (
+            {"relative_path": _incident_rel(f"{_day(-1)}-archive-old.md")},
+            "incident_file_name_invalid",
+            text["incident_file_name_invalid"] + "：",
+        ),
+        "another-suffix": ({"relative_path": _incident_rel(f"{_day(-1)}-{INCIDENT_SLUG}.txt")}, "incident_file_name_invalid", text["incident_file_name_invalid"] + "："),
+        "an-update": ({"action": "update"}, "declaration_invalid", "事故卡只支持新建（create），计划动作为「update」"),
+        "a-draft-of-another-page-type": (
+            {"content": INCIDENT_DRAFT.replace(draft_head, draft_head + "type: topic\n", 1)},
+            "declaration_invalid",
+            "声明的页面类型「incident」与草稿页面的类型「topic」不一致",
+        ),
+        "a-project-that-is-no-candidate": (
+            {"wiki_route": {**INCIDENT_ROUTE, "project": "gamma-ops"}},
+            "declaration_invalid",
+            "声明的项目 gamma-ops 不能唯一匹配候选项目",
+        ),
+        "no-declaration": (
+            {"wiki_route": None, "content": INCIDENT_DRAFT.replace(draft_head, draft_head + "type: incident\n", 1)},
+            "declaration_missing",
+            text["declaration_missing"] + "：事故卡只能经路由声明进入台账",
+        ),
+        "a-credential-in-the-draft": (
+            {"content": INCIDENT_DRAFT + "- 测试库 password: Hk9-Qp31x，只在本地使用。\n"},
+            "secret_leak_blocked",
+            "SECRET_LEAK_BLOCKED：",
+        ),
+        "a-contract-field-the-draft-lacks": (
+            {"content": INCIDENT_DRAFT.replace("---\nseverity: high\n---\n\n", "", 1)},
+            "incident_card_invalid",
+            text["incident_card_invalid"] + "：INCIDENT_PAGE_BUILD: 契约要求字段 severity，草稿未给出，引擎不代填",
+        ),
+        "a-draft-that-states-nothing": (
+            {"content": "---\nseverity: high\n---\n\n# 静默改错测试库配置\n"},
+            "incident_card_invalid",
+            text["incident_card_invalid"] + "：INCIDENT_PAGE_BUILD: 草稿没有事故内容：标准小节均为空",
+        ),
+        "a-frontmatter-that-cannot-be-read": (
+            {"content": "---\nseverity: [high\n---\n\n## 定性\n\n严重。\n"},
+            "incident_card_invalid",
+            text["incident_card_invalid"] + "：INCIDENT_PAGE_BUILD: 草稿的 frontmatter 无法解析：",
+        ),
+        "a-status-the-contract-refuses": (
+            {"content": INCIDENT_DRAFT.replace(draft_head, draft_head + "status: draft\n", 1)},
+            "incident_card_invalid",
+            text["incident_card_invalid"] + "：STATUS_NOT_ALLOWED: ",
+        ),
+        "a-load-policy-the-contract-refuses": (
+            {"content": INCIDENT_DRAFT.replace(draft_head, draft_head + "load_policy: always\n", 1)},
+            "incident_card_invalid",
+            text["incident_card_invalid"] + "：LOAD_POLICY_CONTRACT: ",
+        ),
+    }
+    rt = _incident_runtime(tmp_path)
+    if name == "a-page-that-already-exists":
+        _write(rt.knowledge.root, rel, "已有的事故卡。\n")
+        return rt, {}, "incident_target_exists", text["incident_target_exists"] + "："
+    overrides, code, detail_start = said[name]
+    return rt, overrides, code, detail_start
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "ledger-closed",
+        "outside-the-ledger",
+        "in-a-sub-directory-of-the-ledger",
+        "in-another-partition",
+        "a-name-without-a-day",
+        "a-day-that-does-not-exist",
+        "a-day-ahead",
+        "no-name",
+        "a-hidden-name",
+        "an-archived-name",
+        "another-suffix",
+        "a-page-that-already-exists",
+        "an-update",
+        "a-draft-of-another-page-type",
+        "a-project-that-is-no-candidate",
+        "no-declaration",
+        "a-credential-in-the-draft",
+        "a-contract-field-the-draft-lacks",
+        "a-draft-that-states-nothing",
+        "a-frontmatter-that-cannot-be-read",
+        "a-status-the-contract-refuses",
+        "a-load-policy-the-contract-refuses",
+    ],
+)
+def test_an_incident_card_the_ledger_refuses_is_never_corrected(tmp_path: Path, name: str):
+    rt, overrides, code, detail_start = _refused(name, tmp_path)
+    before = _ledger_files(rt)
+
+    decision = _incident_route(rt, **overrides)
+
+    assert decision.routed is False
+    assert (decision.reason_code, decision.source, decision.page_type, decision.page, decision.project, decision.sensitive) == (code, "", "", "", None, False)
+    assert decision.detail.startswith(detail_start), decision.detail
+    assert code in UNROUTED_REASON_LABEL  # the summary of a run can name it
+    # The declaration is carried as the planner made it — absent when the plan made none.
+    route = overrides.get("wiki_route", INCIDENT_ROUTE)
+    assert decision.declared == ({"page_type": "incident", "project": route["project"] or "", "reason": "一次协作事故"} if route is not None else {})
+    normalized = rt.knowledge.wiki_gate.normalize_planned_document(
+        overrides.get("relative_path", _incident_rel()),
+        INCIDENT_TITLE,
+        INCIDENT_SUMMARY,
+        overrides.get("content", INCIDENT_DRAFT),
+        wiki_route=overrides["wiki_route"] if "wiki_route" in overrides else dict(INCIDENT_ROUTE),
+        route=decision,
+        action=overrides.get("action", "create"),
+    )
+    assert normalized is None
+    assert _ledger_files(rt) == before
+    if code == "secret_leak_blocked":
+        assert "Hk9-Qp31x" not in decision.detail  # the shape is named, never the secret
+
+
+def test_a_name_rule_the_contract_adds_is_met_before_the_card_is_routed(tmp_path: Path):
+    # A rule about the page's own name, which for a ledger page begins with its day.
+    strict = INCIDENT_TYPE + '      file_pattern: "^\\\\d{4}-\\\\d{2}-\\\\d{2}-INC-[^/]+\\\\.md$"\n'
+    rt = _incident_runtime(tmp_path, type_decl=strict)
+    assert rt.knowledge.wiki_gate.routing_candidates().incident.directory == INCIDENT_LEDGER
+
+    # A card named by the contract's rule is routed; the plain ledger name is refused, never renamed to fit.
+    legal = _incident_route(rt, relative_path=_incident_rel(_file_name(slug=f"INC-{INCIDENT_SLUG}")))
+    assert (legal.routed, legal.sensitive, legal.page_type) == (True, True, "incident")
+    refused = _incident_route(rt)
+
+    assert (refused.routed, refused.reason_code) == (False, "path_pattern_mismatch")
+    assert refused.detail.startswith(f"{UNROUTED_REASON_TEXT['path_pattern_mismatch']}：FILE_PATTERN_MISMATCH: '{_file_name()}' does not match '")
+    assert _ledger_files(rt) == []
+
+
+def test_a_name_rule_no_ledger_page_can_satisfy_refuses_every_card_as_a_placement_problem(tmp_path: Path):
+    # The contract asks for names that begin `INC-`; a ledger page's name begins with its day. The two cannot agree.
+    strict = INCIDENT_TYPE.replace("^ai-incidents/[^/]+", "^ai-incidents/INC-[^/]+")
+    rt = _incident_runtime(tmp_path, type_decl=strict)
+
+    # The ledger is still located where the pattern's plain letters put it, and the refusal names the rule.
+    assert rt.knowledge.wiki_gate.routing_candidates().incident.directory == INCIDENT_LEDGER
+    refused = _incident_route(rt)
+    assert (refused.routed, refused.reason_code) == (False, "path_pattern_mismatch")
+    assert refused.detail.startswith(f"{UNROUTED_REASON_TEXT['path_pattern_mismatch']}：PATH_PATTERN_MISMATCH: ")
+    assert f"ai-incidents/{_file_name()}" in refused.detail and "^ai-incidents/INC-[^/]+" in refused.detail
+    # A name shaped as that rule asks is not a ledger page's name at all: refused as such, never corrected either way.
+    assert _incident_route(rt, relative_path=_incident_rel(f"INC-{_file_name()}")).reason_code == "incident_file_name_invalid"
+    assert _ledger_files(rt) == []
+
+
+def test_the_ledger_is_never_reached_by_evidence_or_under_another_page_type(tmp_path: Path):
+    rt = _incident_runtime(tmp_path)
+    _add_project(rt.knowledge.root, *ALPHA)
+    typed_incident = INCIDENT_DRAFT.replace("severity: high\n", "severity: high\ntype: incident\n", 1)
+
+    # Even the dry-run planner, which may route on evidence, never picks the ledger: a card enters it by declaration alone.
+    by_evidence = _incident_route(
+        rt,
+        relative_path=f"wiki-知识库/projects-项目/{_file_name()}.md",
+        content=DRAFT,
+        wiki_route=None,
+        allow_evidence_fallback=True,
+        source_workspaces=[str(tmp_path / "work" / "alpha-crm")],
+    )
+    assert (by_evidence.routed, by_evidence.source, by_evidence.page_type) == (True, ROUTE_EVIDENCE, "project-practice-note")
+    typed = _incident_route(rt, content=typed_incident, wiki_route=None, allow_evidence_fallback=True)
+    assert (typed.routed, typed.reason_code) == (False, "declaration_missing")
+
+    # A Wiki that offers the ledger and no project offers evidence nothing: no evidence, no route.
+    (tmp_path / "alone").mkdir()
+    alone = _incident_runtime(tmp_path / "alone")
+    nothing = _incident_route(alone, content=DRAFT, wiki_route=None, allow_evidence_fallback=True)
+    assert (nothing.routed, nothing.reason_code, nothing.page_type) == (False, "no_evidence", "")
+
+    # A card declared as another page type never lands in the ledger, wherever its path points.
+    in_ledger = _incident_rel()
+    misplaced = _incident_route(rt, relative_path=in_ledger, content=DRAFT, wiki_route=_declare("alpha-crm"))
+    assert (misplaced.routed, misplaced.page_type, misplaced.source, misplaced.sensitive) == (True, "project-practice-note", ROUTE_DECLARED, False)
+    landed = rt.knowledge.wiki_gate.normalize_planned_document(
+        in_ledger, TITLE, "", DRAFT, route=misplaced, source_sessions=[INCIDENT_SESSION]
+    )
+    assert landed is not None and landed[0].startswith(f"wiki-知识库/projects-项目/{ALPHA[0]}/实战笔记/")
+    assert INCIDENT_ROOT not in landed[0]
+
+
+@pytest.mark.parametrize(
+    "said, kwargs",
+    [
+        pytest.param("declares no incident page type", {"type_decl": None}, id="no-incident-type"),
+        pytest.param("declares the page type under a partition it does not declare", {"partition": None}, id="no-partition"),
+        pytest.param(
+            "declares sub-directories and none of them is the ledger",
+            {
+                "type_decl": INCIDENT_TYPE.replace(next(line for line in INCIDENT_TYPE.splitlines(True) if "path_pattern" in line), ""),
+                "partition": INCIDENT_PARTITION + "      allowed_subdirectories: [复盘]\n",
+            },
+            id="subdirectories-without-the-ledger",
+        ),
+    ],
+)
+def test_an_incident_declaration_is_refused_where_the_contract_locates_no_ledger(tmp_path: Path, said: str, kwargs: dict[str, Any]):
+    rt = _incident_runtime(tmp_path, **kwargs)
+    _add_project(rt.knowledge.root, *ALPHA)
+    candidates = rt.knowledge.wiki_gate.routing_candidates()
+    assert (candidates.incident, candidates.incident_offered) == (None, False)
+    assert "incident" not in candidates.page_types
+
+    decision = _incident_route(rt)
+
+    assert (decision.routed, decision.reason_code) == (False, "declaration_invalid")
+    assert decision.detail == "声明的页面类型 incident 不在可路由类型内（挂载 Wiki 未声明可定位的事故台账）"
+    assert decision.reason_code in UNROUTED_REASON_LABEL
+
+
+def test_the_ledger_closes_again_when_the_write_prefixes_are_withdrawn_after_discovery(tmp_path: Path):
+    rt = _incident_runtime(tmp_path)
+    discovered = rt.knowledge.wiki_gate.routing_candidates()
+    assert discovered.incident_offered is True
+    rt.cfg.knowledge_sink.allowed_write_prefixes = ["wiki-知识库/projects-项目"]
+
+    # The planner was offered the ledger before the change; the verdict reads the configuration as it is now.
+    decision = _incident_route(rt, candidates=discovered)
+
+    assert (decision.routed, decision.reason_code) == (False, "incident_prefix_not_allowed")
+    assert rt.knowledge.wiki_gate.routing_candidates().incident_offered is False
+
+
+# ---- the run
+
+
+def test_an_incident_card_waits_for_a_human_and_lands_in_the_ledger_only_after_approval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """规格场景（链路侧）：页面类型已声明、目录已放行、approval_mode=smart → P03 之后挂起 AWAITING_APPROVAL。"""
+
+    def plan(key: str) -> list[dict[str, Any]]:
+        # A session that delivered something and met an incident on the way: two cards, never one.
+        return [_incident_item(key), _doc("工作区一致复盘", key, _declare("alpha-crm"))]
+
+    rt, runner, key = _incident_run(tmp_path, monkeypatch, plan)
+    root = rt.knowledge.root
+    rel = _incident_rel()
+
+    run = rt.orchestrator.start_run(trigger="test", phase="daily", session_keys=[key])
+
+    assert runner.routing_candidates.incident_offered is True  # the planner was offered the ledger
+    assert run.status == RunStatus.AWAITING_APPROVAL, run.error
+    assert [_node(run, node_id).status.value for node_id in ("P02_REVIEW", "P03_ROUTE_PLAN")] == ["PASS", "PASS"]
+    assert _node(run, "P04_WRITE_VERIFY").status.value == "AWAITING_APPROVAL"
+    assert [_node(run, node_id).status.value for node_id in ("P05_SETTLE", "P06_REPORT", "P07_DELIVER")] == ["PENDING"] * 3
+    incident, delivery = run.planned_writes
+    assert (incident.action, incident.relative_path, incident.target_kind) == ("create", rel, "knowledge_doc")
+    assert (incident.requires_approval, incident.approval_reason, is_sensitive_write(incident), incident.side_effects) == (
+        True,
+        "事故卡属于敏感写入，需人工确认后才会落盘",
+        True,
+        [],
+    )
+    # The delivery's card is routine and carries no incident; it waits only because the batch does.
+    assert (delivery.requires_approval, is_sensitive_write(delivery)) == (False, False)
+    assert INCIDENT_TITLE not in delivery.content_preview and "静默失误" not in delivery.content_preview
+
+    audit = _audit_by_type(rt, run)
+    assert audit["awaiting_approval"]["payload"] == {"reasons": ["事故卡属于敏感写入，需人工确认后才会落盘"], "planned_count": 2}
+    assert "静默改错测试库配置 → incident；工作区一致复盘" in audit["planned_doc_routed"]["summary"]
+    p03 = _node(run, "P03_ROUTE_PLAN")
+    routed = {doc["title"]: doc for doc in p03.payload["routed_docs"]}
+    assert (routed[INCIDENT_TITLE]["route"]["page_type"], routed[INCIDENT_TITLE]["route"]["project"]) == ("incident", "")
+    assert (routed[INCIDENT_TITLE]["route"]["sensitive"], routed[INCIDENT_TITLE]["side_effects"]) == (True, [])
+    assert routed["工作区一致复盘"]["side_effects"][0]["kind"] == "practice_index_entry"
+    assert p03.payload["unrouted_docs"] == []
+    assert "其中 1 项为事故卡（敏感写入，待人工审批）" in p03.summary
+    assert _check(p03, "知识文档路由校验")["incident_cards"] == 1
+    assert _check(p03, "单批数量上限校验")["physical_knowledge_paths"] == 3  # the ledger page, the card and its index entry
+    assert _ledger_files(rt) == [] and _cards(rt) == []  # nothing while it waits
+
+    finished = rt.orchestrator.approve_and_resume(run.run_id)
+
+    assert finished.status == RunStatus.PASS, finished.error
+    assert _ledger_files(rt) == [rel]
+    raw = (root / rel).read_bytes()
+    assert b"\r" not in raw
+    page = raw.decode("utf-8")
+    assert page == incident.content_preview  # the card the plan showed is the card that landed
+    assert rt.knowledge.wiki_gate.validate_document(rel, page).ok
+    assert yaml.safe_load(split_frontmatter(page)[0])["sources"] == [f"ai-flywheel session: {key}"]
+    (card,) = _cards(rt)
+    assert card.endswith("-工作区一致复盘.md")
+    index = (root / "wiki-知识库" / "projects-项目" / ALPHA[0] / "实战笔记" / "笔记索引.md").read_text(encoding="utf-8")
+    assert "工作区一致复盘" in index and INCIDENT_TITLE not in index  # the ledger is no project's practice
+    assert rt.db.get_session(key).status.value == "processed"
+
+
+def test_a_rejected_incident_card_leaves_the_ledger_empty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    rt, _runner, key = _incident_run(tmp_path, monkeypatch, lambda key: [_incident_item(key)])
+
+    run = rt.orchestrator.start_run(trigger="test", phase="daily", session_keys=[key])
+    assert run.status == RunStatus.AWAITING_APPROVAL, run.error
+
+    rejected = rt.orchestrator.reject_run(run.run_id, "事故事实待核对")
+
+    assert rejected.status == RunStatus.CANCELLED
+    assert _ledger_files(rt) == []
+    assert not (rt.knowledge.root / INCIDENT_LEDGER).exists()
+    assert rt.db.get_session(key).status.value == "pending"
+
+
+def test_a_closed_ledger_refuses_a_declared_incident_card_and_leaves_a_trace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    rt, runner, key = _incident_run(
+        tmp_path, monkeypatch, lambda key: [_incident_item(key)], prefixes=("wiki-知识库/projects-项目",)
+    )
+
+    run = rt.orchestrator.start_run(trigger="test", phase="daily", session_keys=[key])
+
+    # The planner was not offered the ledger; the plan it insisted on is intercepted and traced, and the batch passes empty.
+    assert run.status == RunStatus.PASS, run.error
+    assert run.planned_writes == []
+    assert runner.routing_candidates.page_types == ["project-practice-note"]
+    assert "INCIDENT PAGES" not in _p03_prompt(runner.routing_candidates)
+    p03 = _node(run, "P03_ROUTE_PLAN")
+    (unrouted,) = p03.payload["unrouted_docs"]
+    assert (unrouted["title"], unrouted["reason_code"], unrouted["relative_path"]) == (INCIDENT_TITLE, "incident_prefix_not_allowed", _incident_rel())
+    assert unrouted["reason"] == f"{UNROUTED_REASON_TEXT['incident_prefix_not_allowed']}：{INCIDENT_LEDGER}/"
+    assert unrouted["declared"]["page_type"] == "incident"
+    assert unrouted["source_session_keys"] == [key]
+    audit = _audit_by_type(rt, run)
+    assert audit["planned_doc_unrouted"]["payload"]["unrouted_docs"] == [unrouted]
+    assert "1 篇笔记未列入写入计划：事故前缀未放行 1" in audit["planned_doc_unrouted"]["summary"]
+    assert "1 篇笔记因无法归属项目未列入计划（事故前缀未放行 1）" in p03.summary
+    assert _check(p03, "知识文档路由校验")["unrouted"] == 1
+    assert "incident_cards" not in _check(p03, "知识文档路由校验")
+    assert not (rt.knowledge.root / INCIDENT_LEDGER).exists()
+    assert rt.db.get_session(key).status.value == "processed"
+
+
+@pytest.mark.parametrize(
+    "approval_mode, valve, expected",
+    [
+        pytest.param("smart", False, RunStatus.AWAITING_APPROVAL, id="smart"),
+        pytest.param("always", False, RunStatus.AWAITING_APPROVAL, id="always"),
+        pytest.param("auto", False, RunStatus.AWAITING_APPROVAL, id="auto-vetoed-by-the-valve"),
+        pytest.param("auto", True, RunStatus.PASS, id="auto-with-the-valve-open"),
+    ],
+)
+def test_an_incident_card_takes_the_gate_every_sensitive_write_takes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, approval_mode: str, valve: bool, expected: RunStatus
+):
+    """Under `smart` and `always` the card waits for a human; `auto` is the maintainer's explicit choice, with the valve's consent."""
+    rt, _runner, key = _incident_run(
+        tmp_path, monkeypatch, lambda key: [_incident_item(key)], approval_mode=approval_mode, valve=valve
+    )
+
+    run = rt.orchestrator.start_run(trigger="test", phase="daily", session_keys=[key])
+
+    assert run.status == expected, run.error
+    written = expected == RunStatus.PASS
+    assert ("awaiting_approval" in _audit_by_type(rt, run)) is not written
+    assert (_ledger_files(rt) == [_incident_rel()]) is written
+    if not written:
+        (reason,) = _audit_by_type(rt, run)["awaiting_approval"]["payload"]["reasons"]
+        assert reason == ("事故卡属于敏感写入，需人工确认后才会落盘" if approval_mode != "always" else "当前为每次人工审批模式（共 1 项）")

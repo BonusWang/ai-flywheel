@@ -5,9 +5,14 @@
 
 最后一节覆盖 finding 的可选字段 `domain_signals`（feat-project-domain-incremental-deposit）：
 会话查证过的表结构、配置、架构链路与业务口径线索，以及没有线索时的缺省。
+
+再往后的三节覆盖高保真输入、事件拆分与分阶段模型（feat-agy-ingest-and-high-fidelity-distill）：
+16000 字会话预算、置顶的结构化摘要、`events` 契约，以及 P02 / P03 各自的 `review_model`、
+`plan_model` 与推理强度。模型网关用记录请求体的桩代替，不发出任何真实请求。
 """
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import shutil
@@ -17,9 +22,14 @@ from typing import Any
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from ai_flywheel.adapters.runners import (
     P02_MAX_SESSIONS,
+    P02_MIDDLE_OMITTED,
+    P02_SESSION_HEAD_CHARS,
+    P02_SESSION_TAIL_CHARS,
+    P02_SESSION_TEXT_LIMIT,
     REVIEW_EMPTY_FINDINGS,
     REVIEW_EMPTY_REPLY,
     REVIEW_FINDINGS_NOT_LIST,
@@ -30,6 +40,7 @@ from ai_flywheel.adapters.runners import (
     REVIEW_UNPARSABLE_REPLY,
     CliSubprocessRunner,
     DryRunHeuristicRunner,
+    ModelCallError,
     OpenAICompatibleRunner,
     PlanDiagnostics,
     PlanOutcome,
@@ -37,13 +48,20 @@ from ai_flywheel.adapters.runners import (
     _build_p02_prompt,
     build_runner,
     empty_domain_signals,
+    excerpt_session_text,
     normalize_domain_signals,
 )
-from ai_flywheel.config import FlywheelConfig
+from ai_flywheel.adapters.runners import clients as clients_mod
+from ai_flywheel.adapters.runners import prompts as prompts_mod
+from ai_flywheel.adapters.runners.clients import P02_STAGE, P03_STAGE
+from ai_flywheel.adapters.runners.normalizers import REVIEW_EVENT_KINDS, normalize_review_events
+from ai_flywheel.adapters.runners.prompts import P02_APPENDED_BRIEF_HEADER, P02_BRIEF_MARKER
+from ai_flywheel.config import ApiRunnerConfig, FlywheelConfig
 from ai_flywheel.core import orchestrator as orchestrator_mod
+from ai_flywheel.core.queue_service import render_structured_brief
 from ai_flywheel.models import NodeExecution, NodeStatus, RegisterSessionRequest, RunStatus, SessionRecord, SessionStatus, WorkflowRunRecord
 from ai_flywheel.runtime import FlywheelRuntime
-from ai_flywheel.storage.fs_store import ImmutableFileStore
+from ai_flywheel.storage.fs_store import ImmutableFileStore, canonical_hash
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -189,7 +207,8 @@ def test_baseline_runner_selection_prompt_inputs_and_review_limits(tmp_path: Pat
     unconfigured.runner.mode = "api"
     assert isinstance(build_runner(unconfigured, ImmutableFileStore(tmp_path / "receipts")), DryRunHeuristicRunner)
 
-    sessions = [(record, f"正文{i}" * 2000) for i, (record, _) in enumerate(_sessions("s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"))]
+    # Every body is 20000 characters: over the review's budget for one session, so each is excerpted.
+    sessions = [(record, f"正文{i}" * 10000) for i, (record, _) in enumerate(_sessions("s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"))]
     prompt = _build_p02_prompt(sessions, [], [{"name": "release-checklist", "description": "发版检查"}], "both")
 
     assert "FRIDAY WEEKLY REVIEW" in prompt
@@ -199,17 +218,20 @@ def test_baseline_runner_selection_prompt_inputs_and_review_limits(tmp_path: Pat
     assert set(payload) == {"phase", "sessions", "open_retros", "existing_skills"}
     assert payload["phase"] == "both"
     assert payload["existing_skills"] == [{"name": "release-checklist", "description": "发版检查"}]
-    # the prompt carries the first sessions only, each as a head+tail excerpt
+    # the prompt carries the first sessions only, each as a head+tail excerpt inside the budget
     assert len(payload["sessions"]) == P02_MAX_SESSIONS == 6
-    assert {len(item["text"]) for item in payload["sessions"]} == {2924}
+    assert P02_SESSION_TEXT_LIMIT == 16000
+    assert {len(item["text"]) for item in payload["sessions"]} == {
+        P02_SESSION_HEAD_CHARS + len(P02_MIDDLE_OMITTED) + P02_SESSION_TAIL_CHARS
+    }
     bodies = {
-        record.session_key: f"正文{i}" * 2000
+        record.session_key: f"正文{i}" * 10000
         for i, (record, _) in enumerate(_sessions("s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"))
     }
     for item in payload["sessions"]:
         body = bodies[item["session_key"]]
-        assert item["text"] == body[:1450] + "\n...[middle omitted]...\n" + body[-1450:]
-        assert len(item["text"]) <= 3000
+        assert item["text"] == body[:P02_SESSION_HEAD_CHARS] + P02_MIDDLE_OMITTED + body[-P02_SESSION_TAIL_CHARS :]
+        assert len(item["text"]) <= P02_SESSION_TEXT_LIMIT
 
 
 def test_second_identical_review_is_served_from_cache(tmp_path: Path):
@@ -900,3 +922,660 @@ def test_a_reply_cached_before_the_field_existed_is_completed_and_served(tmp_pat
     assert fake.prompts == []  # served from the cache, the model is not asked again
     assert result["review_diagnostics"]["cache_hit"] is True
     assert [f["domain_signals"] for f in result["findings"]] == [EMPTY_SIGNALS, EMPTY_SIGNALS]
+
+# ---------------------------------------------------------------- high-fidelity input, events and per-stage models
+# (feat-agy-ingest-and-high-fidelity-distill)
+
+
+def _dialogue(chars: int, *middle: str) -> str:
+    """A dialogue of exactly ``chars`` characters, with ``middle`` laid at its centre."""
+    filler = "用户：继续核对下一个字段。助手：好，接着看。\n"
+    inner = "".join(middle)
+    lead = (chars - len(inner)) // 2
+    head = (filler * (chars // len(filler) + 2))[:lead]
+    tail = (filler * (chars // len(filler) + 2))[: chars - lead - len(inner)]
+    body = head + inner + tail
+    assert len(body) == chars
+    return body
+
+
+def _sessions_of(prompt: str) -> list[dict[str, str]]:
+    """The session entries of a P02 prompt's input."""
+    return json.loads(prompt.rsplit("\n\n", 1)[1])["sessions"]
+
+
+def _event(kind: str = "delivery", *, key: str = "codex:s1", title: str = "交付：对账任务", summary: str = "完成对账任务，金额以分为单位。", **extra: Any) -> dict[str, Any]:
+    return {"event_id": "ev-9", "kind": kind, "title": title, "summary": summary, "session_key": key, **extra}
+
+
+def _events_review(*events: dict[str, Any], session_id: str = "s1") -> str:
+    """A model review with the given events and nothing else to persist."""
+    return json.dumps(
+        {"findings": [_finding(session_id)], "events": list(events), "mistakes": [], "dissents": [], "repeated_workflows": []},
+        ensure_ascii=False,
+    )
+
+
+BRIEF = {
+    "tables_verified": ["ledger_entries: entry_id 主键，amount 以分为单位"],
+    "root_cause": "连接池上限过小，不是接口超时",
+    "decisions": [{"what": "连接池上限调到 50", "why": "压测下请求排队超时"}],
+}
+
+
+def test_a_long_session_within_the_budget_is_carried_whole():
+    """规格场景：12000 字的会话在 16000 字预算内完整进入审查，中段的表名与根因都还在。"""
+    table = "助手：查了 ledger_entries 表，主键 entry_id，amount 以分为单位。\n"
+    root_cause = "用户：所以根因是连接池上限配小了？助手：是，根因是连接池上限过小。\n"
+    body = _dialogue(12000, table, root_cause)
+    # Both sit in the middle, where the head + tail excerpt of the old 3000-character budget ended.
+    assert body.index(table) > 1450
+    assert body.index(root_cause) + len(root_cause) < 12000 - 1450
+    record, _ = _sessions("s1")[0]
+
+    (entry,) = _sessions_of(_build_p02_prompt([(record, body)], [], None, "daily"))
+
+    assert entry["text"] == body
+    assert P02_MIDDLE_OMITTED not in entry["text"]
+    assert table.strip() in entry["text"] and root_cause.strip() in entry["text"]
+    assert list(entry) == ["session_key", "client", "project", "title", "text"]
+
+
+@pytest.mark.parametrize("limit", [P02_SESSION_TEXT_LIMIT, 3000, 2000, 64000])
+def test_a_session_over_the_budget_keeps_its_head_and_tail_inside_the_budget(limit):
+    body = _dialogue(limit + 4000)
+    excerpt = excerpt_session_text(body, limit)
+    whole = P02_SESSION_HEAD_CHARS + len(P02_MIDDLE_OMITTED) + P02_SESSION_TAIL_CHARS
+
+    assert len(excerpt) == min(limit, whole)
+    head, _, tail = excerpt.partition(P02_MIDDLE_OMITTED)
+    assert head == body[: len(head)]
+    assert tail == body[len(body) - len(tail) :]
+    # A session exactly at the budget is carried whole; one character more is excerpted.
+    assert excerpt_session_text("x" * limit, limit) == "x" * limit
+    assert P02_MIDDLE_OMITTED in excerpt_session_text("x" * (limit + 1), limit)
+
+    record, _ = _sessions("s1")[0]
+    (entry,) = _sessions_of(_build_p02_prompt([(record, body)], [], None, "daily", session_char_limit=limit))
+    assert entry["text"] == excerpt
+
+
+def test_the_session_budget_is_a_configured_setting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    assert ApiRunnerConfig().p02_session_char_limit == P02_SESSION_TEXT_LIMIT == 16000
+    for out_of_range in (1999, 64001):
+        with pytest.raises(ValidationError):
+            ApiRunnerConfig(p02_session_char_limit=out_of_range)
+
+    runner = _api_runner(tmp_path)
+    runner.cfg.runner.api.p02_session_char_limit = 3000
+    seen: list[int | None] = []
+    real = prompts_mod._build_p02_prompt
+
+    def spy(sessions, open_retros, existing_skills, phase, *, session_char_limit=None):
+        seen.append(session_char_limit)
+        return real(sessions, open_retros, existing_skills, phase, session_char_limit=session_char_limit)
+
+    monkeypatch.setattr(clients_mod, "_build_p02_prompt", spy)
+    runner._call_chat_completion = _FakeModel(_review("s1"))
+    runner.review_sessions(_sessions("s1"), [])
+
+    cli = CliSubprocessRunner(runner.cfg, ImmutableFileStore(tmp_path / "cli-receipts"))
+    cli.cfg.runner.cli.command = "mock-cli"
+    cli._invoke_cli = lambda stage, prompt, **kwargs: json.loads(_review("s1"))  # type: ignore[method-assign]
+    cli.review_sessions(_sessions("s1"), [])
+
+    # Both runners hand the configured budget to the prompt; neither invents another.
+    assert seen == [3000, 3000]
+
+
+def test_the_structured_brief_comes_before_the_dialogue_and_is_never_excerpted():
+    record, short = _sessions("s1")[0]
+    briefed = record.model_copy(update={"metadata": {"structured_brief": BRIEF}})
+
+    (entry,) = _sessions_of(_build_p02_prompt([(briefed, _dialogue(40000))], [], None, "daily"))
+
+    assert list(entry) == ["session_key", "client", "project", "title", "structured_brief", "text"]
+    assert entry["structured_brief"].startswith(P02_BRIEF_MARKER + "\n")
+    assert json.loads(entry["structured_brief"].split("\n", 1)[1]) == BRIEF  # whole, in the client's key order
+    # Only the dialogue is excerpted, exactly as it would be without the brief.
+    assert entry["text"] == excerpt_session_text(_dialogue(40000))
+    assert P02_MIDDLE_OMITTED in entry["text"]
+    # A session without a brief gets the entry it always had.
+    (plain,) = _sessions_of(_build_p02_prompt([(record, short)], [], None, "daily"))
+    assert list(plain) == ["session_key", "client", "project", "title", "text"]
+    assert plain["text"] == short
+
+
+def test_a_brief_the_queue_appended_is_lifted_out_of_the_dialogue():
+    record, _ = _sessions("s1")[0]
+    dialogue = _dialogue(40000)
+    appended = f"{dialogue}\n\n{render_structured_brief(BRIEF)}"
+
+    entry = _sessions_of(_build_p02_prompt([(record, appended)], [], None, "daily"))[0]
+
+    assert entry["structured_brief"] == f"{P02_BRIEF_MARKER}\n{render_structured_brief(BRIEF)}"
+    # The dialogue alone is excerpted: the brief is neither cut nor counted against the budget.
+    assert entry["text"] == excerpt_session_text(dialogue)
+    assert P02_APPENDED_BRIEF_HEADER not in entry["text"]
+    # A short dialogue comes back exactly as it was, without the trailing block.
+    short = "用户：接口超时怎么排查。\n助手：先看连接池上限。\n"
+    brief_block = render_structured_brief(BRIEF)
+    short_entry = _sessions_of(_build_p02_prompt([(record, f"{short}\n\n{brief_block}")], [], None, "daily"))[0]
+    assert short_entry["text"] == short.rstrip("\n")
+    assert short_entry["structured_brief"] == f"{P02_BRIEF_MARKER}\n{brief_block}"
+
+
+def test_a_brief_given_twice_is_carried_once_and_the_session_record_wins():
+    dialogue = _dialogue(500)
+    appended = f"{dialogue}\n\n{render_structured_brief({'from': 'queue'})}"
+    record = _sessions("s1")[0][0].model_copy(update={"metadata": {"structured_brief": {"from": "record"}}})
+
+    entry = _sessions_of(_build_p02_prompt([(record, appended)], [], None, "daily"))[0]
+
+    assert entry["structured_brief"] == f"{P02_BRIEF_MARKER}\n" + '{\n  "from": "record"\n}'
+    assert entry["text"] == dialogue
+    assert entry["structured_brief"].count(P02_BRIEF_MARKER) == 1
+    assert "queue" not in entry["structured_brief"] + entry["text"]
+
+
+def test_only_a_usable_brief_is_carried_and_a_credential_in_it_is_masked():
+    record, short = _sessions("s1")[0]
+
+    def entry(brief: Any) -> dict[str, str]:
+        briefed = record.model_copy(update={"metadata": {"structured_brief": brief}})
+        return _sessions_of(_build_p02_prompt([(briefed, short)], [], None, "daily"))[0]
+
+    for unusable in ({}, None, [], "", 0):
+        assert "structured_brief" not in entry(unusable), unusable
+    text_brief = "表：ledger_entries；根因：连接池上限过小"
+    assert entry(text_brief)["structured_brief"] == f"{P02_BRIEF_MARKER}\n{text_brief}"
+
+    # The queue redacts a brief when it is submitted; the prompt is the second net, on the same patterns:
+    # an assignment inside a text, and the value of a key that names a credential.
+    leaky = {
+        "数据库密码": "Hk9-Qp31x",
+        "note": "数据库密码：Hk9-Qp31x",
+        "token": "abc123def456",
+        "kept": "数据库密码：******",
+        "also_fine": "密码走环境变量注入",
+    }
+    from_record = entry(leaky)["structured_brief"]
+    from_queue = _sessions_of(_build_p02_prompt([(record, f"{short}\n\n{render_structured_brief(leaky)}")], [], None, "daily"))[0]["structured_brief"]
+    for text in (from_record, from_queue):
+        assert "Hk9-Qp31x" not in text and "abc123def456" not in text
+        assert text.count("[REDACTED]") == 3, text
+        assert "数据库密码：******" in text
+        assert "密码走环境变量注入" in text
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        pytest.param(
+            f"{P02_APPENDED_BRIEF_HEADER}\n用户：这一行不是条目，说明上面那句只是对话里提到的一句话。\n",
+            id="header-then-a-dialogue-line",
+        ),
+        pytest.param("flywheel-brief: structured brief submitted by the client\n  - key: value\n", id="another-header"),
+        pytest.param(f"助手：客户端会提交 `{P02_APPENDED_BRIEF_HEADER}` 这样的一行。\n", id="header-inside-a-line"),
+    ],
+)
+def test_a_dialogue_that_only_resembles_the_appended_brief_is_left_whole(tail):
+    record, _ = _sessions("s1")[0]
+    body = "用户：先看日志。\n" + tail
+
+    entry = _sessions_of(_build_p02_prompt([(record, body)], [], None, "daily"))[0]
+
+    assert "structured_brief" not in entry
+    assert entry["text"] == body
+
+
+def test_the_prompt_and_the_queue_name_the_appended_brief_alike():
+    """The runners may not import the queue service, so the header is written in two places."""
+    rendered = render_structured_brief(BRIEF)
+
+    assert rendered.split("\n", 1)[0] == P02_APPENDED_BRIEF_HEADER
+    assert all(line.startswith("  - ") for line in rendered.split("\n")[1:])
+    assert prompts_mod.split_appended_brief(f"用户：先看日志。\n\n{rendered}")[1] == rendered
+
+
+def _queue_dialogue(turns: int = 14) -> str:
+    """A dialogue of many short turns, the way a transcript reader hands it to the queue.
+
+    The queue folds a single long turn in the middle before it chunks, so a dialogue
+    meant to span two chunks has to be made of turns it keeps verbatim.
+    """
+    turn = "[assistant] " + "核对记录。" * 389
+    assert len(turn) == 1957
+    return "\n\n".join([turn] * turns)
+
+
+def test_the_queue_appends_the_brief_to_the_first_chunk_and_the_prompt_lifts_it(tmp_path: Path):
+    rt, _ = _runtime(tmp_path)
+    _register(rt)
+    items = rt.queue.on_explicit_enqueue(client="codex", session_id="s1", content=_queue_dialogue(), structured_brief=BRIEF)
+
+    assert [item.chunk_index for item in items] == [1, 2]  # above the 24000-character chunk limit
+    texts = [rt.queue.load_queue_item_text(item) for item in items]
+    brief_block = render_structured_brief(BRIEF)
+    assert texts[0].endswith("\n\n" + brief_block)
+    assert P02_APPENDED_BRIEF_HEADER not in texts[1]
+
+    record = rt.db.get_session("codex:s1")
+    first, second = (_sessions_of(_build_p02_prompt([(record, text)], [], None, "daily"))[0] for text in texts)
+
+    assert first["structured_brief"] == f"{P02_BRIEF_MARKER}\n{brief_block}"
+    # The dialogue alone is excerpted: the brief is neither cut nor counted against the budget.
+    # (Excerpting the text as the queue stored it would have spent the tail on the brief.)
+    dialogue = texts[0][: -len("\n\n" + brief_block)]
+    assert len(dialogue) > P02_SESSION_TEXT_LIMIT
+    assert first["text"] == excerpt_session_text(dialogue)
+    assert P02_APPENDED_BRIEF_HEADER not in first["text"]
+    # The later chunk carries dialogue only: the review reads the brief once, with the first part.
+    assert "structured_brief" not in second
+    assert second["text"] == texts[1]
+    assert P02_APPENDED_BRIEF_HEADER not in second["text"]
+
+
+def test_p02_prompt_states_the_structured_brief_and_asks_for_events():
+    prompt = _build_p02_prompt(_sessions("s1"), [], None, "daily")
+
+    for needle in (
+        "STRUCTURED BRIEF:",
+        '"structured_brief" ahead of its "text"',
+        "It is evidence the client submitted, not dialogue",
+        "quote the dialogue, never the brief, as something the session said",
+        "EVENTS:",
+        '"events" array',
+        '"event_id" (ev-1, ev-2, ...)',
+        '"kind" (delivery|incident|decision|domain_fact)',
+        '"session_key" (copied verbatim)',
+        "An incident is a collaboration accident",
+        "a business delivery and the incident that happened on the way are two events",
+        "Record every incident as its own event",
+        "Leave the array empty ([]) when there is no such event.",
+    ):
+        assert needle in prompt, needle
+    contract = prompt.split("Return STRICT JSON ONLY:\n", 1)[1].split("\n\n", 1)[0]
+    assert (
+        '"events":[{"event_id":"ev-1","kind":"delivery|incident|decision|domain_fact","title":"简洁中文标题",'
+        '"summary":"...","session_key":"..."}]'
+    ) in contract
+    assert contract.index('"findings":[') < contract.index('"events":[') < contract.index('"mistakes":[')
+
+
+def test_review_events_are_normalized_into_one_shape():
+    raw = [
+        _event(" Delivery "),  # the kind as a model may spell it
+        _event("incident", title=" 事故：静默改错配置 ", note="not part of the contract"),
+        _event("decision", title="决策：金额以分为单位", summary=""),
+        _event("domain_fact", title="事实：ledger_entries 主键", summary="entry_id 是主键"),
+        _event("delivery"),  # the first event again
+        "not an object",
+        42,
+        None,
+        _event("mistake", title="不认识的种类"),
+        _event(key="   "),  # no session it belongs to
+        _event("decision", title="  ", summary=""),  # nothing to say
+    ]
+
+    events = normalize_review_events(raw)
+
+    said = "完成对账任务，金额以分为单位。"
+    assert events == [
+        {"event_id": "ev-1", "kind": "delivery", "title": "交付：对账任务", "summary": said, "session_key": "codex:s1"},
+        {"event_id": "ev-2", "kind": "incident", "title": "事故：静默改错配置", "summary": said, "session_key": "codex:s1"},
+        {"event_id": "ev-3", "kind": "decision", "title": "决策：金额以分为单位", "summary": "", "session_key": "codex:s1"},
+        {"event_id": "ev-4", "kind": "domain_fact", "title": "事实：ledger_entries 主键", "summary": "entry_id 是主键", "session_key": "codex:s1"},
+    ]
+    assert list(events[0]) == ["event_id", "kind", "title", "summary", "session_key"]
+    assert REVIEW_EVENT_KINDS == ("delivery", "incident", "decision", "domain_fact")
+    # An id is a place in the list: the same reply always yields the same ids, and a second pass changes nothing.
+    assert normalize_review_events(events) == events
+    assert [event["event_id"] for event in normalize_review_events(list(reversed(events)))] == ["ev-1", "ev-2", "ev-3", "ev-4"]
+
+
+@pytest.mark.parametrize("raw", [_OMITTED, None, {"kind": "delivery"}, "events", 7, [{"kind": "delivery"}]])
+def test_anything_but_a_list_of_usable_events_reads_as_no_event(raw):
+    review = {"findings": [_finding("s1")]}
+    if raw is not _OMITTED:
+        review["events"] = raw
+
+    assert normalize_review_events(review.get("events")) == []
+
+
+def test_review_events_are_bounded_masked_and_kept_in_order():
+    many = normalize_review_events([_event("delivery", title=f"交付：任务{index}") for index in range(30)])
+
+    assert [event["event_id"] for event in many] == [f"ev-{number}" for number in range(1, 25)]
+    assert [event["title"] for event in many][:3] == ["交付：任务0", "交付：任务1", "交付：任务2"]
+
+    (masked,) = normalize_review_events(
+        [_event("incident", title="事故：" + "长" * 100, summary="数据库密码：Hk9-Qp31x。" + "经过" * 400, key="k" * 200)]
+    )
+    assert (len(masked["title"]), len(masked["summary"]), len(masked["session_key"])) == (80, 600, 120)
+    assert "Hk9-Qp31x" not in masked["summary"]
+    assert masked["summary"].startswith("数据库密码：[REDACTED]")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param(_OMITTED, id="omitted"),
+        pytest.param(None, id="null"),
+        pytest.param({"kind": "delivery"}, id="not-a-list"),
+        pytest.param([{"kind": "delivery"}], id="no-usable-entry"),
+        pytest.param(["x", 3], id="garbage-entries"),
+    ],
+)
+def test_a_review_without_usable_events_reads_as_no_event(tmp_path: Path, raw: Any):
+    review = json.loads(_review("s1"))
+    if raw is not _OMITTED:
+        review["events"] = raw
+    runner = _api_runner(tmp_path)
+    runner._call_chat_completion = _FakeModel(json.dumps(review, ensure_ascii=False))
+
+    result = runner.review_sessions(_sessions("s1"), [])
+
+    assert result["events"] == []
+    assert result["review_diagnostics"]["reason_code"] is None
+    assert [finding["session_key"] for finding in result["findings"]] == ["codex:s1"]
+
+
+def test_review_events_pass_through_the_model_review(tmp_path: Path):
+    runner = _api_runner(tmp_path)
+    event = _event("incident", title="事故：静默改错配置", summary="改错了测试库配置，未告知。")
+    runner._call_chat_completion = _FakeModel(_events_review(event))
+
+    result = runner.review_sessions(_sessions("s1"), [])
+
+    assert result["events"] == [{**event, "event_id": "ev-1"}]
+    assert result["review_diagnostics"]["finding_count"] == 1
+    # A review read from a cache written before the events existed states none, like a review without them.
+    cached = _api_runner(tmp_path)
+    second = cached.review_sessions(_sessions("s1"), [])
+    assert second["review_diagnostics"]["cache_hit"] is True
+    assert second["events"] == result["events"]
+
+
+def test_every_reviewer_states_the_events(tmp_path: Path):
+    # The local reviewer reads no transcript in detail: it records no event and says so.
+    assert DryRunHeuristicRunner().review_sessions(_sessions(*SESSION_IDS), [])["events"] == []
+
+    cfg = FlywheelConfig(base_dir=tmp_path)
+    cfg.runner.mode = "cli"
+    cfg.runner.cli.command = "mock-cli"
+    cli = CliSubprocessRunner(cfg, ImmutableFileStore(tmp_path / "cli-receipts"))
+    cli._invoke_cli = lambda stage, prompt, **kwargs: json.loads(_events_review(_event("incident", title="事故：静默改错配置")))  # type: ignore[method-assign]
+
+    (event,) = cli.review_sessions(_sessions("s1"), [])["events"]
+
+    assert (event["kind"], event["title"], event["event_id"]) == ("incident", "事故：静默改错配置", "ev-1")
+
+
+class _RecordingModel:
+    """Stands in for the model gateway and keeps the whole prompt of every call."""
+
+    P02_LINE = "You are the P02 Review Worker of AI Flywheel."
+    P03_LINE = "You are the P03 Route & Write-Plan Worker of AI Flywheel."
+    REPAIR_LINE = "The previous output was malformed JSON"
+
+    def __init__(self, p02_reply: str, *, repair_reply: str = "", p03_reply: str = '{"planned_writes": []}') -> None:
+        self.p02_reply = p02_reply
+        self.repair_reply = repair_reply
+        self.p03_reply = p03_reply
+        self.prompts: list[str] = []
+
+    def __call__(self, prompt: str, system_prompt: str) -> str:
+        self.prompts.append(prompt)
+        if prompt.startswith(self.P02_LINE):
+            return self.p02_reply
+        if prompt.startswith(self.REPAIR_LINE):
+            return self.repair_reply
+        return self.p03_reply
+
+    def prompts_of(self, first_line: str) -> list[str]:
+        return [prompt for prompt in self.prompts if prompt.startswith(first_line)]
+
+
+def test_the_events_of_a_review_reach_the_review_node_and_the_plan_prompt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    rt, _ = _runtime(tmp_path)
+    _register(rt)
+    events = [
+        _event("delivery", title="交付：对账任务"),
+        _event("incident", title="事故：静默改错配置", summary="改错了测试库配置，未告知。"),
+    ]
+    model = _RecordingModel(_events_review(*events))
+    monkeypatch.setattr(OpenAICompatibleRunner, "_call_chat_completion", model)
+
+    run = rt.orchestrator.start_run(trigger="test", phase="daily", session_keys=["codex:s1"], auto_approve_override=True)
+
+    assert run.status == RunStatus.PASS, run.error
+    expected = [{**event, "event_id": f"ev-{index}"} for index, event in enumerate(events, start=1)]
+    p02 = _node(run, "P02_REVIEW")
+    assert p02.status == NodeStatus.PASS
+    assert p02.payload["events"] == expected
+    assert next(check for check in p02.internal_checks if check["name"] == "重复流程与 Skill 线索扫描")["detail"]["events"] == 2
+    (plan_prompt,) = model.prompts_of(_RecordingModel.P03_LINE)
+    assert json.loads(plan_prompt.rsplit("\n\n", 1)[1])["events"] == expected
+    assert "EVENTS:" in plan_prompt
+    assert "事故：静默改错配置" in plan_prompt
+
+
+def test_the_format_repair_is_shown_the_events_key(tmp_path: Path):
+    runner = _api_runner(tmp_path)
+    model = _RecordingModel('{"findings": [ BROKEN JSON', repair_reply=_events_review(_event("decision", title="决策：金额以分为单位")))
+    runner._call_chat_completion = model
+
+    result = runner.review_sessions(_sessions("s1"), [])
+
+    (repair,) = model.prompts_of(_RecordingModel.REPAIR_LINE)
+    assert repair.index('"findings":[...]') < repair.index('"events":[...]') < repair.index('"mistakes":[...]')
+    assert [event["kind"] for event in result["events"]] == ["decision"]
+
+
+# ---- per-stage model layering
+
+
+class _Gateway:
+    """Stands in for the model gateway: records every request body, answers with the next canned reply."""
+
+    def __init__(self, replies: list[str]) -> None:
+        self.replies = list(replies)
+        self.bodies: list[dict[str, Any]] = []
+
+    def __call__(self, url: str, headers: Any = None, json: Any = None, timeout: Any = None) -> httpx.Response:
+        self.bodies.append(json)
+        content = self.replies[min(len(self.bodies) - 1, len(self.replies) - 1)]
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", url),
+            json={"model": "served-model", "choices": [{"message": {"content": content}}]},
+        )
+
+
+def _staged_runner(tmp_path: Path, **stage: str) -> OpenAICompatibleRunner:
+    """An API runner on `mock-model` at `medium` effort, with the per-stage keys given."""
+    runner = _api_runner(tmp_path)
+    runner.cfg.runner.api.reasoning_effort = "medium"
+    for key, value in stage.items():
+        setattr(runner.cfg.runner.api, key, value)
+    return runner
+
+
+def test_the_review_runs_on_its_own_model_and_effort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """规格场景：review_model / review_reasoning_effort 进 P02 请求体，缓存键也与默认模型不同。"""
+    runner = _staged_runner(tmp_path, review_model="strong-review-model", review_reasoning_effort="high")
+    gateway = _Gateway([_review("s1", "s2", "s3")])
+    monkeypatch.setattr(httpx, "post", gateway)
+
+    result = runner.review_sessions(_sessions("s1", "s2", "s3"), [])
+
+    (request,) = gateway.bodies
+    assert request["model"] == "strong-review-model"
+    assert request["reasoning_effort"] == "high"
+    assert result["runner"] == "api:strong-review-model"
+    assert result["review_source"] == REVIEW_SOURCE_MODEL
+    telemetry = result["review_diagnostics"]["call_telemetry"]
+    assert (telemetry["model"], telemetry["reasoning_effort"], telemetry["served_model"]) == ("strong-review-model", "high", "served-model")
+
+    # The review's cache is keyed by the pair it really ran on: another model's reply is never served to it.
+    same_effort = _staged_runner(tmp_path)
+    prompt = "同一个提示词"
+    assert runner._cache_file(P02_STAGE, prompt).name != same_effort._cache_file(P02_STAGE, prompt).name
+    # The review's keys say nothing about the plan stage.
+    assert runner._cache_file(P03_STAGE, prompt).name == same_effort._cache_file(P03_STAGE, prompt).name
+
+    plain_model = _FakeModel(_review("s1"))
+    same_effort._call_chat_completion = plain_model
+    same_effort.review_sessions(_sessions("s1"), [])  # the default model's reply lands in the cache
+    staged_model = _FakeModel(_review("s1"))
+    runner._call_chat_completion = staged_model
+
+    asked = runner.review_sessions(_sessions("s1"), [])
+
+    assert len(plain_model.prompts) == 1
+    assert len(staged_model.prompts) == 1  # asked again: the other model's reply is not this one's
+    assert asked["review_diagnostics"]["cache_hit"] is False
+    assert runner.review_sessions(_sessions("s1"), [])["review_diagnostics"]["cache_hit"] is True
+
+
+def test_without_a_stage_override_the_cache_key_is_what_it_always_was(tmp_path: Path):
+    runner = _staged_runner(tmp_path)
+    prompt = "同一个提示词"
+
+    for stage in (P02_STAGE, P03_STAGE):
+        expected = canonical_hash(
+            {
+                "stage": stage,
+                "base_url": "http://127.0.0.1:9999/v1",
+                "model": "mock-model",
+                "reasoning_effort": "medium",
+                "prompt": prompt,
+            }
+        )[:16]
+        assert runner._cache_file(stage, prompt).name == f"{stage}-{expected}.json"
+    # Only one of the pair overridden: the other half still comes from the configured pair.
+    effort_only = _staged_runner(tmp_path, plan_reasoning_effort="high")
+    assert effort_only._cache_file(P03_STAGE, prompt).name != runner._cache_file(P03_STAGE, prompt).name
+    assert effort_only._cache_file(P02_STAGE, prompt).name == runner._cache_file(P02_STAGE, prompt).name
+
+
+@pytest.mark.parametrize(
+    ("stage", "keys", "expected"),
+    [
+        pytest.param(P02_STAGE, {}, ("mock-model", "medium"), id="review-unset"),
+        pytest.param(P02_STAGE, {"review_model": "  "}, ("mock-model", "medium"), id="review-blank-model"),
+        pytest.param(P02_STAGE, {"review_model": " r-model "}, ("r-model", "medium"), id="review-model-only"),
+        pytest.param(P02_STAGE, {"review_reasoning_effort": " high "}, ("mock-model", "high"), id="review-effort-only"),
+        pytest.param(P02_STAGE, {"plan_model": "p-model", "plan_reasoning_effort": "low"}, ("mock-model", "medium"), id="plan-keys-ignore"),
+        pytest.param(P03_STAGE, {}, ("mock-model", "medium"), id="plan-unset"),
+        pytest.param(P03_STAGE, {"plan_model": "p-model", "plan_reasoning_effort": "low"}, ("p-model", "low"), id="plan-both"),
+        pytest.param(P03_STAGE, {"review_model": "r-model", "review_reasoning_effort": "high"}, ("mock-model", "medium"), id="review-keys-ignore"),
+        pytest.param("p04_write", {"review_model": "r-model", "plan_model": "p-model"}, ("mock-model", "medium"), id="unknown-stage"),
+    ],
+)
+def test_a_stage_falls_back_to_the_configured_pair_key_by_key(tmp_path: Path, stage: str, keys: dict[str, str], expected: tuple[str, str]):
+    runner = _staged_runner(tmp_path, **keys)
+
+    assert runner._resolve_stage_api_params(stage) == expected
+
+
+def test_the_plan_runs_on_its_own_model_and_effort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    runner = _staged_runner(tmp_path, plan_model="strong-plan-model", plan_reasoning_effort="low")
+    gateway = _Gateway([json.dumps({"planned_writes": []}, ensure_ascii=False)])
+    monkeypatch.setattr(httpx, "post", gateway)
+
+    outcome = runner.plan_writes_detailed({"findings": []}, [], 8)
+
+    (request,) = gateway.bodies
+    assert (request["model"], request["reasoning_effort"]) == ("strong-plan-model", "low")
+    assert outcome.diagnostics.model == "strong-plan-model"
+    assert outcome.diagnostics.call_telemetry["model"] == "strong-plan-model"
+    assert outcome.diagnostics.to_dict()["model"] == "strong-plan-model"
+
+
+def test_an_effort_reaches_the_request_only_when_someone_set_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    gateway = _Gateway([_review("s1")])
+    monkeypatch.setattr(httpx, "post", gateway)
+    bare = _api_runner(tmp_path)  # no effort configured anywhere
+    bare._call_chat_completion("p", "s")
+    assert "reasoning_effort" not in gateway.bodies[0]
+
+    runner = _api_runner(tmp_path)
+    runner.cfg.runner.api.review_reasoning_effort = "high"
+    runner.review_sessions(_sessions("s1"), [])
+
+    assert gateway.bodies[1]["reasoning_effort"] == "high"
+    # Outside a stage the same runner asks with the configured pair.
+    runner._call_chat_completion("p", "s")
+    assert "reasoning_effort" not in gateway.bodies[2]
+    assert gateway.bodies[2]["model"] == "mock-model"
+
+
+def test_the_format_repair_asks_the_same_stage_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    runner = _staged_runner(tmp_path, review_model="strong-review-model", review_reasoning_effort="high")
+    gateway = _Gateway(['{"findings": [ BROKEN JSON', _review("s1")])
+    monkeypatch.setattr(httpx, "post", gateway)
+
+    result = runner.review_sessions(_sessions("s1"), [])
+
+    assert [(request["model"], request["reasoning_effort"]) for request in gateway.bodies] == [("strong-review-model", "high")] * 2
+    assert result["review_diagnostics"]["repair_attempted"] is True
+    assert result["review_diagnostics"]["reason_code"] is None
+    assert [finding["session_key"] for finding in result["findings"]] == ["codex:s1"]
+
+
+def test_the_model_call_keeps_its_two_argument_signature_and_leaves_no_stage_behind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # A sandbox replay replaces this method with a stub that takes (prompt, system_prompt): the signature is a contract.
+    assert list(inspect.signature(OpenAICompatibleRunner._call_chat_completion).parameters) == ["self", "prompt", "system_prompt"]
+
+    runner = _staged_runner(tmp_path, review_model="strong-review-model", review_reasoning_effort="high")
+    runner.cfg.runner.api.transport_retries = 0
+
+    def refused(url: str, headers: Any = None, json: Any = None, timeout: Any = None) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", refused)
+    with pytest.raises(ModelCallError) as refused_call:
+        runner.review_sessions(_sessions("s1"), [])
+
+    assert refused_call.value.telemetry["model"] == "strong-review-model"
+    assert (runner._active_stage_model, runner._active_stage_effort) == ("", "")
+
+    # No stage in flight: the call asks for the configured pair, as it always did.
+    gateway = _Gateway(["ok"])
+    monkeypatch.setattr(httpx, "post", gateway)
+    runner._call_chat_completion("p", "s")
+    assert (gateway.bodies[0]["model"], gateway.bodies[0]["reasoning_effort"]) == ("mock-model", "medium")
+    # A stage in flight nests: the one before it is back afterwards.
+    with runner._stage_call(P03_STAGE):
+        runner._call_chat_completion("p", "s")
+    assert gateway.bodies[1]["model"] == "mock-model"
+    assert (runner._active_stage_model, runner._active_stage_effort) == ("", "")
+
+
+def test_a_run_reviews_on_the_review_model_and_plans_on_the_plan_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    rt, _ = _runtime(tmp_path)
+    rt.cfg.runner.api.reasoning_effort = "medium"
+    rt.cfg.runner.api.review_model = "strong-review-model"
+    rt.cfg.runner.api.review_reasoning_effort = "high"
+    rt.cfg.runner.api.plan_model = "strong-plan-model"
+    _register(rt)
+    gateway = _Gateway([_review("s1"), '{"planned_writes": []}'])
+    monkeypatch.setattr(httpx, "post", gateway)
+
+    run = rt.orchestrator.start_run(trigger="test", phase="daily", session_keys=["codex:s1"], auto_approve_override=True)
+
+    assert run.status == RunStatus.PASS, run.error
+    assert [(request["model"], request["reasoning_effort"]) for request in gateway.bodies] == [
+        ("strong-review-model", "high"),
+        ("strong-plan-model", "medium"),
+    ]
+    p02, p03 = _node(run, "P02_REVIEW"), _node(run, "P03_ROUTE_PLAN")
+    assert p02.status == NodeStatus.PASS and p03.status == NodeStatus.PASS
+    assert p02.payload["review_diagnostics"]["call_telemetry"]["model"] == "strong-review-model"
+    assert p03.payload["plan_diagnostics"]["model"] == "strong-plan-model"
+    assert p03.payload["plan_diagnostics"]["call_telemetry"]["model"] == "strong-plan-model"
+    # The batch's runner mode names the configured runner; which model answered is on the nodes.
+    assert run.runner_mode == "api:mock-model"
+    assert rt.db.get_session("codex:s1").status == SessionStatus.PROCESSED

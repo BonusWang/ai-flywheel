@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -282,8 +284,346 @@ def derive_readable_title(
     return f"{client_clean} · {tail_id}"
 
 
-def extract_jsonl_metadata(path: Path, max_lines: int = 50) -> dict[str, Any]:
-    """Extract canonical identity, parentage, subagent metadata, workspace, and title info from a JSONL file."""
+# ---------------------------------------------------------------- Antigravity transcripts
+#
+# Antigravity keeps one conversation per ``<brain>/<uuid>/`` directory and logs it to
+# ``.system_generated/logs/transcript.jsonl`` inside it. Every line is one *step*: it has a
+# ``step_index`` and a ``type``. Only two types are the conversation — ``USER_INPUT`` is what
+# the person asked, ``PLANNER_RESPONSE`` what the model answered — and the rest is
+# bookkeeping: ``GENERIC`` is raw tool output, by far the largest part of a file.
+
+#: Step types only Antigravity writes. One of them identifies a line's origin on its own.
+_ANTIGRAVITY_STEP_TYPES = frozenset({"USER_INPUT", "PLANNER_RESPONSE", "GENERIC", "CHECKPOINT"})
+_ANTIGRAVITY_USER_STEP = "USER_INPUT"
+_ANTIGRAVITY_ASSISTANT_STEP = "PLANNER_RESPONSE"
+
+#: What Antigravity wraps a user step in. ``USER_REQUEST`` holds what the person typed. The
+#: other two are the app's bookkeeping around it — the time, the open document, an invoked
+#: skill, a settings change — and are never dialogue. An unclosed block runs to the end.
+_ANTIGRAVITY_METADATA_BLOCK_RE = re.compile(
+    r"<(ADDITIONAL_METADATA|USER_SETTINGS_CHANGE)>(.*?)(?:</\1>|\Z)", re.DOTALL | re.IGNORECASE
+)
+_ANTIGRAVITY_REQUEST_RE = re.compile(r"<USER_REQUEST>(.*?)(?:</USER_REQUEST>|\Z)", re.DOTALL | re.IGNORECASE)
+_ANTIGRAVITY_REQUEST_TAG_RE = re.compile(r"</?USER_REQUEST>", re.IGNORECASE)
+
+#: The transcript file of a conversation, as the client writes it into the uuid directory.
+_ANTIGRAVITY_TRANSCRIPT_TAIL = (".system_generated", "logs", "transcript.jsonl")
+
+#: How long an Antigravity transcript must have been left alone before a passive pass reads it.
+DEFAULT_SCAN_QUIET_WINDOW_SECONDS = 900
+
+
+def is_antigravity_client(client: Any) -> bool:
+    """Whether a scan source or a session belongs to the Antigravity client."""
+    return str(client or "").strip().lower() == "antigravity"
+
+
+def is_antigravity_record(obj: Any) -> bool:
+    """Whether one transcript line is a step of an Antigravity ``transcript.jsonl``.
+
+    Decisive on its own is a step type only Antigravity writes. Any other line that carries
+    a top-level ``step_index`` is an Antigravity step too — one of a type that need not be
+    named here, such as ``SYSTEM_MESSAGE`` or ``ERROR_MESSAGE``.
+
+    A Codex (``payload``) or Claude Code (``message``) envelope is never one, whatever else
+    it carries: those clients keep their identity inside the envelope. A Claude Code
+    ``type: "system"`` line therefore stays on the path it always took.
+    """
+    if not isinstance(obj, dict):
+        return False
+    if isinstance(obj.get("payload"), dict) or isinstance(obj.get("message"), dict):
+        return False
+    step_type = str(obj.get("type") or "").strip().upper()
+    return step_type in _ANTIGRAVITY_STEP_TYPES or "step_index" in obj
+
+
+def strip_antigravity_wrappers(content: Any) -> str:
+    """What a person actually typed in an Antigravity user step.
+
+    The request inside ``<USER_REQUEST>`` when there is one; otherwise whatever the step
+    says once its bookkeeping blocks and tags are gone (the approval of a document arrives
+    that way, with an empty request); ``""`` when nothing is left.
+    """
+    text = flatten_content(content)
+    if not text:
+        return ""
+    text = _ANTIGRAVITY_METADATA_BLOCK_RE.sub("", text)
+    request = _ANTIGRAVITY_REQUEST_RE.search(text)
+    if request is not None and request.group(1).strip():
+        return request.group(1).strip()
+    return _ANTIGRAVITY_REQUEST_TAG_RE.sub("", text).strip()
+
+
+def antigravity_dialogue_text(obj: dict[str, Any]) -> str:
+    """The dialogue one Antigravity step carries: ``[user] …``, ``[assistant] …`` or ``""``.
+
+    A ``USER_INPUT`` step is its request with the wrappers removed. A ``PLANNER_RESPONSE``
+    step is its ``content`` only: the model's ``thinking`` and ``tool_calls`` are not an
+    answer, and most steps have no content at all. Every other step type — tool output,
+    checkpoints, system and error notices — is not dialogue and yields ``""``.
+    """
+    step_type = str(obj.get("type") or "").strip().upper()
+    if step_type == _ANTIGRAVITY_USER_STEP:
+        text = strip_antigravity_wrappers(obj.get("content"))
+        return f"[user] {text}" if text else ""
+    if step_type == _ANTIGRAVITY_ASSISTANT_STEP:
+        text = flatten_content(obj.get("content"))
+        return f"[assistant] {text}" if text else ""
+    return ""
+
+
+def antigravity_session_id(path: Path, client: str = "") -> str:
+    """The conversation id an Antigravity transcript is stored under, or ``""``.
+
+    Every transcript is named ``transcript.jsonl``, so the file name says nothing: the uuid
+    directory it sits in is the id. The layout settles that without knowing the client, so
+    every caller normalises alike. A transcript moved out of the layout is still normalised
+    when the caller names the client.
+    """
+    parts = path.parts
+    if not is_antigravity_client(client):
+        if tuple(part.lower() for part in parts[-3:]) != _ANTIGRAVITY_TRANSCRIPT_TAIL or len(parts) < 4:
+            return ""
+        return parts[-4] if _UUID_RE.fullmatch(parts[-4]) else ""
+    for parent in path.parents:
+        if _UUID_RE.fullmatch(parent.name):
+            return parent.name
+    return ""
+
+
+#: A machine-written line of a user step that names the open document or the workspace. The
+#: label may carry Markdown emphasis, around it or inside it: ``**Active Document:** value``.
+_ANTIGRAVITY_WORKSPACE_LABEL_RE = re.compile(
+    r"^\s*[\*_`]*(?:active document|workspace(?:[ _]+root)?|working directory|current directory|project root|cwd)"
+    r"[\s\*_`]*[:=][ \t]*(.+?)\s*[\*_`]*$",
+    re.IGNORECASE,
+)
+_ANTIGRAVITY_LIST_MARKER_RE = re.compile(r"^[\s>*+-]+")
+
+#: The user step as its JSON line spells its type, whatever the spacing: a cheap test that
+#: lets a long transcript be read for its user steps without parsing the other lines.
+_ANTIGRAVITY_USER_STEP_QUOTED = f'"{_ANTIGRAVITY_USER_STEP}"'
+
+#: A local path written in running text: a drive path, or an absolute POSIX path with at least
+#: two segments. A URL never matches: its first slash follows a colon, the rest a slash.
+_BARE_LOCAL_PATH_RE = (
+    r"(?<![A-Za-z0-9_/])(?:[A-Za-z]:[\\/][^\s\"'<>|*`]+|/(?:[\w.\-@+]+[\\/])+[\w.\-@+]+)"
+)
+#: Every place running text may name a path, in the order it names them. A token set off in
+#: backticks or double quotes is read whole when it starts like a path: spaces inside belong
+#: to it, which the bare pattern cannot tell from the end of the path.
+_PATH_MENTION_RE = re.compile(
+    r"`(?P<backtick>[^`\n]+)`|\"(?P<dquote>[^\"\n]+)\"|(?P<bare>" + _BARE_LOCAL_PATH_RE + r")"
+)
+_LOCAL_PATH_RE = re.compile(_BARE_LOCAL_PATH_RE)
+_LOCAL_PATH_START_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|/)")
+#: Punctuation a path picks up from the sentence around it.
+_PATH_TRIM_CHARS = "\"'`" + ".,;:!?，。；：、）)》"
+
+#: The words that follow a path written without quotes: up to twelve are tried as part of it.
+_ANTIGRAVITY_FOLLOWING_WORDS_RE = re.compile(r"[ \t]+(\S+(?:[ \t]+\S+){0,11})")
+
+#: The folders directly under a home directory that hold the AI tools' own files. A path in
+#: them is a skill or a setting, never the workspace of a conversation.
+_TOOL_CONFIG_HOMES = (".gemini", ".antigravity", ".codex", ".claude", ".agents", ".cursor", ".windsurf")
+
+#: How far up from a path the repository root may be looked for.
+_WORKSPACE_ROOT_MAX_LEVELS = 24
+
+
+def _existing_path(raw_path: str) -> Path | None:
+    """The absolute directory or file a written path names, when it is on this machine."""
+    try:
+        candidate = Path(os.path.expanduser(raw_path.strip().strip(_PATH_TRIM_CHARS)))
+        if candidate.is_absolute() and (candidate.is_dir() or candidate.is_file()):
+            return candidate
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _workspace_of_directory(directory: Path, home: Path) -> str:
+    """The workspace a real directory stands for, or ``""`` when it stands for none.
+
+    The workspace is the repository root the directory sits in, or else the directory. A
+    filesystem root, the home directory itself, or one of the AI tools' own folders under it
+    (a skill, a setting, the transcript store) is never a workspace.
+    """
+    try:
+        for ancestor in (directory, *directory.parents[: _WORKSPACE_ROOT_MAX_LEVELS - 1]):
+            if (ancestor / ".git").exists():
+                directory = ancestor
+                break
+        if directory.parent == directory or directory == home or any(
+            directory == home / name or home / name in directory.parents for name in _TOOL_CONFIG_HOMES
+        ):
+            return ""
+    except OSError:
+        return ""
+    return str(directory)
+
+
+def _workspace_of_local_path(raw_path: str, home: Path, *, cut_by_blank: bool = False) -> str:
+    """The workspace a local path stands for, or ``""`` when it stands for none.
+
+    The path has to be absolute and to be on this machine: a workspace that is only guessed
+    is worse than none, because the triage rules trust it. What follows its last separator
+    need not exist — a word written straight after the path, or a file not created yet, still
+    names a folder that does — but only when nothing cut the path short (``cut_by_blank``):
+    the folder above a path that was cut is no more than a guess.
+    """
+    existing = _existing_path(raw_path)
+    if existing is not None:
+        directory = existing if existing.is_dir() else existing.parent
+    else:
+        if cut_by_blank:
+            return ""
+        try:
+            candidate = Path(os.path.expanduser(raw_path.strip().strip(_PATH_TRIM_CHARS)))
+            directory = candidate.parent
+            if not candidate.is_absolute() or not directory.is_dir():
+                return ""
+        except (OSError, ValueError):
+            return ""
+    return _workspace_of_directory(directory, home)
+
+
+def _path_with_following_words(text: str, start: int, end: int) -> tuple[str, int]:
+    """A path written without quotes keeps the words that continue it on disk.
+
+    ``…/work area/release notes.md`` written bare is matched only up to ``…/work``. The
+    words after it are appended one at a time, and the longest form that is on the machine
+    is kept: a path is extended only into something that exists, so a path that is complete
+    is never extended by the sentence around it. Returns the path and where it ends in
+    ``text``.
+    """
+    candidate = text[start:end]
+    following = _ANTIGRAVITY_FOLLOWING_WORDS_RE.match(text, end)
+    if following is None:
+        return candidate, end
+    used_end = end
+    for word in re.finditer(r"\S+", following.group(1)):
+        longer_end = following.start(1) + word.end()
+        if _existing_path(text[start:longer_end]) is not None:
+            candidate, used_end = text[start:longer_end], longer_end
+    return candidate, used_end
+
+
+def _typed_path_mentions(text: str) -> list[tuple[str, bool]]:
+    """Every local path running text names, in order, each with whether a blank cut it short.
+
+    A token set off in backticks or double quotes is read whole when it starts like a path:
+    spaces inside belong to it. A bare path has no such boundary, so it ends at the first
+    blank unless the words after it continue it on disk.
+    """
+    mentions: list[tuple[str, bool]] = []
+    for mention in _PATH_MENTION_RE.finditer(text):
+        quoted = mention.group("backtick") or mention.group("dquote")
+        if quoted is not None and _LOCAL_PATH_START_RE.match(quoted):
+            mentions.append((quoted, False))
+            continue
+        source = text if quoted is None else quoted
+        for inner in _LOCAL_PATH_RE.finditer(source):
+            candidate, end = _path_with_following_words(source, inner.start(), inner.end())
+            mentions.append((candidate, end < len(source) and source[end].isspace()))
+    return mentions
+
+
+def antigravity_workspace(content: Any, home: Path | None = None) -> str:
+    """The local workspace an Antigravity user step names, or ``""`` when it names none.
+
+    An Antigravity transcript carries no ``cwd``, so the workspace is read, best effort and
+    conservatively:
+
+    * a machine-written line that names the open document or the workspace
+      (``Active Document: …``) — a browser tab is not a workspace, and is passed over;
+    * failing that, the first local path the person wrote in the request.
+
+    A path counts only when it is on this machine. Nothing found leaves the workspace
+    empty: the triage rules then treat the session as one whose workspace is unknown,
+    which is the honest answer.
+    """
+    raw = flatten_content(content)
+    if not raw:
+        return ""
+    home_dir = Path.home() if home is None else home
+    candidates: list[tuple[str, bool]] = []
+    for block in _ANTIGRAVITY_METADATA_BLOCK_RE.finditer(raw):
+        for line in block.group(2).splitlines():
+            labelled = _ANTIGRAVITY_WORKSPACE_LABEL_RE.match(_ANTIGRAVITY_LIST_MARKER_RE.sub("", line))
+            if labelled is None:
+                continue
+            value = labelled.group(1)
+            # "… tab 1 (/path/to/file.py) (LANGUAGE_X)" names the file inside the brackets.
+            candidates.extend((inside, False) for inside in re.findall(r"\(([^()]*)\)", value))
+            candidates.append((re.sub(r"\([^()]*\)", "", value), False))
+    candidates.extend(_typed_path_mentions(strip_antigravity_wrappers(content)))
+
+    for candidate, cut_by_blank in candidates:
+        if not candidate.strip():
+            continue
+        workspace = _workspace_of_local_path(candidate, home_dir, cut_by_blank=cut_by_blank)
+        if workspace:
+            return workspace
+    return ""
+
+
+def scan_quiet_window_seconds(cfg: Any) -> int:
+    """How long an Antigravity transcript must be left alone before a passive pass reads it.
+
+    ``sessions.scan_quiet_window_seconds``; ``0`` or ``None`` switches the window off. It is
+    read with a default rather than off the config model, so the two passive gates — the
+    directory scan and the queue — behave the same whichever version of the configuration
+    they run with.
+    """
+    sessions = getattr(cfg, "sessions", None)
+    seconds = getattr(sessions, "scan_quiet_window_seconds", DEFAULT_SCAN_QUIET_WINDOW_SECONDS) or 0
+    return max(0, int(seconds))
+
+
+def transcript_is_active(mtime: float, *, quiet_seconds: int, now_ts: float | None = None) -> bool:
+    """Whether a transcript last written at ``mtime`` is still inside the quiet window.
+
+    The window is half-open: a file whose last write is exactly ``quiet_seconds`` old has
+    gone quiet and is read. A window of ``0`` never holds anything back.
+    """
+    if quiet_seconds <= 0:
+        return False
+    current = time.time() if now_ts is None else float(now_ts)
+    return (current - float(mtime)) < quiet_seconds
+
+
+def _read_antigravity_step(obj: dict[str, Any], result: dict[str, Any]) -> bool:
+    """Read one Antigravity user step into ``result``: whether the file has now said all it has to.
+
+    A user step that says nothing — an upload, a bare slash command, a document approval
+    with an empty request — is passed over for the first one that does. The workspace is
+    looked for in every user step until one names it: the document the person is working on
+    may be opened turns into the conversation.
+    """
+    if str(obj.get("type") or "").strip().upper() != _ANTIGRAVITY_USER_STEP:
+        return False
+    content = obj.get("content")
+    if not result["workspace"]:
+        result["workspace"] = antigravity_workspace(content)
+    if not result["first_user_message"]:
+        cleaned = clean_user_message(strip_antigravity_wrappers(content))
+        if cleaned and not _is_boilerplate_user_text(cleaned):
+            result["first_user_message"] = cleaned
+    return bool(result["first_user_message"] and result["workspace"])
+
+
+def extract_jsonl_metadata(path: Path, max_lines: int = 50, *, client: str = "") -> dict[str, Any]:
+    """Extract canonical identity, parentage, subagent metadata, workspace, and title info from a JSONL file.
+
+    ``client`` is the client the file was found for. It matters only to a client whose
+    transcript carries no identity of its own (Antigravity), and then only when the file
+    is no longer in the layout that names the conversation.
+
+    ``max_lines`` bounds the opening lines that are read in full. An Antigravity transcript
+    is read on past them for its user steps alone — without parsing the other lines — while
+    the title or the workspace is still missing.
+    """
     result: dict[str, Any] = {
         "canonical_session_id": "",
         "parent_session_id": "",
@@ -300,12 +640,16 @@ def extract_jsonl_metadata(path: Path, max_lines: int = 50) -> dict[str, Any]:
 
     uuid_matches = _UUID_RE.findall(path.stem)
     filename_uuid = uuid_matches[0] if uuid_matches else ""
+    antigravity_scan_open = False
 
     try:
         with path.open("r", encoding="utf-8", errors="ignore") as f:
             for idx, raw in enumerate(f):
                 if idx >= max_lines:
-                    break
+                    if not antigravity_scan_open:
+                        break
+                    if _ANTIGRAVITY_USER_STEP_QUOTED not in raw:
+                        continue
                 raw = raw.strip()
                 if not raw:
                     continue
@@ -314,6 +658,15 @@ def extract_jsonl_metadata(path: Path, max_lines: int = 50) -> dict[str, Any]:
                 except json.JSONDecodeError:
                     continue
                 if not isinstance(obj, dict):
+                    continue
+
+                # 0. An Antigravity step. The conversation id is the directory the transcript
+                #    lives in (settled below); the title and the workspace come from its user
+                #    steps, and once both are read nothing after them says more.
+                if is_antigravity_record(obj):
+                    antigravity_scan_open = True
+                    if _read_antigravity_step(obj, result):
+                        break
                     continue
 
                 # 1. Discover workspace if not yet set
@@ -417,13 +770,15 @@ def extract_jsonl_metadata(path: Path, max_lines: int = 50) -> dict[str, Any]:
         pass
 
     if not result["canonical_session_id"]:
-        result["canonical_session_id"] = filename_uuid or path.stem
+        result["canonical_session_id"] = (
+            antigravity_session_id(path, client=client) or filename_uuid or path.stem
+        )
 
     return result
 
 
 def extract_jsonl_workspace(path: Path, max_lines: int = 25) -> str:
-    """Inspect the opening lines of a Codex/Claude Code JSONL transcript to discover its workspace cwd."""
+    """Inspect the opening lines of a Codex/Claude Code/Antigravity JSONL transcript to discover its workspace cwd."""
     meta = extract_jsonl_metadata(path, max_lines=max_lines)
     return meta.get("workspace") or ""
 

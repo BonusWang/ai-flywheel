@@ -336,14 +336,18 @@ def test_p01_caps_the_admitted_sessions_at_the_review_limit(
 
 
 def test_the_p02_prompt_keeps_the_head_and_the_tail_of_a_long_session():
-    """W1.1.3: 长会话取头尾摘录，中间明确标注省略，不超过 3000 字符。"""
-    body = "".join(f"{i:04d}" for i in range(2000))  # 8000 字符
+    """W1.1.3 / P1: 长会话取头尾摘录，中间明确标注省略，默认不超过 16000 字符且支持显式 limit。"""
+    body = "".join(f"{i:04d}" for i in range(5000))  # 20000 字符
     excerpt = excerpt_session_text(body)
 
-    assert len(excerpt) <= 3000
-    assert excerpt.startswith(body[:1450])
-    assert excerpt.endswith(body[-1450:])
+    assert len(excerpt) <= 16000
+    assert excerpt.startswith(body[:7800])
+    assert excerpt.endswith(body[-7800:])
     assert "\n...[middle omitted]...\n" in excerpt
+
+    narrow = excerpt_session_text(body, limit=3000)
+    assert len(narrow) <= 3000
+    assert "\n...[middle omitted]...\n" in narrow
 
 
 def test_a_short_session_is_passed_through_unchanged():

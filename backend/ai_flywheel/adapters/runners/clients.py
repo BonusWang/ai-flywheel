@@ -10,8 +10,9 @@ from __future__ import annotations
 import json
 import subprocess
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import httpx
 
@@ -45,6 +46,25 @@ from ai_flywheel.adapters.wiki.router import RoutingCandidates
 from ai_flywheel.config import FlywheelConfig
 from ai_flywheel.models import PlannedWrite, RetroItem, RuleRecord, SessionRecord
 from ai_flywheel.storage.fs_store import ImmutableFileStore, canonical_hash
+
+# The two stages that call a model; their names also head their cache file names.
+P02_STAGE = "p02_review"
+P03_STAGE = "p03_plan"
+
+
+def _plan_write_caps(cfg: FlywheelConfig, routing_candidates: RoutingCandidates | None) -> tuple[int | None, int | None]:
+    """The caps a plan is counted under when it may hold project-domain pages.
+
+    Returns `(max_domain_writes, total_write_set)`, or `(None, None)` for a plan that can
+    hold no domain page and is counted by `max_write_set` alone. Domain pages are counted
+    apart from every other item, under `workflow.max_domain_writes_per_run`; the plan as a
+    whole is bounded by `knowledge_sink.max_write_set`. The domain cap is cut to that
+    bound, so the three caps together never let a batch exceed it.
+    """
+    if not deposit_page_types(routing_candidates):
+        return None, None
+    total = max(1, int(cfg.knowledge_sink.max_write_set))
+    return min(max(0, int(cfg.workflow.max_domain_writes_per_run)), total), total
 
 
 class CliSubprocessRunner(BaseWorkflowRunner):
@@ -125,11 +145,14 @@ class CliSubprocessRunner(BaseWorkflowRunner):
         phase: str = "daily",
     ) -> dict[str, Any]:
         """P02 from the CLI output only: an unusable reply fails the node, it never falls back."""
-        prompt = _build_p02_prompt(sessions, open_retros, existing_skills, phase)
-        cache_file = self._cache_file("p02_review", prompt)
+        prompt = _build_p02_prompt(
+            sessions, open_retros, existing_skills, phase,
+            session_char_limit=self.cfg.runner.api.p02_session_char_limit,
+        )
+        cache_file = self._cache_file(P02_STAGE, prompt)
         cache_hit = cache_file.exists()
         reply_trace: dict[str, Any] = {}
-        parsed = self._invoke_cli("p02_review", prompt, reply_trace=reply_trace)
+        parsed = self._invoke_cli(P02_STAGE, prompt, reply_trace=reply_trace)
         review = _review_from_runner_output(
             parsed,
             source=REVIEW_SOURCE_CLI,
@@ -159,6 +182,8 @@ class CliSubprocessRunner(BaseWorkflowRunner):
         phase: str = "daily",
         routing_candidates: RoutingCandidates | None = None,
     ) -> PlanOutcome:
+        domain_page_types = deposit_page_types(routing_candidates)
+        max_domain_writes, total_write_set = _plan_write_caps(self.cfg, routing_candidates)
         prompt = _build_p03_prompt(
             review_findings,
             existing_rules,
@@ -168,11 +193,13 @@ class CliSubprocessRunner(BaseWorkflowRunner):
             phase,
             routing_candidates=routing_candidates,
             existing_skill_sections=_existing_skill_sections(review_findings, self.cfg.primary_skills_dir),
+            max_domain_writes=max_domain_writes,
+            total_write_set=total_write_set,
         )
-        cache_file = self._cache_file("p03_plan", prompt)
+        cache_file = self._cache_file(P03_STAGE, prompt)
         cache_hit = cache_file.exists()
         reply_trace: dict[str, Any] = {}
-        parsed = self._invoke_cli("p03_plan", prompt, reply_trace=reply_trace)
+        parsed = self._invoke_cli(P03_STAGE, prompt, reply_trace=reply_trace)
         outcome = _plan_from_runner_output(
             parsed,
             source=PLAN_SOURCE_CLI,
@@ -183,7 +210,9 @@ class CliSubprocessRunner(BaseWorkflowRunner):
             cache_hit=cache_hit,
             cache_file_present=cache_hit,
             reply_trace=reply_trace,
-            domain_page_types=deposit_page_types(routing_candidates),
+            domain_page_types=domain_page_types,
+            max_domain_writes=max_domain_writes,
+            total_write_set=total_write_set,
         )
         # The plan is usable: now the reply may be cached for the next identical batch.
         self._persist_cache(cache_file, parsed)
@@ -202,6 +231,45 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
         self.fs_store = fs_store
         # What the last model call cost. Reset on every call; a stubbed call leaves it empty.
         self._last_call_telemetry: dict[str, Any] = {}
+        # The model and the reasoning effort of the stage a call belongs to. `_invoke_api`
+        # sets them around its calls and restores them in `finally`; empty means that no
+        # stage is in flight and the configured `model` / `reasoning_effort` apply.
+        self._active_stage_model = ""
+        self._active_stage_effort = ""
+
+    def _resolve_stage_api_params(self, stage: str) -> tuple[str, str]:
+        """The model and the reasoning effort a stage really runs with.
+
+        A stage's own key wins when it is set; `model` / `reasoning_effort` serve the stage
+        otherwise, so a configuration written before the per-stage keys existed keeps its
+        meaning. An unknown stage runs on the configured pair as well.
+        """
+        api_cfg = self.cfg.runner.api
+        model = api_cfg.model
+        effort = (api_cfg.reasoning_effort or "").strip()
+        if stage == P02_STAGE:
+            model = (api_cfg.review_model or "").strip() or model
+            effort = (api_cfg.review_reasoning_effort or "").strip() or effort
+        elif stage == P03_STAGE:
+            model = (api_cfg.plan_model or "").strip() or model
+            effort = (api_cfg.plan_reasoning_effort or "").strip() or effort
+        return model, effort
+
+    @contextmanager
+    def _stage_call(self, stage: str) -> Iterator[None]:
+        """Make the calls made inside run on `stage`'s model and effort.
+
+        The two-argument `_call_chat_completion(prompt, system_prompt)` keeps its signature —
+        a sandbox replay replaces it with a stub that takes no stage — and reads the stage
+        off these attributes instead. Whatever happens inside, the previous values are back
+        afterwards.
+        """
+        previous = (self._active_stage_model, self._active_stage_effort)
+        self._active_stage_model, self._active_stage_effort = self._resolve_stage_api_params(stage)
+        try:
+            yield
+        finally:
+            self._active_stage_model, self._active_stage_effort = previous
 
     def _call_chat_completion(self, prompt: str, system_prompt: str) -> str:
         """One chat completion call.
@@ -219,8 +287,14 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
         if api_cfg.api_key:
             headers.setdefault("Authorization", f"Bearer {api_cfg.api_key}")
 
+        # The model and the effort the call in flight asks for: the stage's own when one is
+        # in flight (`_stage_call`), the configured pair otherwise.
+        model, effort = api_cfg.model, (api_cfg.reasoning_effort or "").strip()
+        if (self._active_stage_model or "").strip():
+            model = self._active_stage_model
+            effort = (self._active_stage_effort or "").strip()
         body: dict[str, Any] = {
-            "model": api_cfg.model,
+            "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
@@ -228,13 +302,15 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
             "temperature": 0.1,
         }
         # An empty reasoning effort is omitted: not every OpenAI-compatible endpoint knows it.
-        effort = (api_cfg.reasoning_effort or "").strip()
         if effort:
             body["reasoning_effort"] = effort
 
         telemetry: dict[str, Any] = {
             "attempts": 0,
             "duration_ms": 0,
+            # What was asked for, as distinct from `served_model`, which is what answered.
+            "model": model,
+            "reasoning_effort": effort or None,
             "served_model": None,
             "prompt_tokens": None,
             "completion_tokens": None,
@@ -298,13 +374,18 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
 
     def _cache_file(self, stage: str, prompt: str) -> Path:
         api_cfg = self.cfg.runner.api
+        # The pair the stage really runs with. A stage that overrides the model, the effort or
+        # both must not be served the reply the configured pair produced, whichever way the
+        # configuration changes; without an override the pair is the configured one, so a
+        # cache written before the per-stage keys existed is still found.
+        model, effort = self._resolve_stage_api_params(stage)
         prompt_hash = canonical_hash(
             {
                 "stage": stage,
                 "base_url": api_cfg.base_url,
-                "model": api_cfg.model,
+                "model": model,
                 # A different reasoning effort asks a different question: it must not hit an old cache.
-                "reasoning_effort": (api_cfg.reasoning_effort or "").strip(),
+                "reasoning_effort": effort,
                 "prompt": prompt,
             }
         )
@@ -337,7 +418,7 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
         if (
             not self.cfg.safety_valves.effective_model_execution_enabled
             or not api_cfg.base_url
-            or not api_cfg.model
+            or not self._resolve_stage_api_params(stage)[0].strip()
         ):
             return None
 
@@ -350,7 +431,8 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
 
         sys_prompt = "You are an AI Flywheel workflow worker. Return strictly valid JSON with no markdown prose outside JSON."
         try:
-            raw_text = self._call_chat_completion(prompt, sys_prompt)
+            with self._stage_call(stage):
+                raw_text = self._call_chat_completion(prompt, sys_prompt)
         except (httpx.TimeoutException, httpx.ConnectError) as exc:
             # The transport failure is described without naming the gateway; the node keeps it.
             raise self._model_call_error(stage, exc) from None
@@ -372,10 +454,12 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
                 f"Malformed output:\n{raw_text[:8000]}"
             )
             try:
-                repaired_text = self._call_chat_completion(
-                    repair_prompt,
-                    "You are a strict JSON repair utility. Return ONLY one valid JSON object.",
-                )
+                # The repair answers for the same stage, on the same model and effort.
+                with self._stage_call(stage):
+                    repaired_text = self._call_chat_completion(
+                        repair_prompt,
+                        "You are a strict JSON repair utility. Return ONLY one valid JSON object.",
+                    )
                 parsed = _extract_json_block(repaired_text)
                 if parsed is None and reply_trace is not None and repaired_text.strip():
                     reply_trace["repair_parse_error"] = _json_parse_error(repaired_text)
@@ -397,14 +481,19 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
         phase: str = "daily",
     ) -> dict[str, Any]:
         """P02 from the model reply only: an unusable reply fails the node, it never falls back."""
-        prompt = _build_p02_prompt(sessions, open_retros, existing_skills, phase)
-        cache_file = self._cache_file("p02_review", prompt)
+        # The model the review really asks: the review's own when one is configured.
+        model, _effort = self._resolve_stage_api_params(P02_STAGE)
+        prompt = _build_p02_prompt(
+            sessions, open_retros, existing_skills, phase,
+            session_char_limit=self.cfg.runner.api.p02_session_char_limit,
+        )
+        cache_file = self._cache_file(P02_STAGE, prompt)
         cache_hit = cache_file.exists()
         reply_trace: dict[str, Any] = {}
         parsed = self._invoke_api(
-            "p02_review",
+            P02_STAGE,
             prompt,
-            repair_schema_hint='{"findings":[...],"mistakes":[...],"dissents":[...],"repeated_workflows":[...]}',
+            repair_schema_hint='{"findings":[...],"events":[...],"mistakes":[...],"dissents":[...],"repeated_workflows":[...]}',
             reply_trace=reply_trace,
         )
         review = _review_from_runner_output(
@@ -424,7 +513,7 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
         )
         # The review is usable: now the reply may be cached for the next identical batch.
         self._persist_cache(cache_file, parsed)
-        review["runner"] = f"api:{self.cfg.runner.api.model}"
+        review["runner"] = f"api:{model}"
         review["sent_session_keys"] = [s.session_key for s, _ in sessions[:P02_MAX_SESSIONS]]
         return review
 
@@ -440,6 +529,9 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
         routing_candidates: RoutingCandidates | None = None,
     ) -> PlanOutcome:
         """P03 from the model output only: an unusable reply fails the node, it never falls back."""
+        domain_page_types = deposit_page_types(routing_candidates)
+        max_domain_writes, total_write_set = _plan_write_caps(self.cfg, routing_candidates)
+        model, _effort = self._resolve_stage_api_params(P03_STAGE)
         prompt = _build_p03_prompt(
             review_findings,
             existing_rules,
@@ -449,8 +541,10 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
             phase,
             routing_candidates=routing_candidates,
             existing_skill_sections=_existing_skill_sections(review_findings, self.cfg.primary_skills_dir),
+            max_domain_writes=max_domain_writes,
+            total_write_set=total_write_set,
         )
-        cache_file = self._cache_file("p03_plan", prompt)
+        cache_file = self._cache_file(P03_STAGE, prompt)
         cache_hit = cache_file.exists()
         repair_hint = (
             P03_REPAIR_SCHEMA_HINT_WITH_ROUTE
@@ -458,7 +552,7 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
             else P03_REPAIR_SCHEMA_HINT
         )
         reply_trace: dict[str, Any] = {}
-        parsed = self._invoke_api("p03_plan", prompt, repair_schema_hint=repair_hint, reply_trace=reply_trace)
+        parsed = self._invoke_api(P03_STAGE, prompt, repair_schema_hint=repair_hint, reply_trace=reply_trace)
         outcome = _plan_from_runner_output(
             parsed,
             source=PLAN_SOURCE_MODEL,
@@ -469,7 +563,10 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
             cache_hit=cache_hit,
             cache_file_present=cache_hit,
             reply_trace=reply_trace,
-            domain_page_types=deposit_page_types(routing_candidates),
+            domain_page_types=domain_page_types,
+            max_domain_writes=max_domain_writes,
+            total_write_set=total_write_set,
+            model=model,
         )
         # The plan is usable: now the reply may be cached for the next identical batch.
         self._persist_cache(cache_file, parsed)
