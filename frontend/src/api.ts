@@ -291,7 +291,7 @@ export const api = {
       body: JSON.stringify({ retro_ids: retroIds, status }),
     }),
   promoteRetros: (retroIds: string[], severityGrade?: string) =>
-    req<{ observation: any; created: boolean; resolved_count: number; retro_ids: string[] }>(
+    req<{ observation: MistakeObservation; created: boolean; resolved_count: number; retro_ids: string[] }>(
       '/api/site/retro/promote',
       {
         method: 'POST',

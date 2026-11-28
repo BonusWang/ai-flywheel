@@ -2,36 +2,39 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   AlertTriangle,
   ArrowRight,
-  Bell,
-  Calendar,
   Check,
   Clock,
   Loader2,
   Play,
   RefreshCw,
-  ShieldCheck,
   Sparkles,
 } from 'lucide-react'
 import { api } from '../api'
 import type { NavigateFn } from '../App'
-import { ListToolbar, PaginationBar, usePagination } from '../components/ListControls'
+import { AutomationsHistorySection } from '../components/automations/AutomationsHistorySection'
+import { AutomationsWatchdogsSection } from '../components/automations/AutomationsWatchdogsSection'
 import { PillTabs } from '../components/PageLayout'
-import { StatusBadge } from '../components/StatusBadge'
 import { AnimatedNumber } from '../components/ui/AnimatedNumber'
 import { Collapse } from '../components/ui/Collapse'
 import { ConfirmButton } from '../components/ui/ConfirmButton'
 import { Switch } from '../components/ui/Switch'
 import { useToast } from '../components/ui/Toast'
 import {
+  HOURS,
+  MINUTES,
+  buildCronFromVisual,
+  formatCatchupWindow,
+  humanPreview,
+  parseCronToVisual,
+  type CronPreset,
+} from '../lib/cronVisual'
+import {
   APPROVAL_MODE_LABELS,
-  FEISHU_LISTENER_STATE_LABELS,
-  formatDuration,
+  PHASE_LABELS,
   formatRunnerMode,
   formatShanghaiTimestamp,
   labelOf,
-  PHASE_LABELS,
   preferredScrollBehavior,
-  TRIGGER_LABELS,
 } from '../lib/labels'
 import type { AutomationsSnapshot, DreamResult, DreamStatusPayload } from '../types'
 
@@ -41,60 +44,7 @@ interface Props {
   onGlobalRefresh: () => void
 }
 
-type CronPreset = 'daily' | 'weekdays' | 'friday' | 'custom'
 type SectionKey = 'scheduler' | 'daily' | 'daemons' | 'history'
-
-const HOURS = Array.from({ length: 24 }, (_, i) => String(i).padStart(2, '0'))
-const MINUTES = ['00', '05', '10', '15', '20', '25', '30', '35', '40', '45', '50', '55']
-
-function parseCronToVisual(expr: string): {
-  preset: CronPreset
-  hour: string
-  minute: string
-} {
-  const parts = expr.trim().split(/\s+/)
-  if (parts.length === 5 && /^\d{1,2}$/.test(parts[0]) && /^\d{1,2}$/.test(parts[1])) {
-    const minute = String(Number(parts[0])).padStart(2, '0')
-    const hour = String(Number(parts[1])).padStart(2, '0')
-    if (MINUTES.includes(minute) && HOURS.includes(hour) && parts[2] === '*' && parts[3] === '*') {
-      const dow = parts[4].toLowerCase()
-      if (dow === '*') return { preset: 'daily', hour, minute }
-      if (dow === '1-5' || dow === 'mon-fri') return { preset: 'weekdays', hour, minute }
-      if (dow === '5' || dow === 'fri') return { preset: 'friday', hour, minute }
-    }
-  }
-  return { preset: 'custom', hour: '20', minute: '00' }
-}
-
-function buildCronFromVisual(
-  preset: CronPreset,
-  hour: string,
-  minute: string,
-  fallback: string
-): string {
-  const m = String(Number(minute) || 0)
-  const h = String(Number(hour) || 0)
-  if (preset === 'daily') return `${m} ${h} * * *`
-  if (preset === 'weekdays') return `${m} ${h} * * 1-5`
-  if (preset === 'friday') return `${m} ${h} * * 5`
-  return fallback
-}
-
-function humanPreview(preset: CronPreset, hour: string, minute: string): string {
-  if (preset === 'daily') return `每天 ${hour}:${minute} · 上海时间`
-  if (preset === 'weekdays') return `工作日 ${hour}:${minute} · 上海时间`
-  if (preset === 'friday') return `每周五 ${hour}:${minute} · 上海时间`
-  return '自定义排程 · 上海时间'
-}
-
-/** How long after its time a scheduled batch may still run, as one short phrase. */
-function formatCatchupWindow(seconds: number | null | undefined): string {
-  if (seconds == null || !Number.isFinite(Number(seconds))) return '—'
-  const total = Math.max(0, Math.round(Number(seconds)))
-  if (total % 3600 === 0 && total > 0) return `${total / 3600} 小时`
-  if (total % 60 === 0 && total > 0) return `${total / 60} 分钟`
-  return `${total} 秒`
-}
 
 function AutomationsSkeleton() {
   return (
@@ -130,7 +80,6 @@ export const AutomationsPage: React.FC<Props> = ({
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [activeSection, setActiveSection] = useState<SectionKey>('scheduler')
-  const [historyFilter, setHistoryFilter] = useState<'all' | 'scheduled'>('all')
 
   // Visual Cron editor state
   const [cronDraft, setCronDraft] = useState('0 20 * * *')
@@ -349,32 +298,6 @@ export const AutomationsPage: React.FC<Props> = ({
     if (!data) return false
     return cronDraft.trim() !== (data.scheduler.cron || '').trim()
   }, [cronDraft, data])
-
-  const [historyQuery, setHistoryQuery] = useState('')
-  const [historyStatus, setHistoryStatus] = useState('all')
-
-  const filteredRuns = useMemo(() => {
-    if (!data) return []
-    const q = historyQuery.trim().toLowerCase()
-    return [...data.recent_runs]
-      .filter((r) => (historyFilter === 'scheduled' ? r.trigger === 'scheduled' : true))
-      .filter((r) => (historyStatus === 'all' ? true : r.status === historyStatus))
-      .filter((r) =>
-        !q
-          ? true
-          : `${r.batch_date || ''} ${r.run_id} ${r.phase} ${labelOf(PHASE_LABELS, r.phase)} ${r.trigger} ${labelOf(TRIGGER_LABELS, r.trigger)} ${r.error || ''}`
-              .toLowerCase()
-              .includes(q)
-      )
-      .sort((a, b) =>
-        String(b.started_at || b.created_at || '').localeCompare(
-          String(a.started_at || a.created_at || '')
-        )
-      )
-  }, [data, historyFilter, historyQuery, historyStatus])
-
-  const historyPager = usePagination(filteredRuns, 10)
-  const hasHistoryFilters = Boolean(historyQuery.trim()) || historyStatus !== 'all'
 
   if (loading && !data) {
     return <AutomationsSkeleton />
@@ -938,246 +861,18 @@ export const AutomationsPage: React.FC<Props> = ({
         })()}
       </section>
 
-      {/* Card 3: Background Watchdogs */}
-      <section
-        id="automation-sec-daemons"
-        className="card p-5 sm:p-6 space-y-4 scroll-mt-20 lg:scroll-mt-6"
-      >
-        <div>
-          <h2 className="text-[16px] font-semibold text-ink">后台守护</h2>
-          <p className="mt-1 text-[12.5px] text-ink-3">
-            常驻服务期间自动看护中断批次与飞书审批通道，异常时自动清理恢复。
-          </p>
-        </div>
+      <AutomationsWatchdogsSection
+        recovery={recovery}
+        feishu={feishu}
+        recovering={recovering}
+        onRecoveryNow={handleRecoveryNow}
+        onNavigate={onNavigate}
+      />
 
-        <div className="grid gap-4 md:grid-cols-2">
-          {/* Recovery Watchdog */}
-          <div className="rounded-[var(--radius-tile)] border border-line-soft bg-bg-sunk/50 p-4 space-y-2.5">
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2 font-semibold text-[13.5px] text-ink">
-                <ShieldCheck className="w-4 h-4 text-accent" />
-                <span>异常中断自动恢复</span>
-              </div>
-              <span
-                className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${
-                  recovery?.role_active
-                    ? 'bg-ok-soft text-ok-ink'
-                    : 'bg-bg-muted text-ink-3'
-                }`}
-              >
-                {recovery?.role_active ? '运行中' : '未激活'}
-              </span>
-            </div>
-            <p className="text-[12px] text-ink-3">
-              每 <span className="num font-medium">{Math.round(recovery?.interval_seconds ?? 30)}</span> 秒巡检一次，自动清理超过{' '}
-              <span className="num font-medium">{recovery?.stale_after_seconds ?? 300}</span> 秒无响应的卡住批次，释放锁并把未完成对话退回队列。
-            </p>
-            <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[12px] text-ink-4">
-              <span className="num">
-                上次巡检：{formatShanghaiTimestamp(recovery?.last_pass_at)} · 累计恢复{' '}
-                {recovery?.total_reaped_count ?? 0} 批
-              </span>
-              <button
-                type="button"
-                disabled={recovering}
-                onClick={handleRecoveryNow}
-                className="pressable inline-flex items-center gap-1 text-accent-ink hover:underline font-medium disabled:opacity-50"
-              >
-                {recovering && <Loader2 className="w-3 h-3 animate-spin" />}
-                <span>清理卡住的批次</span>
-              </button>
-            </div>
-            {recovery?.last_error && (
-              <div className="text-[11.5px] text-hot">最近错误：{recovery.last_error}</div>
-            )}
-          </div>
-
-          {/* Feishu Outbox & Click Listener */}
-          <div className="rounded-[var(--radius-tile)] border border-line-soft bg-bg-sunk/50 p-4 space-y-2.5">
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2 font-semibold text-[13.5px] text-ink">
-                <Bell className="w-4 h-4 text-accent" />
-                <span>飞书消息与卡片审批</span>
-              </div>
-              <span
-                className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${
-                  feishu?.availability === 'ok'
-                    ? 'bg-ok-soft text-ok-ink'
-                    : feishu?.enabled
-                      ? 'bg-amber-soft text-amber-ink'
-                      : 'bg-bg-muted text-ink-3'
-                }`}
-              >
-                {!feishu?.enabled
-                  ? '未启用'
-                  : feishu.availability === 'ok'
-                    ? '交互就绪'
-                    : feishu.interactive
-                      ? labelOf(FEISHU_LISTENER_STATE_LABELS, feishu.listener_state)
-                      : '仅文本通知'}
-              </span>
-            </div>
-            <p className="text-[12px] text-ink-3">
-              支持在飞书卡片上直接点击「同意 / 放弃」，结果实时同步回本地，平时自动通过不打扰。
-            </p>
-            <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[12px] text-ink-4">
-              <span>
-                链路自检：{feishu?.check_valid ? '已通过' : feishu?.interactive ? '待自检' : '未开启交互卡片'}
-              </span>
-              <button
-                type="button"
-                onClick={() => onNavigate('settings', { settingsTab: 'storage' })}
-                className="pressable inline-flex items-center gap-1 text-accent-ink hover:underline font-medium"
-              >
-                <span>前往配置飞书</span>
-                <ArrowRight className="w-3 h-3" />
-              </button>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* Card 4: Recent Execution History */}
-      <section
-        id="automation-sec-history"
-        className="card p-5 sm:p-6 space-y-4 scroll-mt-20 lg:scroll-mt-6"
-      >
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h2 className="text-[16px] font-semibold text-ink flex items-center gap-2">
-              <Calendar className="w-4 h-4 text-accent" />
-              <span>执行记录</span>
-            </h2>
-            <p className="mt-0.5 text-[12.5px] text-ink-3">
-              点任意批次的「查看批次」直接定位到该批明细与审批抽屉。
-            </p>
-          </div>
-          <PillTabs
-            items={[
-              { key: 'all', label: '全部批次', count: data?.recent_runs.length ?? 0 },
-              {
-                key: 'scheduled',
-                label: '仅定时触发',
-                count: (data?.recent_runs || []).filter((r) => r.trigger === 'scheduled').length,
-              },
-            ]}
-            active={historyFilter}
-            onChange={(k) => {
-              setHistoryFilter(k as 'all' | 'scheduled')
-              historyPager.resetPage()
-            }}
-          />
-        </div>
-
-        {(data?.recent_runs.length ?? 0) > 0 && (
-          <ListToolbar
-            query={historyQuery}
-            onQueryChange={(q) => {
-              setHistoryQuery(q)
-              historyPager.resetPage()
-            }}
-            placeholder="按日期、批次号或错误信息搜索…"
-            hasActiveFilters={hasHistoryFilters}
-            onResetFilters={() => {
-              setHistoryQuery('')
-              setHistoryStatus('all')
-              historyPager.resetPage()
-            }}
-          >
-            <select
-              aria-label="执行记录状态筛选"
-              value={historyStatus}
-              onChange={(e) => {
-                setHistoryStatus(e.target.value)
-                historyPager.resetPage()
-              }}
-              className="field-input h-8 px-2.5 text-[12px]"
-            >
-              <option value="all">全部状态</option>
-              <option value="PASS">已通过</option>
-              <option value="AWAITING_APPROVAL">待审批</option>
-              <option value="FAILED">已失败</option>
-              <option value="PARTIAL">部分完成</option>
-              <option value="CANCELLED">已取消</option>
-            </select>
-          </ListToolbar>
-        )}
-
-        {filteredRuns.length === 0 ? (
-          <div className="rounded-[var(--radius-tile)] border border-dashed border-line py-8 text-center text-[13px] text-ink-4">
-            {historyFilter === 'scheduled'
-              ? '暂无定时调度触发的历史批次；到达预定时间后会自动记录在这里。'
-              : '暂无符合条件的运行记录。'}
-          </div>
-        ) : (
-          <div className="space-y-2">
-            <div className="divide-y divide-line-soft rounded-[var(--radius-tile)] border border-line-soft overflow-hidden">
-              {historyPager.pageItems.map((run) => (
-                <div
-                  key={run.run_id}
-                  className="flex flex-wrap items-center justify-between gap-3 bg-surface px-4 py-3 hover:bg-bg-sunk/60 transition-colors duration-[150ms]"
-                >
-                  <div className="min-w-0 space-y-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="num font-semibold text-[13px] text-ink">
-                        {run.batch_date} #{String(run.batch_seq).padStart(2, '0')}
-                      </span>
-                      <StatusBadge status={run.status} />
-                      <span className="rounded bg-bg-sunk px-2 py-0.5 text-[11px] font-medium text-ink-3">
-                        {labelOf(TRIGGER_LABELS, run.trigger)}
-                      </span>
-                      <span className="rounded bg-bg-sunk px-2 py-0.5 text-[11px] font-medium text-ink-3">
-                        {labelOf(PHASE_LABELS, run.phase)}
-                      </span>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[12px] text-ink-4 num">
-                      <span>{formatShanghaiTimestamp(run.started_at || run.created_at)}</span>
-                      <span>·</span>
-                      <span>整理 {run.admitted_count} 段对话</span>
-                      <span>·</span>
-                      <span>拟写入 {run.planned_writes_count} 项</span>
-                      {run.duration_ms > 0 && (
-                        <>
-                          <span>·</span>
-                          <span>
-                            耗时{' '}
-                            {formatDuration(run.started_at, run.finished_at, [
-                              { duration_ms: run.duration_ms },
-                            ])}
-                          </span>
-                        </>
-                      )}
-                    </div>
-                    {run.error && (
-                      <div className="text-[12px] text-hot truncate max-w-[680px]">
-                        失败原因：{run.error}
-                      </div>
-                    )}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      onNavigate('runs', { runsTab: 'pipeline', runId: run.run_id })
-                    }
-                    className="pressable inline-flex items-center gap-1 rounded-[var(--radius-control)] border border-line bg-surface px-2.5 py-1 text-[12px] font-medium text-ink-2 hover:text-accent-ink hover:border-accent/40"
-                  >
-                    <span>查看批次</span>
-                    <ArrowRight className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              ))}
-            </div>
-            <PaginationBar
-              total={historyPager.total}
-              page={historyPager.page}
-              pageSize={historyPager.pageSize}
-              totalPages={historyPager.totalPages}
-              onPageChange={historyPager.setPage}
-              onPageSizeChange={historyPager.setPageSize}
-            />
-          </div>
-        )}
-      </section>
+      <AutomationsHistorySection
+        recentRuns={data?.recent_runs || []}
+        onNavigate={onNavigate}
+      />
     </div>
   )
 }

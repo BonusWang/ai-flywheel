@@ -95,3 +95,16 @@
   1. Introduce `_CachedModelRunner(BaseWorkflowRunner)` owning canonical prompt building, validation, no-fallback failure handling, and post-validation caching for both real runners, while keeping `_invoke_cli`, `_invoke_api`, `_call_chat_completion`, and `_persist_cache` seams intact.
   2. Replace both remaining ad-hoc frontmatter parses in `adapters/wiki/router.py` with `core.markdown_utils.parse_frontmatter` / `parse_frontmatter_file` and reuse `adapters.wiki.schema._mapping`.
 - **Consequences**: Single implementation of real-runner validation/cache lifecycle; zero remaining ad-hoc `yaml.safe_load` frontmatter parsers in `router.py`.
+
+---
+
+## ADR-008: Frontend Monolith Decomposition & Typed Node Payloads
+
+- **Status**: Accepted
+- **Context**: Three frontend components exceeded 1,180 LOC (`CluesObservationsTab.tsx` 1,334 LOC, `QueueInventoryPanel.tsx` 1,266 LOC, `AutomationsPage.tsx` 1,183 LOC), mixing multiple independent sub-views, filters, pagers, and helper functions in single files. Meanwhile, `NodeDetailPanel.tsx` used 10 `(activeNode.payload as any)` casts.
+- **Decision**:
+  1. Decompose `QueueInventoryPanel.tsx` into `QueueRow.tsx`, `QueueGroupRow.tsx`, and the panel shell (`1,266 -> 682 LOC`).
+  2. Decompose `CluesObservationsTab.tsx` into `cluesUtils.ts`, `CluesObservationsSubView.tsx`, `CluesDissentsSubView.tsx`, `CluesRetrosSubView.tsx`, and the tab shell (`1,334 -> 495 LOC`), giving each sub-view isolated local filter/selection/pagination state.
+  3. Decompose `AutomationsPage.tsx` by extracting `lib/cronVisual.ts`, `AutomationsWatchdogsSection.tsx`, and `AutomationsHistorySection.tsx` (`1,183 -> 875 LOC`).
+  4. Add `CallTelemetry`, `DreamNodeSummary`, and `NodeExecutionPayload` to `types.ts`, eliminating all 10 `as any` casts in `NodeDetailPanel.tsx` and tightening `api.ts` observation return types.
+- **Consequences**: Smaller, independently editable UI modules with local state ownership and stronger TypeScript coverage.
