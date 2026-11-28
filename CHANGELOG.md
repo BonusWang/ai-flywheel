@@ -3,6 +3,43 @@
 All notable changes to **AI Flywheel** are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] - 2026-11-28
+
+### Added
+- **Dual-track `hand_distilled` intent, `structured_brief` & controlled-write dispatch filtering** (`core/queue_service.py`, `core/pipeline/coordinator.py`, `core/pipeline/helpers.py`, `core/triage.py`, `mcp_server.py`, `config.py`, `flywheel.yaml.example`):
+  - Extended `flywheel_session_intent` with `action="hand_distilled"`, optional `wiki_paths`, and `governance_only` (default `true`): complex sessions written manually to a mounted Wiki can now register back into AI Flywheel so P04 skips duplicate knowledge-doc writes while still extracting mistakes, rules, dissents, and skills (`governance_only=true`), or skips the session entirely (`governance_only=false` / `HAND_DISTILLED_SKIP`).
+  - Extended `flywheel_ingest_session` with optional `structured_brief` (fact summary carried ahead of dialogue in P02 prompts and included in content-hash watermarks), protected by a single-source deep credential & `<private>` redactor in `core/privacy.py`.
+  - Added configurable `sessions.triage.controlled_write_markers` to isolate single-turn controlled-write subagent dispatches from automatic batch admission without leaking private wording into the public config template.
+- **Antigravity native `transcript.jsonl` ingest & quiet-window passive scan** (`adapters/sessions.py`, `core/triage.py`, `core/queue_service.py`, `config.py`, `flywheel.yaml.example`):
+  - Added native Antigravity transcript parsing (extracting user requests, assistant replies, and workspace paths while stripping tool noise and handling non-object JSONL rows safely).
+  - Added configurable `sessions.scan_quiet_window_seconds` (default `900s`) so active Antigravity transcripts are skipped while being written and automatically enqueued once quiet, with mtime/size regrowth detection feeding existing incremental delta revisions (`rev + 1`) while preserving `opt_out` and `hand_distilled` intents.
+- **High-fidelity P02/P03 distillation, per-stage model layering & multi-event separation** (`adapters/runners/prompts.py`, `adapters/runners/clients.py`, `adapters/runners/normalizers.py`, `adapters/runners/outcomes.py`, `config.py`, `flywheel.yaml.example`):
+  - Raised default `runner.api.p02_session_char_limit` from 3,000 to **16,000** characters with head+tail excerpting, prepended `structured_brief` ahead of dialogue, and preserved queue payloads verbatim when within `queue_max_item_chars`.
+  - Added optional per-stage model and reasoning-effort overrides (`review_model`, `review_reasoning_effort`, `plan_model`, `plan_reasoning_effort`) so P02 review and P03 planning can run on independent models while `api_model_label` / `resolve_runner_mode` / `flywheel doctor` stay aligned even when the shared `model` field is omitted.
+  - Added structured multi-event separation (`events`: `delivery` / `incident` / `decision` / `domain_fact`) in P02 output and lifted the 220–450 char shallow preview cap in P03 prompts so complex root-cause analyses retain full evidence.
+- **Progressive project-domain incremental deposit & controlled `incident` routing** (`adapters/wiki/domain_pages.py`, `adapters/wiki/router.py`, `adapters/knowledge.py`, `models.py`, `core/pipeline/coordinator.py`, `config.py`):
+  - Added lossless append-only incremental deposit for four project-domain page types (database table schemas, project configs, architecture flows, and business algorithms/calibers) with per-section/per-table deduplication, separate `workflow.max_domain_writes_per_run` budgeting (capped by `knowledge_sink.max_write_set`), and per-target locking with preimage SHA-256 verification and concurrent-edit re-merge.
+  - Enabled controlled routing of incident ledgers (`incident` page type / `ai-incidents/` prefix) with filename/target validation, strict secret checks, and mandatory human approval (`is_incident_write` / `is_sensitive_write`) across portal, Feishu card, and pipeline gates.
+- **Scheduler misfire detection, catch-up & Automations console alignment** (`core/automation.py`, `routes/overview.py`, `routes/automations.py`, `app.py`, `frontend/src/types.ts`, `frontend/src/pages/AutomationsPage.tsx`):
+  - Added Shanghai-timezone `workflow.misfire_grace_seconds` (default `14400`) and `workflow.catchup_missed_schedule` (default `true`) with cross-midnight fire lookup, persisted shared `(job_id, scheduled_fire_time)` claims, single misfire audit logging, and lock-safe automatic catch-up in `serve` mode.
+  - Surfaced `started_at` on `/health` and `started_at`, `misfire_grace_seconds`, `catchup_missed_schedule`, `scheduled_today`, `missed_today`, `catchup_window_until`, and `catchup_run_id` in `/api/site/automations` and `AutomationsPage`.
+
+### Changed
+- **Unified privacy & structured-brief redaction single source of truth** (`core/privacy.py`, `core/queue_service.py`, `adapters/runners/prompts.py`):
+  - Consolidated `key_names_credential`, `redact_structured_brief`, `has_private_tags`, and `strip_private_tags` into `core/privacy.py` so queue ingress, P02 prompt rendering, and receipt sanitization enforce identical credential-key (underscored/plural/CJK/nested-container/non-string scalar) and `<private>` rules.
+- **Version `0.9.0`** (`backend/ai_flywheel/__init__.py`, `pyproject.toml`, `frontend/package.json`, `frontend/package-lock.json`, `profile/site.yaml`, `README.md`):
+  - Bumped version across all parity layers and updated README for dual-track sedimentation, Antigravity native ingest, high-fidelity P02/P03, progressive domain deposit, controlled incident routing, and scheduler catch-up.
+
+### Fixed
+- **Approval safety valve & mandatory incident approval bypass** (`core/pipeline/coordinator.py`, `routes/runs.py`, `cli.py`, `core/automation.py`):
+  - Unified `resolve_approval_mode` across config, CLI, portal sync/async routes, and scheduled triggers so `safety_valves.auto_approve_writes=false` always vetoes `auto` (recording `auto_approve_vetoed`), and ensured `incident` writes always require human approval even when `auto` is enabled.
+- **Plaintext credential & `<private>` leaks in caches, P02 receipts, and P03 metadata** (`adapters/runners/clients.py`, `adapters/runners/outcomes.py`, `adapters/runners/normalizers.py`):
+  - Short-circuited `_cache_plan_reply` so refused replies never invoke cache persistence, blocked replies containing `<private>...</private>` from both API and CLI caches (and unlinked stale cached files on read), recursively sanitized all P02 review fields before persisting receipts/SQLite/observations/dissents while evaluating raw replies for cache refusal, and extended P03 `sanitize_and_check_secrets` to `title`, `summary`, `relative_path`, `approval_reason`, `wiki_route`, `skill_route`, `source_session_keys`, and all `rule_payload` strings.
+- **Hand-distilled skip semantics, mixed-batch source verification & P04 re-check** (`core/queue_service.py`, `core/pipeline/coordinator.py`, `core/pipeline/helpers.py`):
+  - Made repeated `hand_distilled(governance_only=false)` declarations compare only the newest revision and insert a new `skipped` revision when superseded; enforced complete skip exclusion across P01 admission, P04 approval resume (all write kinds, mistakes, dissents), and P05 settlement; validated cited session keys against admitted keys and re-read DB declarations before each P04 item write.
+- **Domain merge concurrency, per-section dedupe & scheduler TOCTOU race** (`adapters/knowledge.py`, `adapters/wiki/domain_pages.py`, `core/automation.py`, `adapters/runners/clients.py`):
+  - Scoped domain-page deduplication to the target section/table instead of whole-page text, serialized same-target merges with preimage SHA-256 verification and bounded re-merge retries, re-checked `_fire_answered` under the workflow lock in `_claim_and_start` to prevent duplicate cron/catch-up starts, and moved runner stage parameters and telemetry to `contextvars.ContextVar` for concurrent isolation.
+
 ## [0.8.0] - 2026-11-26
 
 ### Added

@@ -63,7 +63,7 @@ AI Flywheel 采用「**3+1**」通用生态定位：最外层是一个不持有�
 - **外部策略与装备仓（可选覆盖）**：通过 `profile.override_dir` 只读挂载 policies / triggers、`skills/` 与 `agents/`；P04 对 `SKILL.md` 只做追加式更新（旧文件逐字节为新文件前缀）。
 - **挂载知识库（本地 Markdown / Obsidian Wiki）**：人类可读、可进 Git 的知识资产；`.wiki-schema.md` 写入门禁、FTS5 回读索引与 P04 审批后受控写入。
 
-> **v0.8.0 更新指引**：沉淀队列新增 **Codex UUID 身份归一化去重、JSONL 可读标题提取、工作区展示、主会话与分片/子代理树形折叠（子代理默认不进自动批次、按需手动勾入）以及可配置无头脚本过滤与重筛一键清洗**；知识保鲜期新增 **Wiki `status: archived` 同步、周五蒸馏对超期满 30 天且零助益卡片的纯台账自动退场与阅读弹窗兜底复核**；实时异常线索补齐 **「转入错题观察池」真实闭环与「随下次沉淀自动结算 / 无关联待审会话」状态透出**，彻底消除文案与按钮语义冲突。
+> **v0.9.0 更新指引**：全面升级**双轨沉淀与高保真蒸馏闭环**——新增 `flywheel_session_intent(action="hand_distilled")` 复杂会话手工沉淀回调（`governance_only=true` 跳过重复写 Wiki 但仍提炼错题/规则/分歧/Skill）与 `structured_brief` 结构化证据入队；原生支持 **Antigravity `transcript.jsonl` 解析 + 静默窗口被动扫盘 + 续聊增量重入队**；P02/P03 升级为 **16,000 字保头保尾上下文 + 分阶段模型/推理强度分层（`review_model`/`plan_model`）+ 多事件拆分（`events`）+ 4 类项目领域页无损增量落盘与受控事故卡路由（强制人工审批）**；补齐上海时区**定时任务漏跑审计与宽限期自动补跑**，并强化缓存/回执全链路脱敏与安全阀跨入口一致性。
 
 ---
 
@@ -76,7 +76,7 @@ AI 工具通过 `http://127.0.0.1:8765/mcp`（Streamable HTTP）或 `flywheel mc
 - **开工前**：调用 `flywheel_preflight_activate` 获取反偷懒契约、个人协作偏好、命中先例规则及已知反例，并签发不可变预检回执；也可随时读取 `flywheel://core-card`（≤200 行跨端热态索引卡）。
 - **执行中**：遇到死循环、高危动作或规则复发时，通过 `flywheel_report_signal` 记入复盘队列；`UserPromptSubmit` Hook 会向模型上下文注入规范 `session=<client>:<session_id>` 标识，确保 MCP 声明与本地归档 100% 对齐。
 - **交付时**：调用 `flywheel_record_outcome` 提交结构化验收结果——声明 `status=success` 必须所有必填检查项通过，`real + pass` 必须附带真实证据，并同步回传 `used_knowledge_paths`（自动续期经验卡）与 `used_skills`（记录 Skill 真实调用）。
-- **会话入队与显式意图控制**：通过 `flywheel_session_intent`（`enqueue` 显式高优沉淀 / `opt_out` 本会话永久不沉淀 / `withdraw` 撤回排队）、`flywheel_ingest_session`、`flywheel_register_session`，或由 **Codex 归档目录对账 / Claude Code `SessionEnd` 退出钩子**进入 `distill_queue` 库存队列。
+- **会话入队与双轨显式意图控制**：通过 `flywheel_session_intent`（`enqueue` 显式高优沉淀 / `hand_distilled` 复杂会话手工沉淀后回调登记，支持 `governance_only` 只做治理提炼不重复写 Wiki / `opt_out` 本会话永久不沉淀 / `withdraw` 撤回排队）、`flywheel_ingest_session`（支持 `structured_brief` 结构化摘要优先送审）、`flywheel_register_session`，或由 **Codex 归档目录对账 / Claude Code `SessionEnd` 退出钩子 / Antigravity 静默窗口被动扫盘**进入 `distill_queue` 库存队列。
 
 ### 2. 后台受控进化流水线（P00–P07 固定 8 节点）
 
@@ -97,21 +97,22 @@ AI 工具通过 `http://127.0.0.1:8765/mcp`（Streamable HTTP）或 `flywheel mc
 
 ---
 
-## 核心能力（v0.8.0）
+## 核心能力（v0.9.0）
 
 ### 1. 策略与知识解耦 + 执行期实证门禁
 - 反偷懒契约、循环保护阈值、证据分级（`real / test / static / unknown`）与个人协作偏好独立托管在 `profile/policies/`，无需绑定特定知识库。
 - 知识落点完全可插拔：默认内置 `./data/knowledge`（零配置开箱即用），也可无侵入挂载任意本地 Markdown / Obsidian Wiki。
 
-### 2. 显式沉淀队列、父子归组与统一数据底座（v0.8.0）
+### 2. 显式沉淀队列、双轨意图与多端原生接入（v0.9.0）
 - **可见的流水线库存（`distill_queue`）**：将客户端会话主档（`sessions`）与流水线沉淀任务解耦，提供 6 态库存（`queued` / `processing` / `processed` / `excluded` / `withdrawn` / `dead_letter`）、工作区来源徽标、按工具分片统计与预计清仓批次数；同一会话支持撤回后再输入增量入队（`rev + 1` 水位线）与独立失败重试/死信隔离。
-- **身份归一化、可读标题与父子树形归组**：从 Codex `session_meta` 与 Claude Code JSONL 自动提取规范 UUID（跨通道统一 `codex:<uuid>` 去重）、`custom-title` / 首条有效用户消息可读标题与 `parent_session_key`；同会话多分片与派生子代理在队列看板折叠归组至主会话下，子代理默认隔离子批次自动认领（支持展开按需勾选插队）；支持配置 `sessions.triage.exclude_content_prefixes` 与单轮无工具脚本拦截，并在「按最新规则重筛」中一键刷新存量标题、父子关系与去重。
-- **双端精准触发 + MCP 显式声明**：
+- **身份归一化、可读标题与父子树形归组**：从 Codex `session_meta`、Claude Code 与 Antigravity JSONL 自动提取规范会话标识、可读标题与 `parent_session_key`；同会话多分片与派生子代理在队列看板折叠归组至主会话下，子代理默认隔离子批次自动认领（支持展开按需勾选插队）；支持配置 `sessions.triage.exclude_content_prefixes`、`controlled_write_markers` 与单轮无工具脚本拦截，并在「按最新规则重筛」中一键刷新存量标题、父子关系与去重。
+- **三端精准触发 + 双轨 MCP 控制**：
   - **Codex（严格归档制）**：仅同步 `archived_sessions/` 归档目录或 MCP 显式声明，移出自动撤回、续聊增大后重归档自动增量入队；
   - **Claude Code（exit 退出触发制）**：`SessionEnd` 过三级规则闸门入队，`SessionStart(resume)` 与续聊提示自动撤回，`Stop` 不再制造半成品噪音；
-  - **对话内 MCP 控制**：`flywheel_session_intent` 支持一句话声明沉淀（`enqueue` 高优直通）、本会话永久不沉淀（`opt_out` 一票否决）与撤回（`withdraw`），并由 `UserPromptSubmit` 自动注入规范 `session_key` 实现 100% 对齐。
-- **超大上下文 0-Token 瘦身与保头保尾分片**：JSONL 提取自动剥离 `tool_result`/`thinking`/`reasoning` 噪音块，保留完整用户提问与尾部结论，超预算时按轮次边界拆片（上限 4 片，强制保头保尾），杜绝截尾丢根因。
-- **统一字典表 + 通用状态轨迹 + 权威 DDL**：新增 `sys_dict_items` 统一托管 9 类 55 项内置码值与扩展元数据（`GET /api/site/dicts`）；复用 `audit_events` 承接全系统状态变迁轨迹；权威建模脚本 [`docs/schema.sql`](./docs/schema.sql) 与 [`docs/data-model.md`](./docs/data-model.md) 受架构不变量测试强守护。
+  - **Antigravity（原生解析 + 静默窗口制）**：原生解析 `transcript.jsonl`（跳过工具噪音与非对象行），默认静默 `900s` 后被动入队，续聊再次静默时自动触发增量版本（`rev + 1`）并继承原有 `opt_out`/`hand_distilled` 声明；
+  - **双轨沉淀回调与结构化摘要**：`flywheel_session_intent` 支持一句话声明沉淀（`enqueue`）、手工沉淀回调（`hand_distilled` + `wiki_paths` + `governance_only` 跳过重复写 Wiki 仅提炼错题/规则/分歧/Skill）、永久不沉淀（`opt_out`）与撤回（`withdraw`）；`flywheel_ingest_session` 支持附带 `structured_brief`（统一经过 `core/privacy.py` 深度脱敏并置顶送入 P02）。
+- **高保真上下文保留与保头保尾分片**：队列预算内（默认 24,000 字）原文直传不折损中段事实；超预算时 0-Token 剥离 `tool_result`/`thinking`/`reasoning` 并按轮次边界拆片（上限 4 片，强制保头保尾）；P02 审查默认提供 **16,000 字**保头保尾上下文、多事件拆分（`events`）与分阶段模型/推理强度分层（`review_model`/`plan_model`）。
+- **统一字典表 + 通用状态轨迹 + 权威 DDL**：`sys_dict_items` 统一托管 9 类 55 项内置码值与扩展元数据（`GET /api/site/dicts`）；复用 `audit_events` 承接全系统状态变迁轨迹；权威建模脚本 [`docs/schema.sql`](./docs/schema.sql) 与 [`docs/data-model.md`](./docs/data-model.md) 受架构不变量测试强守护。
 
 ### 3. 抗熵增进化引擎（防记忆投毒、敢做减法、规则可回溯）
 - **两级会话初筛**：一级 0-Token 规则硬筛自动过滤子代理碎片、无头批处理脚本与空会话；二级 P02 语义价值闸门直接丢弃翻译、闲聊与一次性问答，绝不硬凑笔记。
@@ -120,9 +121,9 @@ AI 工具通过 `http://127.0.0.1:8765/mcp`（Streamable HTTP）或 `flywheel mc
 - **经验卡新鲜度偏自动化保鲜**：按 `volatile`（30 天）/ `evolving`（90 天）/ `evergreen`（180 天）管理有效期；超期自动降权并提示复核，在真实任务中通过 `real` 验证引用时自动续期；同步识别 Wiki 原文 `status: archived`（同步退场且不进入 FTS 召回），每周蒸馏对超期满 30 天且零助益卡片在飞轮台账自动归档，并在阅读弹窗提供纯台账兜底操作（`POST /api/site/knowledge/freshness`，绝不改写 Wiki 源文件）。
 - **周五分层蒸馏 + 反 Skill 表演**：支持只读预览（`GET /api/site/dream` / 控制台一键预览）与自动/手动执行——将 14 天零命中试运行规则转入 `dormant`、自动归档 30 天低危单次错题与超期零助益经验卡台账、检测触发词重合规则及 21 天零调用或连续失败 Skill。
 
-### 4. 人机可控的资产变更、Git 审计与多通道通知
-- **合同驱动的 Schema 写入门禁**：挂载含 `.wiki-schema.md` 的 Wiki 时，P03 由模型从现场候选集中声明路由并经证据交叉校验（归属不明或冲突绝不写入，记 `planned_doc_unrouted`）；支持中性 `postflight_hook_script` 写后校验钩子（向后兼容 `wiki_d2_postflight_script`）。
-- **写时隐私与密钥门禁**：自动脱敏 `<private>...</private>` 区块（含文件名 slug 剥离），硬拦截 API Key / Token / 私钥（`SecretLeakError`）。
+### 4. 人机可控的资产变更、领域页增量落盘、Git 审计与多通道通知
+- **合同驱动的 Schema 写入门禁、4 类项目领域页增量落盘与受控事故卡**：挂载含 `.wiki-schema.md` 的 Wiki 时，P03 由模型从现场候选集中声明路由并经证据交叉校验（归属不明或冲突绝不写入，记 `planned_doc_unrouted`）；支持数据库表结构、项目配置、架构流程、业务算法 4 类项目领域页的**按章节/按表去重无损增量合并**（含同目标串行锁与前像 SHA-256 并发重合并保护）与独立配额 `workflow.max_domain_writes_per_run`；支持受控路由 `incident` 事故卡（强制人工审批，即使 `auto` 模式亦不可绕过）；支持中性 `postflight_hook_script` 写后校验钩子（向后兼容 `wiki_d2_postflight_script`）。
+- **全链路隐私与密钥门禁**：统一由 `core/privacy.py` 对 `structured_brief`、P02 回执、P03 写入计划元数据（含标题/摘要/路由/规则载荷）与文档正文脱敏 `<private>...</private>` 并硬拦截 API Key / Token / 私钥（`SecretLeakError`）；任何含密钥或 `<private>` 块的模型回包绝不落盘 `api_cache/` / `cli_cache/`。
 - **Skill 追加式无损更新**：`action="update"` 只在现有 `SKILL.md` 末尾追加新节——旧文件逐字节为新文件前缀，写前备份、原子替换、SHA-256 回读校验并保留原有换行符；审批卡提供现有大纲与全文对照。
 - **可选 P04 本地 Git 审计提交**：开启 `knowledge_sink.auto_git_commit: true` 后，P04 写入验收完成时仅对本批写入路径执行 `git commit --only`（带 `run_id` 与审批来源，绝不触碰无关文件、绝不 `push`）。
 - **分层审批、安全阀与多通道通知**：支持 `smart` / `always` / `auto` 审批模式，安全阀 `safety_valves.auto_approve_writes = false` 拥有最终否决权；支持 Web 控制台、通用 **Webhook**（隐私脱敏 + 可选 HMAC-SHA256 `X-Flywheel-Signature` 签名 + 非致命投递）以及可选飞书交互卡片审批。
@@ -130,7 +131,7 @@ AI 工具通过 `http://127.0.0.1:8765/mcp`（Streamable HTTP）或 `flywheel mc
 ### 5. 工程级可靠性与可观测性
 - **反静默回退**：`api` / `cli` 模式下模型输出不可用时节点直接失败并留下原因码与结构化诊断，绝不偷偷退回本地启发式却伪报模型来源。
 - **校验后缓存与调用追踪**：仅在回复通过语义校验后写入 `api_cache/`；记录尝试次数、耗时、实际服务模型与 prompt / completion / reasoning token 用量，在控制台节点详情直接透出。
-- **原子审批与崩溃恢复**：认领审批、状态迁移与审计事件在同一事务落盘；执行中每 15 秒续锁打心跳，`serve` 进程每 30 秒自动收割僵尸批次。
+- **原子审批、崩溃恢复与漏跑自动补跑**：认领审批、状态迁移与审计事件在同一事务落盘；执行中每 15 秒续锁打心跳，`serve` 进程每 30 秒自动收割僵尸批次，并在上海时区宽限窗口（默认 4 小时，支持跨午夜）内对休眠/重启错过的每日定时批次执行单次审计与共享认领去重补跑。
 
 ### 6. 极简 `5+1` 控制面与零摩擦引导 CLI
 - **控制面 Web UI**：`今日态势`（实证通过率 / 规则健康 / 错题池 / 实时调度与安全阀 / 核心索引卡）/ `沉淀与审批`（顶部 6 态队列库存进度条 + 「沉淀队列（库存）」与「执行流水线（P00–P07）」双 Tab / 轨迹展开 / 规则重筛预览 / 批量插队与审批抽屉）/ `自动化调度`（上海时区 Cron 热重载 / 周五蒸馏预览与触发 / 守护巡检）/ `规则与进化`（避坑规则含沿革徽标 / 错题与分歧 / Skill 实效与经验保鲜 / 证据台账 / 执行规矩）/ `接入与设置` + `关于`。
@@ -218,6 +219,7 @@ sessions:
     - client: "codex"
       path: "~/.codex/archived_sessions"
       glob: "**/*.jsonl"
+  scan_quiet_window_seconds: 900                  # Antigravity 等无归档目录工具的静默窗口（秒）
   queue_max_item_chars: 24000                     # 超大上下文瘦身后单片字符上限
   queue_max_retries: 3                            # 队列项最大失败重试次数（超限转死信）
 
@@ -236,13 +238,21 @@ delivery:
 
 workflow:
   approval_mode: "smart"                          # smart | always | auto
+  max_domain_writes_per_run: 6                    # 单批项目领域页增量落盘独立配额（受 max_write_set 封顶）
+  misfire_grace_seconds: 14400                    # 定时批次漏跑宽限窗口（秒，默认 4 小时，支持跨午夜）
+  catchup_missed_schedule: true                   # serve 模式宽限期内自动补跑一次
   friday_weekly_enabled: true
 
 runner:
   mode: "api"                                     # dry_run | api | cli
   api:
     base_url: "http://127.0.0.1:8000/v1"          # 任意 OpenAI 兼容端点
-    model: "your-model"
+    model: "your-model"                           # 公共默认模型（也可仅配置 review_model + plan_model）
+    review_model: ""                              # 可选：P02 审查专用模型
+    review_reasoning_effort: ""                   # 可选：P02 推理强度
+    plan_model: ""                                # 可选：P03 规划专用模型
+    plan_reasoning_effort: ""                     # 可选：P03 推理强度
+    p02_session_char_limit: 16000                 # P02 单会话送审字符预算（保头保尾）
     timeout_seconds: 240
     reasoning_effort: ""                          # 留空则不发送该参数
     transport_retries: 1                          # 超时/连接错误即时重试次数
