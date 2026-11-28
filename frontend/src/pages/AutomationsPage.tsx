@@ -19,6 +19,7 @@ import { Collapse } from '../components/ui/Collapse'
 import { ConfirmButton } from '../components/ui/ConfirmButton'
 import { Switch } from '../components/ui/Switch'
 import { useToast } from '../components/ui/Toast'
+import { errorMessage } from '../lib/errors'
 import {
   HOURS,
   MINUTES,
@@ -118,8 +119,8 @@ export const AutomationsPage: React.FC<Props> = ({
         if (dream) setDreamStatus(dream)
         if (syncEditor) syncDraftFromSnapshot(snap)
         setError(null)
-      } catch (e: any) {
-        setError(e?.message || '加载自动化调度状态失败')
+      } catch (e: unknown) {
+        setError(errorMessage(e, '加载自动化调度状态失败'))
       } finally {
         setLoading(false)
         setRefreshing(false)
@@ -185,8 +186,8 @@ export const AutomationsPage: React.FC<Props> = ({
           : '自动调度已暂停，手动整理仍随时可用'
       )
       onGlobalRefresh()
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '切换自动调度失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '切换自动调度失败') })
     } finally {
       setTogglingScheduler(false)
     }
@@ -202,8 +203,8 @@ export const AutomationsPage: React.FC<Props> = ({
       syncDraftFromSnapshot(res.automations)
       toast.push(`定时规则已更新为「${res.automations.scheduler.human_schedule}」，立即生效`)
       onGlobalRefresh()
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '保存定时规则失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '保存定时规则失败') })
     } finally {
       setSavingSchedule(false)
     }
@@ -222,8 +223,8 @@ export const AutomationsPage: React.FC<Props> = ({
           : '已关闭周五自动附带体检（仍可随时手动预览或执行）'
       )
       onGlobalRefresh()
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '切换设置失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '切换设置失败') })
     } finally {
       setSavingSchedule(false)
     }
@@ -245,8 +246,8 @@ export const AutomationsPage: React.FC<Props> = ({
       if (rid) {
         onNavigate('runs', { runsTab: 'pipeline', runId: rid })
       }
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '启动整理任务失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '启动整理任务失败') })
     } finally {
       setRunningPhase(null)
     }
@@ -265,8 +266,8 @@ export const AutomationsPage: React.FC<Props> = ({
           : '巡检完成：没有卡住的批次，运行状态正常'
       )
       onGlobalRefresh()
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '执行巡检失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '执行巡检失败') })
     } finally {
       setRecovering(false)
     }
@@ -287,8 +288,8 @@ export const AutomationsPage: React.FC<Props> = ({
       )
       await load(false)
       if (!dryRun) onGlobalRefresh()
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '执行周五精简失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '执行周五精简失败') })
     } finally {
       setDreamBusy(false)
     }

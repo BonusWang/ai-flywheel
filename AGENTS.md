@@ -56,7 +56,7 @@ public repository.
 | `backend/ai_flywheel/storage/db/` | SQLite (v4), split per repository (`workflow_repo`, `session_repo`, `rule_repo`, `knowledge_repo`, `asset_repo`, `audit_repo`, `dict_repo`, `queue_repo`) + `schema.py` / `migrations.py` |
 | `backend/ai_flywheel/storage/` | `fs_store` (immutable receipts), `outbox` (managed delivery outbox), `clock` (injectable clock), `seed` |
 | `backend/ai_flywheel/` | `app.py` (assembly: lifespan with recovery & archive-sync daemons, MCP mount, CORS, SSE, SPA hosting), `routes/` (the portal API split by domain: `overview`, `governance`, `runs`, `automations`), `mcp_server.py` (7 tools + 4 resources), `cli.py`, `config.py`, `models.py`, `runtime.py` (the dependency container) |
-| `frontend/src/` | The console: `pages/` (Home, Workflows with Queue Inventory & Pipeline dual tabs, Automations, Rules, Connect, About), `components/`, `api.ts`, `types.ts`, `lib/labels.ts` |
+| `frontend/src/` | The console: `pages/` (Home, Workflows with Queue Inventory & Pipeline dual tabs, Automations, Rules, Connect, About), `components/`, `api.ts`, `types.ts`, `lib/labels.ts`, `lib/errors.ts` |
 | `profile/` | Methodology policies and the portal branding — decoupled from the knowledge base |
 | `docs/` | `architecture.svg` (3+1 ecosystem view), `schema.sql` (authoritative SQLite v4 DDL pinned by invariant tests), `data-model.md` (table catalog, Mermaid ER diagram & unified dictionary spec) |
 | `openspec/` | Spec-driven development: `config.yaml` (injected into every generated artifact), `specs/` (the baseline), `changes/` (in flight and archived) |

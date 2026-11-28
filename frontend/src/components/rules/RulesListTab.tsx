@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { AlertTriangle, CheckCircle2, Loader2, RefreshCcw } from 'lucide-react'
 import { api } from '../../api'
+import { errorMessage } from '../../lib/errors'
 import { ListToolbar, PaginationBar, usePagination } from '../ListControls'
 import { StatusBadge } from '../StatusBadge'
 import { Collapse } from '../ui/Collapse'
@@ -79,8 +80,8 @@ export const RulesListTab: React.FC<{
           toast.push('已撤销规则状态调整')
         },
       })
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '更新规则状态失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '更新规则状态失败') })
     } finally {
       setBusyId(null)
     }
@@ -101,8 +102,8 @@ export const RulesListTab: React.FC<{
       setDissentScope('')
       await onChanged()
       toast.push('已记下例外场景，下次命中规则时会一并提醒')
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '保存例外失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '保存例外失败') })
     } finally {
       setBusyId(null)
     }
@@ -121,8 +122,8 @@ export const RulesListTab: React.FC<{
           toast.push('已撤销，恢复为待处理分歧')
         },
       })
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '更新分歧状态失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '更新分歧状态失败') })
     } finally {
       setBusyId(null)
     }
@@ -156,8 +157,8 @@ export const RulesListTab: React.FC<{
       onCloseCreate()
       await onChanged()
       toast.push('已新增一条试运行避坑规则')
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '新增规则失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '新增规则失败') })
     } finally {
       setCreating(false)
     }

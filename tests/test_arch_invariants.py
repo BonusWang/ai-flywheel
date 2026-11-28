@@ -1125,3 +1125,20 @@ def test_frontend_http_transport_is_centralized():
             sse_offenders.append(rel)
     assert fetch_offenders == [], f"Direct fetch() outside api.ts: {fetch_offenders}"
     assert sse_offenders == [], f"Direct EventSource() outside App.tsx: {sse_offenders}"
+
+
+def test_frontend_has_no_catch_any_or_as_any():
+    """前端捕获异常必须使用 unknown + lib/errors.ts:errorMessage，且禁止使用 as any 强转。"""
+    catch_any_re = re.compile(r"(?:\bcatch\s*\([^)]*:\s*any\b|\.catch\s*\(\s*\([^)]*:\s*any\b)")
+    as_any_re = re.compile(r"\bas\s+any\b")
+    catch_offenders: list[str] = []
+    cast_offenders: list[str] = []
+    for path in sorted(FRONTEND_SRC.rglob("*.ts*")):
+        rel = path.relative_to(FRONTEND_SRC).as_posix()
+        text = path.read_text(encoding="utf-8")
+        if catch_any_re.search(text):
+            catch_offenders.append(rel)
+        if as_any_re.search(text):
+            cast_offenders.append(rel)
+    assert catch_offenders == [], f"catch (...: any) found in frontend/src: {catch_offenders}"
+    assert cast_offenders == [], f"`as any` cast found in frontend/src: {cast_offenders}"

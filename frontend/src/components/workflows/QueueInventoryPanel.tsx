@@ -12,6 +12,7 @@ import {
   Zap,
 } from 'lucide-react'
 import { api } from '../../api'
+import { errorMessage } from '../../lib/errors'
 import {
   CLIENT_LABELS,
   INGRESS_CHANNEL_LABELS,
@@ -216,8 +217,8 @@ export const QueueInventoryPanel: React.FC<{
     try {
       const res = await api.getQueueEvents(item.queue_id)
       setEventsByItem((prev) => ({ ...prev, [item.queue_id]: res.events }))
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '读取轨迹失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '读取轨迹失败') })
       setEventsByItem((prev) => ({ ...prev, [item.queue_id]: [] }))
     } finally {
       setLoadingTrailId(null)
@@ -263,8 +264,8 @@ export const QueueInventoryPanel: React.FC<{
         const res = await api.getQueueEvents(item.queue_id)
         setEventsByItem((prev) => ({ ...prev, [item.queue_id]: res.events }))
       }
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '操作失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '操作失败') })
     } finally {
       setActingId(null)
     }
@@ -290,8 +291,8 @@ export const QueueInventoryPanel: React.FC<{
         onUndo: undo,
       })
       await onRefresh()
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '批量操作失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '批量操作失败') })
     } finally {
       setBulkBusy(false)
     }
@@ -310,8 +311,8 @@ export const QueueInventoryPanel: React.FC<{
       } else {
         setReTriage(res)
       }
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '规则重筛失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '规则重筛失败') })
     } finally {
       setReTriageBusy(false)
     }
@@ -324,8 +325,8 @@ export const QueueInventoryPanel: React.FC<{
       setReTriage(null)
       toast.push(`已按最新规则更新 ${res.changed_count} 段对话`)
       await onRefresh()
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '应用规则重筛失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '应用规则重筛失败') })
     } finally {
       setReTriageBusy(false)
     }
@@ -374,8 +375,8 @@ export const QueueInventoryPanel: React.FC<{
       setSelected(new Set())
       toast.push(`已恢复整理并重新加入 ${res.updated} 段对话`)
       await onRefresh()
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '恢复整理失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '恢复整理失败') })
     } finally {
       setBulkBusy(false)
     }

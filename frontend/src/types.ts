@@ -308,9 +308,21 @@ export interface DreamNodeSummary {
   proposals?: string[]
 }
 
+export interface TriageReportSummary {
+  checked?: number
+  skipped?: number
+  admitted?: number
+}
+
+export interface ReviewFindingSummary {
+  worthy?: boolean
+}
+
 export interface NodeExecutionPayload extends Record<string, unknown> {
   call_telemetry?: CallTelemetry | null
   dream?: DreamNodeSummary | null
+  triage_report?: TriageReportSummary | null
+  findings?: ReviewFindingSummary[]
 }
 
 export interface NodeExecution {

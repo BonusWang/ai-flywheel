@@ -16,8 +16,8 @@
 | B08 | Final pass: add frontend/frontmatter invariants, sync `AGENTS.md` package map, update architecture metrics, and run full `verify_repo.py --frontend` + independent review | Cross-repo | `done` | `7f79008` |
 | B09 | [PD-001] Delete 5 deprecated shims (`core/feishu_*`, `adapters/wiki_gate.py`), migrate all test imports, lock non-existence invariant | `core/feishu_*.py`, `adapters/wiki_gate.py`, `tests/*`, `AGENTS.md`, `openspec/config.yaml` | `done` | `00d3d70` |
 | B10 | [PD-002/003] Decouple `FlywheelRuntime` from `mcp_server` so backend has 0 upward layer exceptions; document PD-003 retention | `runtime.py`, `app.py`, `cli.py`, `tests/*` | `done` | `a59b8a5` |
-| B11 | Decompose `core/queue_service.py` hand-distilled ledger (`core/queue_hand_distilled.py`) and `adapters/wiki/router.py` models (`adapters/wiki/routing_models.py`) | `core/queue_*`, `adapters/wiki/*`, `AGENTS.md` | `done` | *(current)* |
-| B12 | Decompose `ConnectPolicyPage.tsx`, unify frontend `errorMessage()` replacing `catch (e: any)`, type `NoiseFunnelStrip`/`HomePage` node payloads, add frontend invariant, final independent review + full gate | `frontend/src/*`, `tests/test_arch_invariants.py` | `pending` | — |
+| B11 | Decompose `core/queue_service.py` hand-distilled ledger (`core/queue_hand_distilled.py`) and `adapters/wiki/router.py` models (`adapters/wiki/routing_models.py`) | `core/queue_*`, `adapters/wiki/*`, `AGENTS.md` | `done` | `4ce96af` |
+| B12 | Decompose `ConnectPolicyPage.tsx`, unify frontend `errorMessage()` replacing `catch (e: any)`, type `NoiseFunnelStrip`/`HomePage` node payloads, add frontend invariant, final independent review + full gate | `frontend/src/*`, `tests/test_arch_invariants.py` | `done` | *(current)* |
 
 ---
 

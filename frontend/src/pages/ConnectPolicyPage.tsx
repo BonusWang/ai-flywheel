@@ -1,18 +1,16 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
-import { CheckCircle2, ChevronRight, Loader2, RefreshCw, Save, Shield, Zap } from 'lucide-react'
+import { CheckCircle2, ChevronRight, Loader2, RefreshCw, Save, Shield } from 'lucide-react'
 import type { NavigateFn, RouteIntent } from '../App'
 import { api } from '../api'
-import { CodeBlock, CopyButton } from '../components/CodeBlock'
+import { ConnectClientsTab } from '../components/connect/ConnectClientsTab'
+import { ConnectSandboxTab } from '../components/connect/ConnectSandboxTab'
 import { PillTabs } from '../components/PageLayout'
 import { Collapse } from '../components/ui/Collapse'
 import { Switch } from '../components/ui/Switch'
 import { useToast } from '../components/ui/Toast'
-import {
-  ANTI_LAZINESS_MODE_LABELS,
-  FEISHU_LISTENER_STATE_LABELS,
-  labelOf,
-} from '../lib/labels'
-import type { ConnectPayload, FeishuCheckStatus, PreflightResponse } from '../types'
+import { errorMessage } from '../lib/errors'
+import { FEISHU_LISTENER_STATE_LABELS, labelOf } from '../lib/labels'
+import type { ConnectPayload, FeishuCheckStatus } from '../types'
 
 interface Props {
   intent?: RouteIntent
@@ -40,12 +38,6 @@ interface StorageDraft {
   feishuApproverIds: string
 }
 
-const TEST_PRESETS = [
-  { label: '发布前核对配置', task: '准备发布上线，先核对环境配置并跑全量回归测试' },
-  { label: '排查接口超时', task: '排查线上接口偶发超时并补充重试与单测证据' },
-  { label: '批量数据库变更', task: '执行大表历史数据批量更新，注意分批提交与回滚保护' },
-]
-
 export const ConnectPolicyPage: React.FC<Props> = ({
   intent,
   onNavigate,
@@ -54,15 +46,8 @@ export const ConnectPolicyPage: React.FC<Props> = ({
   const toast = useToast()
   const [tab, setTab] = useState<'connect' | 'storage' | 'test'>(intent?.settingsTab || 'connect')
   const [connectData, setConnectData] = useState<ConnectPayload | null>(null)
-  const [selectedClient, setSelectedClient] = useState('codex')
   const [restartNotice, setRestartNotice] = useState<string[]>([])
   const [saving, setSaving] = useState(false)
-
-  // Test sandbox (project defaults to empty, falls back to 'generic' automatically)
-  const [pfPrompt, setPfPrompt] = useState('修复接口报错并做真实验证')
-  const [pfProject, setPfProject] = useState('')
-  const [pfResult, setPfResult] = useState<PreflightResponse | null>(null)
-  const [pfLoading, setPfLoading] = useState(false)
 
   // Storage & model config
   const [overrideDir, setOverrideDir] = useState('')
@@ -227,25 +212,6 @@ export const ConnectPolicyPage: React.FC<Props> = ({
     feishuApproverIds,
   ])
 
-  const executePreflight = async (overrideTask?: string) => {
-    const promptText = (overrideTask ?? pfPrompt).trim()
-    if (!promptText || pfLoading) return
-    setPfLoading(true)
-    try {
-      const res = await api.preflight({
-        task: promptText,
-        project: pfProject.trim() || 'generic',
-        client: 'portal-sandbox',
-      })
-      setPfResult(res)
-      onGlobalRefresh()
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '模拟测试失败' })
-    } finally {
-      setPfLoading(false)
-    }
-  }
-
   const saveAdapters = useCallback(async () => {
     if (saving || !isDirty) return
     setSaving(true)
@@ -303,8 +269,8 @@ export const ConnectPolicyPage: React.FC<Props> = ({
         setRestartNotice([])
         toast.push('设置已保存并立即生效')
       }
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '保存设置失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '保存设置失败') })
     } finally {
       setSaving(false)
     }
@@ -369,17 +335,12 @@ export const ConnectPolicyPage: React.FC<Props> = ({
       const st = await api.feishuCheckStatus()
       setFeishuCheck({ ...st, running: true })
       toast.push({ tone: 'info', message: '已发出飞书测试卡片，请在飞书点击「我收到了」' })
-    } catch (err) {
-      setFeishuCheckError(err instanceof Error ? err.message : String(err))
+    } catch (err: unknown) {
+      setFeishuCheckError(errorMessage(err, String(err)))
     } finally {
       setFeishuCheckBusy(false)
     }
   }
-
-  const clientObj =
-    connectData?.guides.clients.find((c) => c.id === selectedClient) ||
-    connectData?.guides.clients[0]
-  const mcpTools = connectData?.mcp_tools || []
 
   return (
     <div
@@ -456,71 +417,7 @@ export const ConnectPolicyPage: React.FC<Props> = ({
       </Collapse>
 
       {/* Tab 1: Connect AI Clients */}
-      {tab === 'connect' && (
-        <div key="tab-connect" className="animate-tab-enter max-w-3xl space-y-5">
-          {!connectData ? (
-            <div className="space-y-4" aria-busy="true">
-              <div className="card p-4">
-                <div className="skeleton-block h-10 w-full" />
-              </div>
-              <div className="card p-5 space-y-3">
-                <div className="skeleton-block h-5 w-40" />
-                <div className="skeleton-block h-28 w-full" />
-              </div>
-            </div>
-          ) : (
-            <>
-              <div className="card p-4 flex flex-wrap items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="text-[12px] text-ink-4">本地服务地址（MCP）</div>
-                  <code className="mono text-[13.5px] font-medium text-ink">
-                    {connectData.guides.endpoints.mcp_http_url}
-                  </code>
-                </div>
-                <CopyButton text={connectData.guides.endpoints.mcp_http_url} label="复制地址" />
-              </div>
-
-              <PillTabs
-                items={connectData.guides.clients.map((c) => ({ key: c.id, label: c.name }))}
-                active={selectedClient}
-                onChange={setSelectedClient}
-              />
-
-              {clientObj && (
-                <div key={clientObj.id} className="animate-tab-enter space-y-3">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <h2 className="text-[16px] font-bold text-ink">{clientObj.name} 配置方法</h2>
-                    <span className="chip">{clientObj.loop_guarantee}</span>
-                  </div>
-                  <p className="text-[13px] text-ink-3">{clientObj.notes}</p>
-                  <CodeBlock title={`第 1 步 · ${clientObj.mcp_label}`} code={clientObj.mcp_config} />
-                  <CodeBlock title={`第 2 步 · ${clientObj.hook_label}`} code={clientObj.hook_config} />
-                </div>
-              )}
-
-              {mcpTools.length > 0 && (
-                <section className="card p-5">
-                  <h3 className="text-[14.5px] font-bold text-ink mb-3">
-                    连上后，AI 工具会多出这 {mcpTools.length} 个能力
-                  </h3>
-                  <ul className="space-y-2 text-[13px] leading-[1.7] text-ink-2">
-                    {mcpTools.map((tool) => (
-                      <li key={tool.name} className="flex gap-2">
-                        <span className="mt-[9px] size-1 shrink-0 rounded-full bg-accent" />
-                        <span>
-                          <strong className="font-semibold text-ink">{tool.title_zh}</strong>（
-                          <code className="mono text-[11.5px] text-ink-3">{tool.name}</code>
-                          ）：{tool.description_zh || tool.description}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                </section>
-              )}
-            </>
-          )}
-        </div>
-      )}
+      {tab === 'connect' && <ConnectClientsTab connectData={connectData} />}
 
       {/* Tab 2: Safety Valves, Directories, Model & Channels */}
       {tab === 'storage' && (
@@ -843,88 +740,7 @@ export const ConnectPolicyPage: React.FC<Props> = ({
       )}
 
       {/* Tab 3: Self-Test Sandbox */}
-      {tab === 'test' && (
-        <div key="tab-test" className="animate-tab-enter max-w-2xl card p-5 space-y-4">
-          <div className="flex items-center gap-2">
-            <Zap className="w-4 h-4 text-accent" />
-            <h2 className="text-[15px] font-bold text-ink">模拟一次开局提醒</h2>
-          </div>
-          <p className="text-[13px] text-ink-3">
-            输入你准备交给 AI 的任务，立即预览系统会自动注入哪些执行规矩与避坑规则。
-          </p>
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-[11.5px] text-ink-4">试试常见场景：</span>
-            {TEST_PRESETS.map((p) => (
-              <button
-                key={p.label}
-                type="button"
-                onClick={() => {
-                  setPfPrompt(p.task)
-                  executePreflight(p.task)
-                }}
-                className="pressable chip hover:border-accent/50 hover:text-ink"
-              >
-                {p.label}
-              </button>
-            ))}
-          </div>
-          <div className="space-y-2.5">
-            <input
-              value={pfProject}
-              onChange={(e) => setPfProject(e.target.value)}
-              placeholder="项目名（选填，留空则匹配全局通用规则）"
-              className="field-input w-full px-3 py-2 text-[13px]"
-            />
-            <textarea
-              rows={3}
-              value={pfPrompt}
-              onChange={(e) => setPfPrompt(e.target.value)}
-              onKeyDown={(e) => {
-                if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-                  e.preventDefault()
-                  executePreflight()
-                }
-              }}
-              placeholder="输入你想测试的任务描述（Cmd/Ctrl + Enter 运行）…"
-              className="field-input w-full px-3 py-2 text-[13px]"
-            />
-            <button
-              type="button"
-              onClick={() => executePreflight()}
-              disabled={pfLoading || !pfPrompt.trim()}
-              className="pressable inline-flex items-center gap-1.5 h-9 px-4 rounded-[var(--radius-control)] bg-accent text-accent-contrast text-[13px] font-medium hover:bg-accent-ink disabled:opacity-50"
-            >
-              {pfLoading ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              ) : (
-                <Zap className="w-3.5 h-3.5" />
-              )}
-              <span>{pfLoading ? '正在模拟…' : '运行模拟测试'}</span>
-            </button>
-          </div>
-          <Collapse open={Boolean(pfResult)}>
-            {pfResult && (
-              <div className="pt-3 border-t border-line-soft space-y-2">
-                <div className="text-[12px] text-ink-4">
-                  匹配模式：
-                  <strong className="text-ink">
-                    {labelOf(
-                      ANTI_LAZINESS_MODE_LABELS,
-                      pfResult.anti_laziness_mode,
-                      pfResult.anti_laziness_mode
-                    )}
-                  </strong>{' '}
-                  · 命中避坑规则{' '}
-                  <strong className="num text-ink">{pfResult.matched_rules.length}</strong> 条
-                </div>
-                <pre className="mono text-[12px] leading-[1.65] bg-bg-sunk border border-line-soft rounded-[var(--radius-control)] p-3.5 whitespace-pre-wrap max-h-80 overflow-y-auto text-ink-2">
-                  {pfResult.compact_context}
-                </pre>
-              </div>
-            )}
-          </Collapse>
-        </div>
-      )}
+      {tab === 'test' && <ConnectSandboxTab onGlobalRefresh={onGlobalRefresh} />}
     </div>
   )
 }

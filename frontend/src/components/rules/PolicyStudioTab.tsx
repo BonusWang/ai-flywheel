@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useImperativeHandle, useMemo, useState } from 'react'
 import { api } from '../../api'
+import { errorMessage } from '../../lib/errors'
 import { labelOf, POLICY_SOURCE_LABELS } from '../../lib/labels'
 import { Switch } from '../ui/Switch'
 import { useToast } from '../ui/Toast'
@@ -128,8 +129,8 @@ export const PolicyStudioTab: React.FC<{
       })
       await onChanged()
       toast.push('规矩已保存，下次对话立即生效')
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '保存规矩失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '保存规矩失败') })
     } finally {
       setSaving(false)
     }
@@ -147,8 +148,8 @@ export const PolicyStudioTab: React.FC<{
       setBaseline(null)
       await onChanged()
       toast.push('已恢复系统默认规矩')
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '恢复默认失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '恢复默认失败') })
     } finally {
       setSaving(false)
     }

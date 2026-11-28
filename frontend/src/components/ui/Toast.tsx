@@ -8,6 +8,7 @@ import React, {
   useState,
 } from 'react'
 import { AlertCircle, CheckCircle2, Info, Loader2, RotateCcw, X } from 'lucide-react'
+import { errorMessage } from '../../lib/errors'
 
 export type ToastTone = 'ok' | 'error' | 'info' | 'warn'
 
@@ -160,11 +161,12 @@ export const ToastProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       try {
         await item.onUndo()
         dismiss(item.id)
-      } catch (e: any) {
+      } catch (e: unknown) {
         dismiss(item.id)
+        const msg = errorMessage(e, '')
         push({
           tone: 'error',
-          message: e?.message ? `撤销失败：${e.message}` : '撤销失败，请稍后重试',
+          message: msg ? `撤销失败：${msg}` : '撤销失败，请稍后重试',
         })
       }
     },

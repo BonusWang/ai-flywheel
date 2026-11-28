@@ -8,12 +8,8 @@ import type { WorkflowRunRecord } from '../../types'
 export const NoiseFunnelStrip: React.FC<{ run: WorkflowRunRecord }> = ({ run }) => {
   const p00 = run.nodes.find((n) => n.node_id === 'P00_PREPARE')
   const p02 = run.nodes.find((n) => n.node_id === 'P02_REVIEW')
-  const triage = (p00?.payload as any)?.triage_report as
-    | { checked?: number; skipped?: number; admitted?: number }
-    | undefined
-  const findings = ((p02?.payload as any)?.findings || []) as Array<{
-    worthy?: boolean
-  }>
+  const triage = p00?.payload?.triage_report ?? undefined
+  const findings = p02?.payload?.findings || []
   const worthyCount = findings.filter((f) => f?.worthy !== false).length
   const hasFunnel = (triage && (triage.checked || 0) > 0) || findings.length > 0
   if (!hasFunnel) return null

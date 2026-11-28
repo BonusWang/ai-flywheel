@@ -154,9 +154,7 @@ export const HomePage: React.FC<Props> = ({ overview, onNavigate }) => {
       : '智能审批'
 
   const p00Node = latest_run?.nodes.find((n) => n.node_id === 'P00_PREPARE')
-  const triageReport = (p00Node?.payload as any)?.triage_report as
-    | { checked?: number; skipped?: number; admitted?: number }
-    | undefined
+  const triageReport = p00Node?.payload?.triage_report ?? undefined
 
   const aside = (
     <>

@@ -145,3 +145,16 @@
   1. Extract `core/queue_hand_distilled.py` (`QueueHandDistilledMixin`, `_declaration_meta`, ~275 LOC) from `core/queue_service.py` (shrinking it to ~1,275 LOC), preserving `DistillQueueService`'s public API intact.
   2. Extract `adapters/wiki/routing_models.py` (`IncidentRouting`, `DepositRouting`, `RoutingCandidates`, `RouteDecision`, `RouteContext`, reason maps, ~455 LOC) from `adapters/wiki/router.py` (shrinking it to ~855 LOC), re-exporting all symbols from `router.py`.
 - **Consequences**: Largest backend file drops below 1,300 LOC; routing models and hand-distilled policy can evolve independently.
+
+---
+
+## ADR-012: Frontend `errorMessage()` Utility, Zero `catch (e: any)` / `as any`, and `ConnectPolicyPage` Decomposition
+
+- **Status**: Accepted
+- **Context**: `ConnectPolicyPage.tsx` (930 LOC) mixed client setup guides, storage/model configuration, and the interactive preflight sandbox in one file. Meanwhile, 10 frontend modules repeated `catch (e: any)` (~32 sites) and 2 modules still cast `(node.payload as any)`.
+- **Decision**:
+  1. Introduce `frontend/src/lib/errors.ts` (`errorMessage(err: unknown, fallback: string)`) and migrate all `catch (e: any)` / `.catch((e: any)` sites across `frontend/src/` to `unknown`.
+  2. Extend `NodeExecutionPayload` in `frontend/src/types.ts` with `TriageReportSummary` and `ReviewFindingSummary`, removing the final `as any` casts in `NoiseFunnelStrip.tsx` and `HomePage.tsx`.
+  3. Extract `ConnectClientsTab.tsx` (Tab 1) and `ConnectSandboxTab.tsx` (Tab 3) out of `ConnectPolicyPage.tsx` (shrinking it below 750 LOC).
+  4. Lock the rule in `tests/test_arch_invariants.py:test_frontend_has_no_catch_any_or_as_any()`.
+- **Consequences**: Zero `catch (e: any)` and zero `as any` casts across the entire frontend; `any` occurrences reduced by 75% (65 -> 16, only generic JSON map boundaries).
