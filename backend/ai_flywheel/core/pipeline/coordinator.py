@@ -34,7 +34,7 @@ from ai_flywheel.adapters.runners import (
 )
 from ai_flywheel.adapters.sessions import SessionAdapter
 from ai_flywheel.adapters.skills import SkillWriterAdapter
-from ai_flywheel.adapters.wiki_gate import (
+from ai_flywheel.adapters.wiki import (
     ROUTE_DECLARED,
     ROUTE_EVIDENCE,
     UPDATE_NO_NEW_CONTENT,

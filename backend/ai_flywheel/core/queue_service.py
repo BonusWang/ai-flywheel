@@ -36,7 +36,7 @@ from ai_flywheel.core.privacy import (
     mask_credential_shapes,
     redact_structured_brief,
 )
-from ai_flywheel.core.time_utils import SHANGHAI_TZ
+from ai_flywheel.core.time_utils import SHANGHAI_TZ, shanghai_now_iso
 from ai_flywheel.core.triage import (
     _UUID_RE,
     derive_readable_title,
@@ -129,16 +129,12 @@ HAND_DISTILLED_META_KEYS = (
 QUIET_WINDOW_ACTIVE = "QUIET_WINDOW_ACTIVE"
 
 
-def _shanghai_now_iso() -> str:
-    return datetime.now(timezone.utc).astimezone(SHANGHAI_TZ).isoformat()
-
-
 def _declaration_meta(mode: str, paths: list[str], *, declared_at: str = "") -> dict[str, Any]:
     """The session-metadata mirror of a hand-distilled declaration."""
     meta: dict[str, Any] = {
         "distill_mode": mode,
         "hand_distilled_paths": list(paths),
-        "hand_distilled_at": declared_at or _shanghai_now_iso(),
+        "hand_distilled_at": declared_at or shanghai_now_iso(),
     }
     if mode == DISTILL_MODE_SKIPPED:
         meta["hand_distilled_skip"] = True

@@ -13,7 +13,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-import yaml
 from pydantic import ValidationError
 
 from ai_flywheel.adapters.skills import (
@@ -30,6 +29,7 @@ from ai_flywheel.adapters.runners.contracts import (
     _slugify,
     normalize_rule_payload,
 )
+from ai_flywheel.core.markdown_utils import parse_frontmatter
 from ai_flywheel.core.privacy import (
     SecretLeakError,
     mask_credential_shapes,
@@ -59,30 +59,6 @@ def _append_reason(base: str, suffix: str) -> str:
     if not right:
         return left
     return f"{left}；{right}"
-
-
-def _draft_frontmatter(content: str) -> dict[str, Any]:
-    """Top-level YAML mapping of a markdown draft, or an empty dict when there is none."""
-    text = (content or "").strip()
-    if not text.startswith("---"):
-        return {}
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return {}
-    try:
-        loaded = yaml.safe_load(parts[1])
-    except yaml.YAMLError:
-        return {}
-    return loaded if isinstance(loaded, dict) else {}
-
-
-def _draft_body(content: str) -> str:
-    text = (content or "").strip()
-    if text.startswith("---"):
-        parts = text.split("---", 2)
-        if len(parts) >= 3:
-            return parts[2]
-    return text
 
 
 def _h1(body: str) -> str:
@@ -140,8 +116,7 @@ def _complete_missing_fields(raw_item: dict[str, Any]) -> tuple[dict[str, Any], 
 
     kind = item["target_kind"].strip().lower() if isinstance(item.get("target_kind"), str) else ""
     content = item.get("content_preview") if isinstance(item.get("content_preview"), str) else ""
-    frontmatter = _draft_frontmatter(content)
-    body = _draft_body(content)
+    frontmatter, body = parse_frontmatter(content)
     payload = item.get("rule_payload") if isinstance(item.get("rule_payload"), dict) else {}
     route = item.get("skill_route") if isinstance(item.get("skill_route"), dict) else {}
     completed: list[str] = []

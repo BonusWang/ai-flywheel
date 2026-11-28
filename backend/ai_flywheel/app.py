@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from mcp.server.transport_security import TransportSecuritySettings
 
 from ai_flywheel import __version__
-from ai_flywheel.core.automation import CATCHUP_CHECK_INTERVAL_SECONDS
+from ai_flywheel.core.automation import CATCHUP_CHECK_INTERVAL_SECONDS, recovery_watchdog_settings
 from ai_flywheel.routes import (
     build_automations_router,
     build_governance_router,
@@ -73,8 +73,7 @@ def create_app(
             recovery_stop = threading.Event()
 
             def _recovery_loop() -> None:
-                interval = float(os.environ.get("FLYWHEEL_RECOVERY_INTERVAL", "30"))
-                stale_after = int(os.environ.get("FLYWHEEL_RECOVERY_STALE_SECONDS", "300"))
+                interval, stale_after = recovery_watchdog_settings()
                 # The lost-fire check runs on the first pass — a service started after the
                 # cron time finds out at once — and then a few times an hour: the window
                 # in which a fire may still be caught up is hours wide. It follows the

@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ai_flywheel.adapters.knowledge import KnowledgeSinkAdapter
-from ai_flywheel.adapters.wiki_gate import (
+from ai_flywheel.adapters.wiki import (
     CREATE_TARGET_EXISTS,
     UNROUTED_REASON_LABEL,
     RouteDecision,

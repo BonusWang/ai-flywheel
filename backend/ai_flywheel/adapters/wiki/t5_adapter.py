@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 import yaml
 
 from ai_flywheel.adapters.wiki.schema import split_frontmatter
+from ai_flywheel.core.markdown_utils import parse_frontmatter, trim_blank_lines
 from ai_flywheel.core.time_utils import compute_valid_until, shanghai_today_ymd
 from ai_flywheel.models import INCIDENT_PAGE_TYPE
 
@@ -80,16 +81,6 @@ def _split_draft_body(raw_body: str) -> dict[str, list[str]]:
 
 def _dedupe(items: list[str]) -> list[str]:
     return list(dict.fromkeys(item for item in items if item))
-
-
-def _load_draft_frontmatter(fm_text: str | None) -> dict[str, Any]:
-    if not fm_text:
-        return {}
-    try:
-        loaded = yaml.safe_load(fm_text)
-    except yaml.YAMLError:
-        return {}
-    return loaded if isinstance(loaded, dict) else {}
 
 
 def _draft_tags(raw_tags: Any) -> list[str]:
@@ -198,8 +189,7 @@ def normalize_planned_document(
     record_id = f"{today_str}-{rec_slug}"
     target_rel = f"{projects_root_rel}/{chosen['dir_name']}/实战笔记/{today_str}-{file_slug}.md"
 
-    fm_text, raw_body = split_frontmatter(content or "")
-    draft_fm = _load_draft_frontmatter(fm_text)
+    draft_fm, raw_body = parse_frontmatter(content or "")
     buckets = _split_draft_body(raw_body)
     description = _card_description(summary, buckets, clean_title)
     sources_list = [f"ai-flywheel session: {sk}" for sk in (source_sessions or []) if sk][:5]
@@ -251,16 +241,6 @@ _INCIDENT_SECTION_KEYWORDS: tuple[tuple[tuple[str, ...], str], ...] = (
 )
 
 
-def _trim_blank(lines: list[str]) -> list[str]:
-    """The lines without their leading and trailing blank ones."""
-    start, end = 0, len(lines)
-    while start < end and not lines[start].strip():
-        start += 1
-    while end > start and not lines[end - 1].strip():
-        end -= 1
-    return lines[start:end]
-
-
 def _incident_draft_layout(
     body: str,
 ) -> tuple[str, list[str], dict[str, list[str]], list[tuple[str, list[str]]]]:
@@ -310,9 +290,9 @@ def _incident_draft_layout(
         current.append(raw.rstrip())
     return (
         title_line,
-        _trim_blank(preamble),
-        {name: _trim_blank(lines) for name, lines in sections.items()},
-        [(name, _trim_blank(lines)) for name, lines in others],
+        trim_blank_lines(preamble),
+        {name: trim_blank_lines(lines) for name, lines in sections.items()},
+        [(name, trim_blank_lines(lines)) for name, lines in others],
     )
 
 

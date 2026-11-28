@@ -901,3 +901,179 @@ def test_no_class_defines_duplicate_methods_and_no_db_mixins_collide():
                         mixin_methods[item.name].append(f"{path.name}:{node.name}:{item.lineno}")
     collisions = {name: locs for name, locs in sorted(mixin_methods.items()) if len(locs) > 1}
     assert collisions == {}, f"FlywheelDB mixin method collisions: {collisions}"
+
+
+_SHARED_LEAF_PRIMITIVES = frozenset(
+    {
+        "ai_flywheel.models",
+        "ai_flywheel.config",
+        "ai_flywheel.core.time_utils",
+        "ai_flywheel.core.privacy",
+        "ai_flywheel.core.markdown_utils",
+        "ai_flywheel.core.approval_channel",
+    }
+)
+
+_DEPRECATED_SHIM_MODULES = frozenset(
+    {
+        "ai_flywheel.adapters.wiki_gate",
+        "ai_flywheel.core.feishu_card",
+        "ai_flywheel.core.feishu_channel",
+        "ai_flywheel.core.feishu_listen",
+        "ai_flywheel.core.feishu_check",
+    }
+)
+
+# Narrow, explicitly tracked baseline upward dependencies; shrinks as batches land.
+_KNOWN_LAYER_EXCEPTIONS = frozenset(
+    {
+        ("ai_flywheel.adapters.sessions", "ai_flywheel.core.triage"),
+        ("ai_flywheel.storage.seed", "ai_flywheel.core.activation"),
+        ("ai_flywheel.storage.seed", "ai_flywheel.core.receipts"),
+        ("ai_flywheel.runtime", "ai_flywheel.mcp_server"),
+    }
+)
+
+
+def _backend_runtime_import_graph() -> dict[str, set[str]]:
+    """Runtime-only internal import graph of ``ai_flywheel`` (skipping ``if TYPE_CHECKING:``)."""
+    import ast
+    from collections import defaultdict
+
+    backend_root = REPO_ROOT / "backend" / "ai_flywheel"
+    edges: dict[str, set[str]] = defaultdict(set)
+
+    def _module_name(path: Path) -> str:
+        rel = path.relative_to(backend_root).with_suffix("")
+        parts = list(rel.parts)
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        return "ai_flywheel" + ("." + ".".join(parts) if parts else "")
+
+    for path in sorted(backend_root.rglob("*.py")):
+        mod = _module_name(path)
+        edges.setdefault(mod, set())
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+        class _Visitor(ast.NodeVisitor):
+            def visit_If(self, node: ast.If) -> None:
+                if isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING":
+                    return
+                self.generic_visit(node)
+
+            def visit_Import(self, node: ast.Import) -> None:
+                for alias in node.names:
+                    if alias.name.startswith("ai_flywheel"):
+                        edges[mod].add(alias.name)
+
+            def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+                if node.module and node.module.startswith("ai_flywheel"):
+                    edges[mod].add(node.module)
+                elif node.level > 0:
+                    base = mod.split(".")
+                    if path.name != "__init__.py":
+                        base = base[:-1]
+                    up = node.level - 1
+                    if up > 0:
+                        base = base[:-up]
+                    target = ".".join(base + ([node.module] if node.module else []))
+                    edges[mod].add(target)
+
+        _Visitor().visit(tree)
+
+    return edges
+
+
+def test_no_runtime_circular_imports_in_backend():
+    """后端运行时模块依赖图必须是有向无环图（DAG），禁止引入循环依赖。"""
+    edges = _backend_runtime_import_graph()
+    idx = 0
+    indices: dict[str, int] = {}
+    low: dict[str, int] = {}
+    stack: list[str] = []
+    on_stack: set[str] = set()
+    cycles: list[list[str]] = []
+
+    def _strongconnect(v: str) -> None:
+        nonlocal idx
+        indices[v] = low[v] = idx
+        idx += 1
+        stack.append(v)
+        on_stack.add(v)
+        for w in sorted(edges.get(v, ())):
+            if w not in indices:
+                _strongconnect(w)
+                low[v] = min(low[v], low[w])
+            elif w in on_stack:
+                low[v] = min(low[v], indices[w])
+        if low[v] == indices[v]:
+            comp: list[str] = []
+            while True:
+                w = stack.pop()
+                on_stack.remove(w)
+                comp.append(w)
+                if w == v:
+                    break
+            if len(comp) > 1:
+                cycles.append(sorted(comp))
+
+    for node in sorted(set(edges) | {t for ts in edges.values() for t in ts}):
+        if node not in indices:
+            _strongconnect(node)
+
+    assert cycles == [], f"Runtime circular imports detected: {cycles}"
+
+
+def test_no_production_code_imports_legacy_shims():
+    """生产代码必须直接引用权威模块，不得再依赖历史兼容壳。"""
+    edges = _backend_runtime_import_graph()
+    offenders: list[str] = []
+    for src, targets in sorted(edges.items()):
+        if src in _DEPRECATED_SHIM_MODULES:
+            continue
+        for target in sorted(targets):
+            if target in _DEPRECATED_SHIM_MODULES:
+                offenders.append(f"{src} -> {target}")
+    assert offenders == [], f"Production code imports legacy shim(s): {offenders}"
+
+
+def test_shared_leaf_primitives_have_no_upward_dependencies():
+    """共享叶子原语（models/config/time_utils/privacy/markdown_utils/approval_channel）不得向上依赖。"""
+    edges = _backend_runtime_import_graph()
+    allowed = _SHARED_LEAF_PRIMITIVES | {"ai_flywheel"}
+    offenders: list[str] = []
+    for mod in sorted(_SHARED_LEAF_PRIMITIVES):
+        for target in sorted(edges.get(mod, ())):
+            if target not in allowed:
+                offenders.append(f"{mod} -> {target}")
+    assert offenders == [], f"Shared leaf primitive has upward dependency: {offenders}"
+
+
+def test_backend_respects_layered_dependency_direction():
+    """依赖方向必须服从 entry -> runtime -> core -> adapters -> storage -> leaf primitives。"""
+    edges = _backend_runtime_import_graph()
+    rank = {"entry": 5, "runtime": 4, "core": 3, "adapters": 2, "storage": 1, "leaf": 0}
+
+    def _layer(mod: str) -> str:
+        if mod == "ai_flywheel" or mod in _SHARED_LEAF_PRIMITIVES:
+            return "leaf"
+        parts = mod.split(".")
+        top = parts[1] if len(parts) > 1 else ""
+        if top in {"app", "cli", "mcp_server", "routes"}:
+            return "entry"
+        if top in {"runtime", "core", "adapters", "storage"}:
+            return top
+        return "leaf"
+
+    violations: list[str] = []
+    for src, targets in sorted(edges.items()):
+        if src in _DEPRECATED_SHIM_MODULES:
+            continue
+        sl = _layer(src)
+        for target in sorted(targets):
+            tl = _layer(target)
+            if tl == "leaf" or sl == "leaf":
+                continue
+            if rank[sl] < rank[tl] and (src, target) not in _KNOWN_LAYER_EXCEPTIONS:
+                violations.append(f"[{sl}->{tl}] {src} -> {target}")
+    assert violations == [], f"New layer dependency violations: {violations}"
