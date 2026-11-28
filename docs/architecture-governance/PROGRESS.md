@@ -24,4 +24,5 @@
 
 | Batch | Date | Commit | Summary | Verification |
 |---|---|---|---|---|
-| B00 | 2026-11-28 | *(pending)* | Established isolated governance worktree, full AST/frontend audit, architecture map, ADR log, pending decisions, and backlog | Hygiene + OpenSpec + baseline verification |
+| B00 | 2026-11-28 | `d5546b2` | Established isolated governance worktree, full AST/frontend audit, architecture map, ADR log, pending decisions, and backlog | Hygiene (378 files clean) + OpenSpec |
+| B01 | 2026-11-28 | *(current)* | Removed duplicate `SessionRepoMixin.count_retro_items` and shadowed `KnowledgeRepoMixin.get_preflight_knowledge_pointers`; unified `SHANGHAI_TZ` in `storage/db/schema.py`; added AST invariant banning duplicate class methods & DB mixin collisions | `test_arch_invariants` + `test_v2_schema_and_skills` + `test_v3_true_flywheel` (45 passed) |

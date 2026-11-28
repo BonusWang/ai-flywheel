@@ -452,23 +452,6 @@ class KnowledgeRepoMixin:
             out[item["doc_path"]] = item
         return out
 
-    def get_preflight_knowledge_pointers(self, receipt_id: str) -> list[str]:
-        if not receipt_id:
-            return []
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT payload_json FROM preflight_receipts WHERE receipt_id = ?",
-                (receipt_id,),
-            ).fetchone()
-        if not row:
-            return []
-        try:
-            payload = json.loads(row["payload_json"])
-        except (TypeError, json.JSONDecodeError):
-            return []
-        pointers = payload.get("knowledge_pointers") or []
-        return [str(p) for p in pointers]
-
     def get_knowledge_card_metrics(self, limit: int = 50) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(

@@ -858,3 +858,46 @@ def test_the_example_config_matches_the_defaults_of_the_new_review_and_plan_sett
             ApiRunnerConfig(**rejected)
     with pytest.raises(ValueError):
         WorkflowConfig(max_domain_writes_per_run=33)
+
+
+# ---------------------------------------------------------------- 8. 结构与依赖不变量
+
+
+def test_no_class_defines_duplicate_methods_and_no_db_mixins_collide():
+    """任何类不得重复定义同名方法；FlywheelDB 的仓储 mixin 不得存在同名方法遮蔽。"""
+    import ast
+    from collections import defaultdict
+
+    backend_root = REPO_ROOT / "backend" / "ai_flywheel"
+    dup_methods: list[str] = []
+    for path in sorted(backend_root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        rel = path.relative_to(backend_root).as_posix()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            seen: dict[str, list[int]] = defaultdict(list)
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    is_setter = any(
+                        isinstance(d, ast.Attribute) and d.attr == "setter"
+                        for d in item.decorator_list
+                    )
+                    if not is_setter:
+                        seen[item.name].append(item.lineno)
+            for name, lines in sorted(seen.items()):
+                if len(lines) > 1:
+                    dup_methods.append(f"{rel}::{node.name}.{name} at lines {lines}")
+    assert dup_methods == [], f"Duplicate method definitions found: {dup_methods}"
+
+    db_dir = backend_root / "storage" / "db"
+    mixin_methods: dict[str, list[str]] = defaultdict(list)
+    for path in sorted(db_dir.glob("*_repo.py")) + [db_dir / "migrations.py"]:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef):
+                        mixin_methods[item.name].append(f"{path.name}:{node.name}:{item.lineno}")
+    collisions = {name: locs for name, locs in sorted(mixin_methods.items()) if len(locs) > 1}
+    assert collisions == {}, f"FlywheelDB mixin method collisions: {collisions}"
