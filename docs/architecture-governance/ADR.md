@@ -72,3 +72,15 @@
   2. Rename `core/pipeline/helpers.py:promote_observation` to `link_rule_to_observation`.
   3. Preserve `core/orchestrator.py` and `WorkflowOrchestrator`'s public interface and runtime monkeypatch seam untouched.
 - **Consequences**: `start_run` drops from 925 LOC to ~95 LOC and `_execute_post_approval` from 771 LOC to ~18 LOC, making the P00–P07 state machine scannable at a glance and isolating pre- vs post-approval edits.
+
+---
+
+## ADR-006: Modularize Distill Queue Service & Unify Transcript Reader
+
+- **Status**: Accepted
+- **Context**: `core/queue_service.py` had grown to 2,399 LOC mixing pure transcript compaction/chunking, batch archive reconciliation/re-triage sweeps, and real-time ingress state transitions. Its `read_full_transcript` function also duplicated the JSONL reader in `adapters/sessions.py:read_transcript_excerpt`.
+- **Decision**:
+  1. Extract deterministic compaction, turn splitting, chunking, content hashing, and structured brief rendering into `core/queue_compaction.py` (~355 LOC), and delegate `read_full_transcript` directly to `adapters/sessions.py:read_transcript_excerpt`.
+  2. Extract batch reconciliation (`reconcile_codex_archives`), `re_triage_queue`, and pending-session/grown-transcript bridging into `core/queue_reconcile.py` (`QueueReconcileMixin`, ~540 LOC).
+  3. Keep `core/queue_service.py` (~1,530 LOC) as the canonical ingress state machine and public import surface re-exporting all queue helpers.
+- **Consequences**: Compaction is pure and DB-free; one canonical JSONL transcript reader serves both session scanning and queue ingestion; maintenance sweeps evolve independently of real-time ingress.
