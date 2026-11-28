@@ -134,3 +134,14 @@
   2. Migrate all test callers to `build_mcp_server(rt)` and empty `_KNOWN_LAYER_EXCEPTIONS` in `tests/test_arch_invariants.py`, locking **zero** upward layer violations across the entire backend.
   3. Explicitly retain `core/orchestrator.py` as an intentional monkeypatch facade seam (PD-003), matching `AGENTS.md`.
 - **Consequences**: Strict acyclic `entry -> runtime -> core -> adapters -> storage -> leaf` dependency enforcement with zero exceptions.
+
+---
+
+## ADR-011: Extract `queue_hand_distilled.py` and `wiki/routing_models.py`
+
+- **Status**: Accepted
+- **Context**: `core/queue_service.py` (1,542 LOC) and `adapters/wiki/router.py` (1,297 LOC) remained the two largest backend files, each combining a cohesive sub-domain/model block with its core state-machine/evaluation logic.
+- **Decision**:
+  1. Extract `core/queue_hand_distilled.py` (`QueueHandDistilledMixin`, `_declaration_meta`, ~275 LOC) from `core/queue_service.py` (shrinking it to ~1,275 LOC), preserving `DistillQueueService`'s public API intact.
+  2. Extract `adapters/wiki/routing_models.py` (`IncidentRouting`, `DepositRouting`, `RoutingCandidates`, `RouteDecision`, `RouteContext`, reason maps, ~455 LOC) from `adapters/wiki/router.py` (shrinking it to ~855 LOC), re-exporting all symbols from `router.py`.
+- **Consequences**: Largest backend file drops below 1,300 LOC; routing models and hand-distilled policy can evolve independently.
