@@ -367,8 +367,11 @@ def test_the_example_config_matches_the_workflow_schedule_defaults():
 
 async def test_the_mcp_server_keeps_exactly_seven_tools_and_four_resources(tmp_path: Path):
     """新能力只扩展现有工具的可选参数：工具与资源的总数都不变。"""
+    from ai_flywheel.mcp_server import build_mcp_server
+
     rt = _runtime(tmp_path)
-    tools = sorted(tool.name for tool in await rt.mcp.list_tools())
+    mcp = build_mcp_server(rt)
+    tools = sorted(tool.name for tool in await mcp.list_tools())
     assert tools == [
         "flywheel_ingest_session",
         "flywheel_preflight_activate",
@@ -378,8 +381,8 @@ async def test_the_mcp_server_keeps_exactly_seven_tools_and_four_resources(tmp_p
         "flywheel_session_intent",
         "flywheel_status",
     ]
-    assert len(await rt.mcp.list_resources()) == 4
-    schemas = {tool.name: tool.input_schema for tool in await rt.mcp.list_tools()}
+    assert len(await mcp.list_resources()) == 4
+    schemas = {tool.name: tool.input_schema for tool in await mcp.list_tools()}
     for name, key in (
         ("flywheel_session_intent", "wiki_paths"),
         ("flywheel_session_intent", "governance_only"),
@@ -924,12 +927,8 @@ _DEPRECATED_SHIM_MODULES = frozenset(
     }
 )
 
-# Narrow, explicitly tracked baseline upward dependency (see DECISIONS_PENDING.md PD-002).
-_KNOWN_LAYER_EXCEPTIONS = frozenset(
-    {
-        ("ai_flywheel.runtime", "ai_flywheel.mcp_server"),
-    }
-)
+# Zero upward layer exceptions across the backend (PD-002 resolved in B10).
+_KNOWN_LAYER_EXCEPTIONS: frozenset[tuple[str, str]] = frozenset()
 
 
 def _backend_runtime_import_graph() -> dict[str, set[str]]:

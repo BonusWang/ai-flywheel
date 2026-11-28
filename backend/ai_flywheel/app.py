@@ -16,6 +16,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from ai_flywheel import __version__
 from ai_flywheel.core.automation import CATCHUP_CHECK_INTERVAL_SECONDS, recovery_watchdog_settings
+from ai_flywheel.mcp_server import build_mcp_server
 from ai_flywheel.routes import (
     build_automations_router,
     build_governance_router,
@@ -43,7 +44,8 @@ def create_app(
         auto_seed=auto_seed,
         process_role=effective_role,
     )
-    mcp_http_app = rt.mcp.streamable_http_app(
+    mcp_server = build_mcp_server(rt)
+    mcp_http_app = mcp_server.streamable_http_app(
         streamable_http_path="/",
         json_response=True,
         stateless_http=True,
@@ -142,7 +144,7 @@ def create_app(
             )
             archive_thread.start()
             rt.start_feishu()
-        async with rt.mcp.session_manager.run():
+        async with mcp_server.session_manager.run():
             yield
         rt.stop_feishu()
         if recovery_stop is not None:
@@ -160,6 +162,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.runtime = rt
+    app.state.mcp = mcp_server
 
     app.add_middleware(
         CORSMiddleware,

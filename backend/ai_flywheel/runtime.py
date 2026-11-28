@@ -22,7 +22,6 @@ from ai_flywheel.core.publication import PublicationLayer
 from ai_flywheel.core.queue_service import DistillQueueService
 from ai_flywheel.core.receipts import ReceiptService
 from ai_flywheel.core.triage import triage_session
-from ai_flywheel.mcp_server import build_mcp_server
 from ai_flywheel.models import (
     IngressChannel,
     RegisterSessionRequest,
@@ -37,7 +36,7 @@ from ai_flywheel.storage.seed import seed_demo_data
 
 
 class FlywheelRuntime:
-    """Single dependency container wiring all decoupled engines, adapters, MCP, and APIs."""
+    """Single dependency container wiring all decoupled engines, adapters, and domain services."""
 
     def __init__(self, cfg: FlywheelConfig, *, skip_fts_sync: bool = False, clock: SystemClock | None = None, process_role: str = "cli") -> None:
         self.cfg = cfg
@@ -80,7 +79,6 @@ class FlywheelRuntime:
         )
         self.hooks = ThinHookProcessor(self)
         self.publication = PublicationLayer(cfg, self.db, self.policies, self.activation)
-        self.mcp = build_mcp_server(self)
         self.outbox = None
         self.lark_runner = None
         self.feishu_listener = None

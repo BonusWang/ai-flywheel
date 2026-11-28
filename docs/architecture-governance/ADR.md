@@ -120,3 +120,17 @@
   2. Migrate all remaining test imports directly to `ai_flywheel.adapters.channels.feishu.*` and `ai_flywheel.adapters.wiki`.
   3. Strengthen `test_no_production_code_imports_legacy_shims` in `tests/test_arch_invariants.py` to assert both non-existence of the 5 shim files and zero imports across `backend/` and `tests/`.
 - **Consequences**: Canonical import paths everywhere (`Deletion over Accumulation`), zero dead forwarding shells.
+
+---
+
+## ADR-010: MCP Server Owned by Entry Layer & Intentional Retention of `core/orchestrator.py` (PD-002 / PD-003)
+
+- **Status**: Accepted (Maintainer Approved)
+- **Context**:
+  1. `runtime.py` imported `build_mcp_server` from `mcp_server.py` (an entry-layer transport adapter) and exposed `rt.mcp`, creating the single remaining `[runtime -> entry]` layer exception in `_KNOWN_LAYER_EXCEPTIONS`.
+  2. `core/orchestrator.py` (48 LOC) is the documented runtime monkeypatch facade over `core/pipeline/`.
+- **Decision**:
+  1. Remove `self.mcp` and the `mcp_server` import from `FlywheelRuntime`; construct `build_mcp_server(rt)` exclusively in the entry layer (`app.py`, exposing `app.state.mcp`, and `cli.py` for `mcp-stdio`).
+  2. Migrate all test callers to `build_mcp_server(rt)` and empty `_KNOWN_LAYER_EXCEPTIONS` in `tests/test_arch_invariants.py`, locking **zero** upward layer violations across the entire backend.
+  3. Explicitly retain `core/orchestrator.py` as an intentional monkeypatch facade seam (PD-003), matching `AGENTS.md`.
+- **Consequences**: Strict acyclic `entry -> runtime -> core -> adapters -> storage -> leaf` dependency enforcement with zero exceptions.

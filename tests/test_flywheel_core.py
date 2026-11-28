@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from ai_flywheel.app import create_app
 from ai_flywheel.config import FlywheelConfig, load_config
 from ai_flywheel.core.receipts import OutcomeGateError
+from ai_flywheel.mcp_server import build_mcp_server
 from ai_flywheel.models import (
     CheckResult,
     CreateRuleRequest,
@@ -257,8 +258,9 @@ def test_p00_p07_approval_auto_and_fail_run_lock_safety(isolated_runtime: Flywhe
 @pytest.mark.asyncio
 async def test_mcp_tools_and_fastapi_endpoints(isolated_runtime: FlywheelRuntime):
     rt = isolated_runtime
+    mcp = build_mcp_server(rt)
     # Direct MCP tool verification via official MCPServer
-    tools = await rt.mcp.list_tools()
+    tools = await mcp.list_tools()
     tool_map = {t.name: t for t in tools}
     tool_names = set(tool_map.keys())
     assert {
@@ -274,7 +276,7 @@ async def test_mcp_tools_and_fastapi_endpoints(isolated_runtime: FlywheelRuntime
     outcome_schema = json.dumps(tool_map["flywheel_record_outcome"].input_schema)
     assert "OutcomeCheck" in outcome_schema and "VerificationKind" in outcome_schema
 
-    reg_res = await rt.mcp.call_tool(
+    reg_res = await mcp.call_tool(
         "flywheel_ingest_session",
         {
             "client": "claude",
@@ -290,7 +292,7 @@ async def test_mcp_tools_and_fastapi_endpoints(isolated_runtime: FlywheelRuntime
         "claude:mcp-001", statuses=[QueueStatus.QUEUED]
     )
 
-    intent_res = await rt.mcp.call_tool(
+    intent_res = await mcp.call_tool(
         "flywheel_session_intent",
         {
             "action": "opt_out",

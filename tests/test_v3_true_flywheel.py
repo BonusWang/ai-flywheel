@@ -14,6 +14,7 @@ from ai_flywheel.config import FlywheelConfig, load_config
 from ai_flywheel.core.core_card import MAX_BYTES, MAX_LINES, rebuild_core_card
 from ai_flywheel.core.dream import run_dream_consolidation
 from ai_flywheel.core.privacy import SecretLeakError
+from ai_flywheel.mcp_server import build_mcp_server
 from ai_flywheel.models import (
     CheckResult,
     CreateRuleRequest,
@@ -349,7 +350,7 @@ async def test_derived_core_card_hard_cap_and_mcp_resource(rt: FlywheelRuntime):
     assert info["lines"] <= MAX_LINES
     assert info["bytes"] <= MAX_BYTES
 
-    resources = await rt.mcp.list_resources()
+    resources = await build_mcp_server(rt).list_resources()
     uris = {str(r.uri) for r in resources}
     assert "flywheel://core-card" in uris
 

@@ -18,6 +18,7 @@ from ai_flywheel.core.onboarding import (
     apply_init_client,
     plan_init_client,
 )
+from ai_flywheel.mcp_server import build_mcp_server
 from ai_flywheel.runtime import FlywheelRuntime
 from ai_flywheel.storage.seed import seed_demo_data
 
@@ -214,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
             base_dir=args.base_dir,
             skip_fts_sync=True,
         )
-        rt.mcp.run(transport="stdio")
+        build_mcp_server(rt).run(transport="stdio")
         return 0
 
     if args.command == "seed":
