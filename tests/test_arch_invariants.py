@@ -924,12 +924,9 @@ _DEPRECATED_SHIM_MODULES = frozenset(
     }
 )
 
-# Narrow, explicitly tracked baseline upward dependencies; shrinks as batches land.
+# Narrow, explicitly tracked baseline upward dependency (see DECISIONS_PENDING.md PD-002).
 _KNOWN_LAYER_EXCEPTIONS = frozenset(
     {
-        ("ai_flywheel.adapters.sessions", "ai_flywheel.core.triage"),
-        ("ai_flywheel.storage.seed", "ai_flywheel.core.activation"),
-        ("ai_flywheel.storage.seed", "ai_flywheel.core.receipts"),
         ("ai_flywheel.runtime", "ai_flywheel.mcp_server"),
     }
 )

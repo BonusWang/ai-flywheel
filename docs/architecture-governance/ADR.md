@@ -41,3 +41,19 @@
   2. Add an AST invariant forbidding any module under `backend/ai_flywheel/` from importing deprecated compatibility shims (`core.feishu_*`, `adapters.wiki_gate`).
   3. Retain the shim files themselves until maintainer sign-off on breaking deprecation (tracked in `DECISIONS_PENDING.md`).
 - **Consequences**: Zero new internal coupling to shims while preserving external/test compatibility.
+
+---
+
+## ADR-004: Transcript Parsing in Adapters & Governance Domain Service Extraction
+
+- **Status**: Accepted
+- **Context**:
+  1. `adapters/sessions.py` imported 10 helpers upward from `core/triage.py`, and duplicated `_flatten_content` + boilerplate detection, because client JSONL/Antigravity transcript parsing lived inside the 1,140 LOC `core/triage.py` monolith.
+  2. `storage/seed.py` imported `ActivationEngine` and `ReceiptService` at runtime purely for type hints.
+  3. `routes/governance.py` (669 LOC) embedded observation lifecycle, retro promotion, knowledge freshness enrichment, and skill ledger merging inline inside FastAPI route handlers.
+- **Decision**:
+  1. Extract pure client transcript parsing into `adapters/transcripts.py` (~659 LOC) and re-export from `core/triage.py` (~519 LOC); inject `triage_fn` into `SessionAdapter` from `FlywheelRuntime`.
+  2. Move `storage/seed.py` core engine imports under `TYPE_CHECKING`.
+  3. Extract `GovernanceService` (`core/governance.py`, wired as `rt.governance`), shrinking `routes/governance.py` to thin HTTP mapping (~310 LOC).
+  4. Shrink `_KNOWN_LAYER_EXCEPTIONS` in `tests/test_arch_invariants.py` from 4 entries to 1 (`runtime -> mcp_server`).
+- **Consequences**: `storage/*` and `adapters/*` now have zero upward runtime dependencies; governance operations are directly testable without HTTP transport.
