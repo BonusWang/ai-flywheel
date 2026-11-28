@@ -48,7 +48,7 @@ from ai_flywheel.adapters.wiki import _workspace_segments
 from ai_flywheel.adapters.wiki.router import RouteDecision
 from ai_flywheel.app import create_app
 from ai_flywheel.config import ApiRunnerConfig, FlywheelConfig
-from ai_flywheel.core.feishu_card import is_sensitive
+from ai_flywheel.adapters.channels.feishu.card import is_sensitive
 from ai_flywheel.core.orchestrator import NODE_TEMPLATES, WorkflowOrchestrator
 from ai_flywheel.core.pipeline.helpers import apply_route_decision
 from ai_flywheel.models import (
@@ -367,8 +367,11 @@ def test_the_example_config_matches_the_workflow_schedule_defaults():
 
 async def test_the_mcp_server_keeps_exactly_seven_tools_and_four_resources(tmp_path: Path):
     """新能力只扩展现有工具的可选参数：工具与资源的总数都不变。"""
+    from ai_flywheel.mcp_server import build_mcp_server
+
     rt = _runtime(tmp_path)
-    tools = sorted(tool.name for tool in await rt.mcp.list_tools())
+    mcp = build_mcp_server(rt)
+    tools = sorted(tool.name for tool in await mcp.list_tools())
     assert tools == [
         "flywheel_ingest_session",
         "flywheel_preflight_activate",
@@ -378,8 +381,8 @@ async def test_the_mcp_server_keeps_exactly_seven_tools_and_four_resources(tmp_p
         "flywheel_session_intent",
         "flywheel_status",
     ]
-    assert len(await rt.mcp.list_resources()) == 4
-    schemas = {tool.name: tool.input_schema for tool in await rt.mcp.list_tools()}
+    assert len(await mcp.list_resources()) == 4
+    schemas = {tool.name: tool.input_schema for tool in await mcp.list_tools()}
     for name, key in (
         ("flywheel_session_intent", "wiki_paths"),
         ("flywheel_session_intent", "governance_only"),
@@ -858,3 +861,284 @@ def test_the_example_config_matches_the_defaults_of_the_new_review_and_plan_sett
             ApiRunnerConfig(**rejected)
     with pytest.raises(ValueError):
         WorkflowConfig(max_domain_writes_per_run=33)
+
+
+# ---------------------------------------------------------------- 8. 结构与依赖不变量
+
+
+def test_no_class_defines_duplicate_methods_and_no_db_mixins_collide():
+    """任何类不得重复定义同名方法；FlywheelDB 的仓储 mixin 不得存在同名方法遮蔽。"""
+    import ast
+    from collections import defaultdict
+
+    backend_root = REPO_ROOT / "backend" / "ai_flywheel"
+    dup_methods: list[str] = []
+    for path in sorted(backend_root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        rel = path.relative_to(backend_root).as_posix()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            seen: dict[str, list[int]] = defaultdict(list)
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    is_setter = any(
+                        isinstance(d, ast.Attribute) and d.attr == "setter"
+                        for d in item.decorator_list
+                    )
+                    if not is_setter:
+                        seen[item.name].append(item.lineno)
+            for name, lines in sorted(seen.items()):
+                if len(lines) > 1:
+                    dup_methods.append(f"{rel}::{node.name}.{name} at lines {lines}")
+    assert dup_methods == [], f"Duplicate method definitions found: {dup_methods}"
+
+    db_dir = backend_root / "storage" / "db"
+    mixin_methods: dict[str, list[str]] = defaultdict(list)
+    for path in sorted(db_dir.glob("*_repo.py")) + [db_dir / "migrations.py"]:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef):
+                        mixin_methods[item.name].append(f"{path.name}:{node.name}:{item.lineno}")
+    collisions = {name: locs for name, locs in sorted(mixin_methods.items()) if len(locs) > 1}
+    assert collisions == {}, f"FlywheelDB mixin method collisions: {collisions}"
+
+
+_SHARED_LEAF_PRIMITIVES = frozenset(
+    {
+        "ai_flywheel.models",
+        "ai_flywheel.config",
+        "ai_flywheel.core.time_utils",
+        "ai_flywheel.core.privacy",
+        "ai_flywheel.core.markdown_utils",
+        "ai_flywheel.core.approval_channel",
+    }
+)
+
+_DEPRECATED_SHIM_MODULES = frozenset(
+    {
+        "ai_flywheel.adapters.wiki_gate",
+        "ai_flywheel.core.feishu_card",
+        "ai_flywheel.core.feishu_channel",
+        "ai_flywheel.core.feishu_listen",
+        "ai_flywheel.core.feishu_check",
+    }
+)
+
+# Zero upward layer exceptions across the backend (PD-002 resolved in B10).
+_KNOWN_LAYER_EXCEPTIONS: frozenset[tuple[str, str]] = frozenset()
+
+
+def _backend_runtime_import_graph() -> dict[str, set[str]]:
+    """Runtime-only internal import graph of ``ai_flywheel`` (skipping ``if TYPE_CHECKING:``)."""
+    import ast
+    from collections import defaultdict
+
+    backend_root = REPO_ROOT / "backend" / "ai_flywheel"
+    edges: dict[str, set[str]] = defaultdict(set)
+
+    def _module_name(path: Path) -> str:
+        rel = path.relative_to(backend_root).with_suffix("")
+        parts = list(rel.parts)
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        return "ai_flywheel" + ("." + ".".join(parts) if parts else "")
+
+    for path in sorted(backend_root.rglob("*.py")):
+        mod = _module_name(path)
+        edges.setdefault(mod, set())
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+        class _Visitor(ast.NodeVisitor):
+            def visit_If(self, node: ast.If) -> None:
+                if isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING":
+                    return
+                self.generic_visit(node)
+
+            def visit_Import(self, node: ast.Import) -> None:
+                for alias in node.names:
+                    if alias.name.startswith("ai_flywheel"):
+                        edges[mod].add(alias.name)
+
+            def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+                if node.module and node.module.startswith("ai_flywheel"):
+                    edges[mod].add(node.module)
+                elif node.level > 0:
+                    base = mod.split(".")
+                    if path.name != "__init__.py":
+                        base = base[:-1]
+                    up = node.level - 1
+                    if up > 0:
+                        base = base[:-up]
+                    target = ".".join(base + ([node.module] if node.module else []))
+                    edges[mod].add(target)
+
+        _Visitor().visit(tree)
+
+    return edges
+
+
+def test_no_runtime_circular_imports_in_backend():
+    """后端运行时模块依赖图必须是有向无环图（DAG），禁止引入循环依赖。"""
+    edges = _backend_runtime_import_graph()
+    idx = 0
+    indices: dict[str, int] = {}
+    low: dict[str, int] = {}
+    stack: list[str] = []
+    on_stack: set[str] = set()
+    cycles: list[list[str]] = []
+
+    def _strongconnect(v: str) -> None:
+        nonlocal idx
+        indices[v] = low[v] = idx
+        idx += 1
+        stack.append(v)
+        on_stack.add(v)
+        for w in sorted(edges.get(v, ())):
+            if w not in indices:
+                _strongconnect(w)
+                low[v] = min(low[v], low[w])
+            elif w in on_stack:
+                low[v] = min(low[v], indices[w])
+        if low[v] == indices[v]:
+            comp: list[str] = []
+            while True:
+                w = stack.pop()
+                on_stack.remove(w)
+                comp.append(w)
+                if w == v:
+                    break
+            if len(comp) > 1:
+                cycles.append(sorted(comp))
+
+    for node in sorted(set(edges) | {t for ts in edges.values() for t in ts}):
+        if node not in indices:
+            _strongconnect(node)
+
+    assert cycles == [], f"Runtime circular imports detected: {cycles}"
+
+
+def test_no_production_code_imports_legacy_shims():
+    """已清理的 5 个历史兼容壳不得回流到代码库，且任何后端或测试代码不得再引用它们。"""
+    import ast
+
+    backend_root = REPO_ROOT / "backend" / "ai_flywheel"
+    expected_gone = (
+        backend_root / "adapters" / "wiki_gate.py",
+        backend_root / "core" / "feishu_card.py",
+        backend_root / "core" / "feishu_channel.py",
+        backend_root / "core" / "feishu_listen.py",
+        backend_root / "core" / "feishu_check.py",
+    )
+    surviving = [p.relative_to(REPO_ROOT).as_posix() for p in expected_gone if p.exists()]
+    assert surviving == [], f"Deleted legacy shim file(s) reappeared: {surviving}"
+
+    offenders: list[str] = []
+    for root_dir in (backend_root, REPO_ROOT / "tests"):
+        for path in sorted(root_dir.rglob("*.py")):
+            rel = path.relative_to(REPO_ROOT).as_posix()
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.name in _DEPRECATED_SHIM_MODULES:
+                            offenders.append(f"{rel} -> {alias.name}")
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    if node.module in _DEPRECATED_SHIM_MODULES:
+                        offenders.append(f"{rel} -> {node.module}")
+                    for alias in node.names:
+                        cand = f"{node.module}.{alias.name}"
+                        if cand in _DEPRECATED_SHIM_MODULES:
+                            offenders.append(f"{rel} -> {cand}")
+    assert offenders == [], f"Legacy shim import(s) found: {offenders}"
+
+
+def test_shared_leaf_primitives_have_no_upward_dependencies():
+    """共享叶子原语（models/config/time_utils/privacy/markdown_utils/approval_channel）不得向上依赖。"""
+    edges = _backend_runtime_import_graph()
+    allowed = _SHARED_LEAF_PRIMITIVES | {"ai_flywheel"}
+    offenders: list[str] = []
+    for mod in sorted(_SHARED_LEAF_PRIMITIVES):
+        for target in sorted(edges.get(mod, ())):
+            if target not in allowed:
+                offenders.append(f"{mod} -> {target}")
+    assert offenders == [], f"Shared leaf primitive has upward dependency: {offenders}"
+
+
+def test_backend_respects_layered_dependency_direction():
+    """依赖方向必须服从 entry -> runtime -> core -> adapters -> storage -> leaf primitives。"""
+    edges = _backend_runtime_import_graph()
+    rank = {"entry": 5, "runtime": 4, "core": 3, "adapters": 2, "storage": 1, "leaf": 0}
+
+    def _layer(mod: str) -> str:
+        if mod == "ai_flywheel" or mod in _SHARED_LEAF_PRIMITIVES:
+            return "leaf"
+        parts = mod.split(".")
+        top = parts[1] if len(parts) > 1 else ""
+        if top in {"app", "cli", "mcp_server", "routes"}:
+            return "entry"
+        if top in {"runtime", "core", "adapters", "storage"}:
+            return top
+        return "leaf"
+
+    violations: list[str] = []
+    for src, targets in sorted(edges.items()):
+        if src in _DEPRECATED_SHIM_MODULES:
+            continue
+        sl = _layer(src)
+        for target in sorted(targets):
+            tl = _layer(target)
+            if tl == "leaf" or sl == "leaf":
+                continue
+            if rank[sl] < rank[tl] and (src, target) not in _KNOWN_LAYER_EXCEPTIONS:
+                violations.append(f"[{sl}->{tl}] {src} -> {target}")
+    assert violations == [], f"New layer dependency violations: {violations}"
+
+
+def test_no_ad_hoc_frontmatter_splitting_outside_markdown_utils():
+    """Markdown frontmatter 解析必须走 core.markdown_utils，禁止再散落 .split('---', 2)。"""
+    backend_root = REPO_ROOT / "backend" / "ai_flywheel"
+    offenders: list[str] = []
+    pattern = re.compile(r'\.split\(\s*["\']---["\']\s*,\s*2\s*\)')
+    for path in sorted(backend_root.rglob("*.py")):
+        rel = path.relative_to(backend_root).as_posix()
+        if rel == "core/markdown_utils.py":
+            continue
+        text = path.read_text(encoding="utf-8")
+        if pattern.search(text):
+            offenders.append(rel)
+    assert offenders == [], f"Ad-hoc frontmatter split('---', 2) found in: {offenders}"
+
+
+def test_frontend_http_transport_is_centralized():
+    """前端 HTTP 请求必须统一收口在 api.ts，SSE 连接统一收口在 App.tsx。"""
+    fetch_offenders: list[str] = []
+    sse_offenders: list[str] = []
+    for path in sorted(FRONTEND_SRC.rglob("*.ts*")):
+        rel = path.relative_to(FRONTEND_SRC).as_posix()
+        text = path.read_text(encoding="utf-8")
+        if rel != "api.ts" and re.search(r"\bfetch\s*\(", text):
+            fetch_offenders.append(rel)
+        if rel != "App.tsx" and re.search(r"\bnew\s+EventSource\s*\(", text):
+            sse_offenders.append(rel)
+    assert fetch_offenders == [], f"Direct fetch() outside api.ts: {fetch_offenders}"
+    assert sse_offenders == [], f"Direct EventSource() outside App.tsx: {sse_offenders}"
+
+
+def test_frontend_has_no_catch_any_or_as_any():
+    """前端捕获异常必须使用 unknown + lib/errors.ts:errorMessage，且禁止使用 as any 强转。"""
+    catch_any_re = re.compile(r"(?:\bcatch\s*\([^)]*:\s*any\b|\.catch\s*\(\s*\([^)]*:\s*any\b)")
+    as_any_re = re.compile(r"\bas\s+any\b")
+    catch_offenders: list[str] = []
+    cast_offenders: list[str] = []
+    for path in sorted(FRONTEND_SRC.rglob("*.ts*")):
+        rel = path.relative_to(FRONTEND_SRC).as_posix()
+        text = path.read_text(encoding="utf-8")
+        if catch_any_re.search(text):
+            catch_offenders.append(rel)
+        if as_any_re.search(text):
+            cast_offenders.append(rel)
+    assert catch_offenders == [], f"catch (...: any) found in frontend/src: {catch_offenders}"
+    assert cast_offenders == [], f"`as any` cast found in frontend/src: {cast_offenders}"

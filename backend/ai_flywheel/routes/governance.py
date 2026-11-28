@@ -1,21 +1,18 @@
-"""Governance: policies, rules, mistake observations, dissents, knowledge and skills."""
+"""Governance HTTP routes: thin transport adapter over policies, activation, receipts, and governance services."""
 from __future__ import annotations
 
-import hashlib
-from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from ai_flywheel.core.receipts import OutcomeGateError
-from ai_flywheel.core.retro_advisory import (
-    advise_retro_item,
-    build_retro_group_key,
-    normalize_retro_summary,
+from ai_flywheel.core.governance import (
+    GovernanceConflictError,
+    GovernanceNotFoundError,
+    GovernanceValidationError,
 )
-from ai_flywheel.core.time_utils import shanghai_today_ymd
+from ai_flywheel.core.receipts import OutcomeGateError
 from ai_flywheel.models import (
     CreateRuleRequest,
     PreflightRequest,
@@ -23,7 +20,6 @@ from ai_flywheel.models import (
     ReportSignalRequest,
     RetroStatus,
     RuleStatus,
-    SignalKind,
 )
 from ai_flywheel.runtime import FlywheelRuntime
 
@@ -72,6 +68,16 @@ class KnowledgeFreshnessBody(BaseModel):
     doc_path: str
     action: str
     freshness_tier: str | None = None
+
+
+def _raise_http(exc: Exception, *, validation_status: int = 422) -> None:
+    if isinstance(exc, GovernanceNotFoundError):
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if isinstance(exc, GovernanceConflictError):
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if isinstance(exc, GovernanceValidationError):
+        raise HTTPException(status_code=validation_status, detail=str(exc)) from exc
+    raise exc
 
 
 def build_governance_router(rt: FlywheelRuntime) -> APIRouter:
@@ -168,45 +174,11 @@ def build_governance_router(rt: FlywheelRuntime) -> APIRouter:
 
     @router.post("/api/site/observations/bulk-archive")
     def site_bulk_archive_observations(body: ObservationBulkArchiveBody) -> dict[str, Any]:
-        eligible_ids = [
-            obs_id
-            for obs_id in dict.fromkeys(body.obs_ids)
-            if (existing := rt.db.get_mistake_observation(obs_id))
-            and existing.get("status") == "observing"
-        ]
-        updated = rt.db.bulk_update_mistake_observation_status(eligible_ids, "archived")
-        if updated > 0:
-            rt.db.append_audit_event(
-                entity_type="mistake_observation",
-                entity_id="bulk",
-                event_type="observation_bulk_archived",
-                actor="portal",
-                summary=f"批量归档 {updated} 条观察错题",
-                payload={"obs_ids": eligible_ids},
-            )
-            rt.refresh_core_card()
-        return {"updated": updated}
+        return {"updated": rt.governance.bulk_archive_observations(body.obs_ids)}
 
     @router.post("/api/site/observations/bulk-restore")
     def site_bulk_restore_observations(body: ObservationBulkArchiveBody) -> dict[str, Any]:
-        eligible_ids = [
-            obs_id
-            for obs_id in dict.fromkeys(body.obs_ids)
-            if (existing := rt.db.get_mistake_observation(obs_id))
-            and existing.get("status") == "archived"
-        ]
-        updated = rt.db.bulk_update_mistake_observation_status(eligible_ids, "observing")
-        if updated > 0:
-            rt.db.append_audit_event(
-                entity_type="mistake_observation",
-                entity_id="bulk",
-                event_type="observation_bulk_restored",
-                actor="portal",
-                summary=f"批量恢复 {updated} 条已归档错题至观察池",
-                payload={"obs_ids": eligible_ids},
-            )
-            rt.refresh_core_card()
-        return {"updated": updated}
+        return {"updated": rt.governance.bulk_restore_observations(body.obs_ids)}
 
     @router.post("/api/site/observations/{obs_id}/promote")
     def site_promote_observation(obs_id: str) -> dict[str, Any]:
@@ -219,45 +191,17 @@ def build_governance_router(rt: FlywheelRuntime) -> APIRouter:
 
     @router.post("/api/site/observations/{obs_id}/archive")
     def site_archive_observation(obs_id: str) -> dict[str, Any]:
-        existing = rt.db.get_mistake_observation(obs_id)
-        if not existing:
-            raise HTTPException(status_code=404, detail="Observation not found")
-        if existing.get("status") != "observing":
-            raise HTTPException(
-                status_code=409,
-                detail=f"Cannot archive observation in status '{existing.get('status')}'",
-            )
-        updated = rt.db.update_mistake_observation_status(obs_id, "archived")
-        rt.db.append_audit_event(
-            entity_type="mistake_observation",
-            entity_id=obs_id,
-            event_type="observation_archived",
-            actor="portal",
-            summary="归档观察错题",
-        )
-        rt.refresh_core_card()
-        return {"observation": updated}
+        try:
+            return {"observation": rt.governance.archive_observation(obs_id)}
+        except Exception as exc:
+            _raise_http(exc)
 
     @router.post("/api/site/observations/{obs_id}/restore")
     def site_restore_observation(obs_id: str) -> dict[str, Any]:
-        existing = rt.db.get_mistake_observation(obs_id)
-        if not existing:
-            raise HTTPException(status_code=404, detail="Observation not found")
-        if existing.get("status") != "archived":
-            raise HTTPException(
-                status_code=409,
-                detail=f"Only archived observations can be restored (current: '{existing.get('status')}')",
-            )
-        updated = rt.db.update_mistake_observation_status(obs_id, "observing")
-        rt.db.append_audit_event(
-            entity_type="mistake_observation",
-            entity_id=obs_id,
-            event_type="observation_restored",
-            actor="portal",
-            summary="撤销归档，恢复错题至观察池",
-        )
-        rt.refresh_core_card()
-        return {"observation": updated}
+        try:
+            return {"observation": rt.governance.restore_observation(obs_id)}
+        except Exception as exc:
+            _raise_http(exc)
 
     @router.get("/api/site/dissents")
     def site_list_dissents(
@@ -268,16 +212,17 @@ def build_governance_router(rt: FlywheelRuntime) -> APIRouter:
         safe_limit = max(1, min(int(limit), 500))
         dissents = rt.db.list_dissent_records(target_id=target_id, status=status, limit=safe_limit)
         rules_by_id = {r.rule_id: r for r in rt.db.list_rules()}
-        enriched: list[dict[str, Any]] = []
-        for d in dissents:
-            rule = rules_by_id.get(str(d.get("target_id") or "")) if d.get("target_type") == "rule" else None
-            enriched.append(
-                {
-                    **d,
-                    "target_title": rule.title if rule else "",
-                    "target_status": rule.status.value if rule else "",
-                }
+        enriched = [
+            {
+                **d,
+                "target_title": (rule.title if rule else ""),
+                "target_status": (rule.status.value if rule else ""),
+            }
+            for d in dissents
+            for rule in (
+                [rules_by_id.get(str(d.get("target_id") or "")) if d.get("target_type") == "rule" else None]
             )
+        ]
         return {"dissents": enriched, "total": len(enriched)}
 
     @router.post("/api/site/dissents")
@@ -321,35 +266,15 @@ def build_governance_router(rt: FlywheelRuntime) -> APIRouter:
 
     @router.get("/api/site/core-card")
     def site_core_card() -> dict[str, Any]:
-        # Read-only: a plain GET never rewrites the derived card on disk.
         return rt.read_core_card()
 
     @router.post("/api/site/core-card/refresh")
     def site_core_card_refresh() -> dict[str, Any]:
-        # The explicit rebuild: the card is a projection of the store, so it is
-        # only rewritten when the caller asks for it.
         return rt.refresh_core_card()
 
     @router.get("/api/site/retro")
     def site_list_retro(status: str | None = None, limit: int = 300) -> dict[str, Any]:
-        safe_limit = max(1, min(int(limit), 500))
-        items = rt.db.list_retro_items(status=status, limit=safe_limit)
-        active_queue_keys = rt.db.list_active_queue_session_keys()
-        user_prefs = rt.policies.get_policy("user_preferences") or {}
-        hard_gates = rt.policies.get_hard_gates()
-        enriched = []
-        for x in items:
-            has_queued_session = bool(x.session_key and x.session_key in active_queue_keys)
-            settlement_mode = "auto_next_batch" if has_queued_session else "manual_only"
-            dumped = x.model_dump(mode="json")
-            dumped["has_queued_session"] = has_queued_session
-            dumped["settlement_mode"] = settlement_mode
-            dumped["advisory"] = advise_retro_item(x, user_prefs=user_prefs, hard_gates=hard_gates)
-            enriched.append(dumped)
-        return {
-            "items": enriched,
-            "total": rt.db.count_retro_items(status=status),
-        }
+        return rt.governance.list_enriched_retro(status=status, limit=limit)
 
     @router.post("/api/site/signals")
     def site_report_signal(req: ReportSignalRequest) -> dict[str, Any]:
@@ -363,96 +288,13 @@ def build_governance_router(rt: FlywheelRuntime) -> APIRouter:
 
     @router.post("/api/site/retro/promote")
     def site_promote_retro(body: RetroPromoteBody) -> dict[str, Any]:
-        if not body.retro_ids:
-            raise HTTPException(status_code=400, detail="retro_ids cannot be empty")
-        items = rt.db.get_retro_items_by_ids(body.retro_ids)
-        if not items:
-            raise HTTPException(status_code=404, detail="No matching retro items found")
-
-        # Sort descending by created_at to use the latest item as primary
-        items.sort(key=lambda it: it.created_at, reverse=True)
-        primary = items[0]
-        found_ids = [it.retro_id for it in items]
-
-        kind_val = primary.kind.value if isinstance(primary.kind, SignalKind) else str(primary.kind)
-        if primary.rule_id:
-            root_cause_key = f"retro-rule-{primary.rule_id}"
-        else:
-            group_key = build_retro_group_key(primary)
-            sha = hashlib.sha256(group_key.encode("utf-8")).hexdigest()
-            kind_kebab = kind_val.replace("_", "-")
-            root_cause_key = f"retro-{kind_kebab}-{sha[:10]}"
-
-        title = normalize_retro_summary(primary.summary)[:80]
-        if body.severity_grade in {"red_silent", "yellow_caught", "green_minor"}:
-            grade = body.severity_grade
-        else:
-            is_high = (
-                primary.kind in {SignalKind.RULE_RECURRENCE, SignalKind.MISSING_EVIDENCE}
-                or kind_val in {"rule_recurrence", "missing_evidence"}
-                or primary.severity == "high"
+        try:
+            return rt.governance.promote_retro_items(
+                body.retro_ids,
+                severity_grade=body.severity_grade,
             )
-            grade = "red_silent" if is_high else "yellow_caught"
-
-        phenomenon = primary.summary
-        truth = f"来源实时异常线索（{kind_val}），需核查根因并固化验证/边界规则"
-
-        adv = advise_retro_item(
-            primary,
-            user_prefs=rt.policies.get_policy("user_preferences") or {},
-            hard_gates=rt.policies.get_hard_gates(),
-        )
-        thinking_root_cause = adv.get("reason", "")
-        caught_by = "tool"
-        session_key = primary.session_key or ""
-
-        obs, created = rt.db.upsert_mistake_observation(
-            root_cause_key=root_cause_key,
-            title=title,
-            severity_grade=grade,
-            phenomenon=phenomenon,
-            truth=truth,
-            thinking_root_cause=thinking_root_cause,
-            caught_by=caught_by,
-            session_key=session_key,
-        )
-
-        for other in items[1:]:
-            if other.session_key and other.session_key != primary.session_key:
-                obs, _ = rt.db.upsert_mistake_observation(
-                    root_cause_key=root_cause_key,
-                    title="",
-                    severity_grade=grade,
-                    phenomenon="",
-                    truth="",
-                    thinking_root_cause="",
-                    caught_by=caught_by,
-                    session_key=other.session_key,
-                )
-
-        updated = rt.db.bulk_update_retro_status(found_ids, RetroStatus.RESOLVED)
-
-        rt.db.append_audit_event(
-            entity_type="retro_queue",
-            entity_id=primary.retro_id,
-            event_type="retro_promoted_to_observation",
-            actor="portal",
-            summary=f"实时异常线索转入错题观察池：{obs.get('title', '')}",
-            payload={
-                "obs_id": obs.get("obs_id"),
-                "root_cause_key": root_cause_key,
-                "retro_ids": found_ids,
-                "resolved_count": updated,
-            },
-        )
-        rt.refresh_core_card()
-
-        return {
-            "observation": obs,
-            "created": created,
-            "resolved_count": updated,
-            "retro_ids": found_ids,
-        }
+        except Exception as exc:
+            _raise_http(exc, validation_status=400)
 
     @router.post("/api/site/retro/{retro_id}/status")
     def site_update_retro(retro_id: str, body: RetroStatusBody) -> dict[str, Any]:
@@ -464,140 +306,18 @@ def build_governance_router(rt: FlywheelRuntime) -> APIRouter:
     # ---- Knowledge Sink Preview (enriched with freshness & effectiveness metrics) ----
     @router.get("/api/site/knowledge")
     def site_list_knowledge(limit: int = 200) -> dict[str, Any]:
-        safe_limit = max(1, min(int(limit), 500))
-        today = shanghai_today_ymd()
-        docs = rt.knowledge.list_documents(limit=safe_limit)
-        freshness_map = rt.db.get_knowledge_freshness_map()
-
-        def _is_card_expired(finfo: dict[str, Any]) -> bool:
-            if not finfo:
-                return False
-            if finfo.get("freshness_state") in {"archived", "superseded"}:
-                return False
-            if bool(finfo.get("is_expired")):
-                return True
-            valid_until = str(finfo.get("valid_until") or "")
-            return bool(valid_until and valid_until < today)
-
-        by_path: dict[str, dict[str, Any]] = {}
-        for doc in docs:
-            doc_path = doc["doc_path"]
-            finfo = freshness_map.get(doc_path) or {}
-            by_path[doc_path] = {
-                **doc,
-                "freshness_tier": finfo.get("freshness_tier", "evolving"),
-                "last_verified_at": finfo.get("last_verified_at"),
-                "valid_until": finfo.get("valid_until"),
-                "freshness_state": finfo.get("freshness_state", "fresh"),
-                "is_expired": _is_card_expired(finfo),
-                "surface_count": int(finfo.get("surface_count") or 0),
-                "helped_count": int(finfo.get("helped_count") or 0),
-            }
-
-        # Ensure every tracked expired, archived, or surfaced card from freshness_map is visible
-        # even when the mounted knowledge base holds more than `limit` files.
-        for doc_path, finfo in freshness_map.items():
-            if doc_path in by_path:
-                continue
-            expired = _is_card_expired(finfo)
-            state = str(finfo.get("freshness_state") or "")
-            is_archived = state in {"archived", "superseded"}
-            if not expired and not is_archived and int(finfo.get("surface_count") or 0) == 0 and int(finfo.get("helped_count") or 0) == 0:
-                continue
-            stem = Path(doc_path).stem
-            by_path[doc_path] = {
-                "doc_path": doc_path,
-                "title": stem,
-                "size_bytes": 0,
-                "excerpt": "",
-                "freshness_tier": finfo.get("freshness_tier", "evolving"),
-                "last_verified_at": finfo.get("last_verified_at"),
-                "valid_until": finfo.get("valid_until"),
-                "freshness_state": finfo.get("freshness_state", "fresh"),
-                "is_expired": expired,
-                "surface_count": int(finfo.get("surface_count") or 0),
-                "helped_count": int(finfo.get("helped_count") or 0),
-            }
-
-        enriched = sorted(
-            by_path.values(),
-            key=lambda d: (
-                0 if d["is_expired"] else 1,
-                str(d.get("valid_until") or "9999-99-99"),
-                str(d.get("doc_path") or ""),
-            ),
-        )
-        expired_total = sum(1 for d in enriched if d["is_expired"])
-        return {
-            "sink_type": rt.cfg.knowledge_sink.type,
-            "root": str(rt.knowledge.root),
-            "documents": enriched,
-            "total": len(enriched),
-            "expired_total": expired_total,
-        }
+        return rt.governance.list_enriched_knowledge(limit=limit)
 
     @router.post("/api/site/knowledge/freshness")
     def site_update_knowledge_freshness(body: KnowledgeFreshnessBody) -> dict[str, Any]:
-        doc_path = body.doc_path.strip()
-        if not doc_path:
-            raise HTTPException(status_code=422, detail="doc_path is required")
-        action = body.action.strip().lower()
-        if action not in {"verify", "archive", "restore", "set_tier"}:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Invalid action '{body.action}'. Must be one of verify, archive, restore, set_tier",
-            )
-        tier = (body.freshness_tier or "").strip().lower() or None
-        if action == "set_tier":
-            if not tier or tier not in {"volatile", "evolving", "evergreen"}:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Invalid freshness_tier '{body.freshness_tier}'. Must be volatile, evolving, or evergreen",
-                )
-        elif tier and tier not in {"volatile", "evolving", "evergreen"}:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Invalid freshness_tier '{body.freshness_tier}'. Must be volatile, evolving, or evergreen",
-            )
-
-        today = shanghai_today_ymd()
         try:
-            card = rt.db.update_knowledge_freshness_action(
-                doc_path,
-                action,
-                today_ymd=today,
-                freshness_tier=tier,
+            return rt.governance.update_knowledge_freshness(
+                doc_path=body.doc_path,
+                action=body.action,
+                freshness_tier=body.freshness_tier,
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-        action_labels = {
-            "verify": "确认笔记有效并顺延保鲜期",
-            "archive": "移出待复核（台账归档）",
-            "restore": "恢复保鲜跟踪",
-            "set_tier": f"调整保鲜档位为 {tier}",
-        }
-        rt.db.append_audit_event(
-            entity_type="knowledge_card",
-            entity_id=doc_path,
-            event_type=f"knowledge_freshness_{action}",
-            actor="portal",
-            summary=f"人工台账复核：{action_labels.get(action, action)}（{doc_path}）",
-            payload={
-                "doc_path": doc_path,
-                "action": action,
-                "freshness_tier": tier,
-                "card": card,
-            },
-        )
-        rt.refresh_core_card()
-
-        freshness_map = rt.db.get_knowledge_freshness_map()
-        expired_total = sum(1 for finfo in freshness_map.values() if finfo.get("is_expired"))
-        return {
-            "card": card,
-            "expired_total": expired_total,
-        }
+        except Exception as exc:
+            _raise_http(exc)
 
     @router.get("/api/site/knowledge/doc")
     def site_read_knowledge(path: str) -> dict[str, Any]:
@@ -609,55 +329,7 @@ def build_governance_router(rt: FlywheelRuntime) -> APIRouter:
     # ---- Skill Effectiveness Ledger & Read-Only Preview ----
     @router.get("/api/site/skills")
     def site_list_skills() -> dict[str, Any]:
-        db_skills = rt.db.list_skill_assets()
-        probed = rt.activation.probe_local_skills()
-        probed_by_name = {str(p.get("name") or ""): p for p in probed if p.get("name")}
-        merged_by_name: dict[str, dict[str, Any]] = {}
-
-        for row in db_skills:
-            name = str(row.get("skill_name") or "")
-            if not name:
-                continue
-            pinfo = probed_by_name.get(name) or {}
-            merged_by_name[name] = {
-                **row,
-                "description": str(row.get("description") or pinfo.get("description") or "").strip(),
-                "path": str(row.get("path") or pinfo.get("path") or ""),
-                "probed": name in probed_by_name,
-            }
-
-        for name, pinfo in probed_by_name.items():
-            if name in merged_by_name:
-                continue
-            merged_by_name[name] = {
-                "skill_name": name,
-                "path": str(pinfo.get("path") or ""),
-                "description": str(pinfo.get("description") or "").strip(),
-                "origin": "local_probed",
-                "invoke_count": 0,
-                "verified_pass_count": 0,
-                "fail_count": 0,
-                "health_state": "untested",
-                "version": 1,
-                "last_used_at": None,
-                "created_at": "",
-                "updated_at": "",
-                "probed": True,
-            }
-
-        merged = sorted(
-            merged_by_name.values(),
-            key=lambda s: (
-                0 if (int(s.get("fail_count") or 0) >= 3 or s.get("health_state") == "failing") else 1,
-                -int(s.get("invoke_count") or 0),
-                str(s.get("skill_name") or "").lower(),
-            ),
-        )
-        return {
-            "skills": merged,
-            "probed_count": len(probed),
-            "tracked_count": len(db_skills),
-        }
+        return rt.governance.list_merged_skills()
 
     @router.get("/api/site/skills/{skill_name}/preview")
     def site_skill_preview(skill_name: str) -> dict[str, Any]:

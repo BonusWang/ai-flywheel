@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from ai_flywheel.adapters.wiki_gate import (
+from ai_flywheel.adapters.wiki import (
     UPDATE_NO_NEW_CONTENT,
     WikiGateError,
     merge_domain_increment,
@@ -268,7 +268,7 @@ def test_gate_blocks_bad_write_and_rolls_back_update(tmp_path: Path):
 
 
 def test_gate_rolls_back_when_postflight_blocks(tmp_path: Path):
-    from ai_flywheel.adapters.wiki_gate import resolve_bash_executable
+    from ai_flywheel.adapters.wiki import resolve_bash_executable
 
     bash = resolve_bash_executable("bash")
     if not bash or not Path(bash).is_file():
@@ -1528,7 +1528,7 @@ def test_the_sink_merges_again_and_stops_when_the_result_cannot_be_trusted(
     from dataclasses import replace
 
     from ai_flywheel.adapters import knowledge as knowledge_module
-    from ai_flywheel.adapters.wiki_gate import MergeResult
+    from ai_flywheel.adapters.wiki import MergeResult
 
     rt = _deposit_runtime(tmp_path)
     target = rt.knowledge.root / ORDERS_REL
@@ -1736,7 +1736,7 @@ def test_two_increments_for_the_same_page_written_at_once_both_land(
 
 
 def test_d2_postflight_failure_rolls_back_a_domain_increment_and_a_new_page(tmp_path: Path):
-    from ai_flywheel.adapters.wiki_gate import resolve_bash_executable
+    from ai_flywheel.adapters.wiki import resolve_bash_executable
 
     bash = resolve_bash_executable("bash")
     if not bash or not Path(bash).is_file():

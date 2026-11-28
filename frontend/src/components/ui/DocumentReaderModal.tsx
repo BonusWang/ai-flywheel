@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { Loader2 } from 'lucide-react'
 import { api } from '../../api'
+import { errorMessage } from '../../lib/errors'
 import { MarkdownView } from '../MarkdownView'
 import { CopyButton } from '../CodeBlock'
 import { Modal } from './Modal'
@@ -57,8 +58,8 @@ export const DocumentReaderModal: React.FC<{
       .then((res) => {
         if (!cancelled) setContent(res.content)
       })
-      .catch((e: any) => {
-        if (!cancelled) setError(e?.message || '读取知识笔记失败')
+      .catch((e: unknown) => {
+        if (!cancelled) setError(errorMessage(e, '读取知识笔记失败'))
       })
       .finally(() => {
         if (!cancelled) setLoading(false)
@@ -79,8 +80,8 @@ export const DocumentReaderModal: React.FC<{
       setCurrentFreshness(res.card)
       onFreshnessUpdated?.(res.card)
       toast.push('已确认笔记仍有效，保鲜期已顺延')
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '更新保鲜状态失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '更新保鲜状态失败') })
     } finally {
       setActionBusy(false)
     }
@@ -109,8 +110,8 @@ export const DocumentReaderModal: React.FC<{
           onFreshnessUpdated?.(undoRes.card)
         },
       })
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '归档操作失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '归档操作失败') })
     } finally {
       setActionBusy(false)
     }
@@ -127,8 +128,8 @@ export const DocumentReaderModal: React.FC<{
       setCurrentFreshness(res.card)
       onFreshnessUpdated?.(res.card)
       toast.push('已恢复保鲜跟踪')
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '恢复保鲜跟踪失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '恢复保鲜跟踪失败') })
     } finally {
       setActionBusy(false)
     }
@@ -147,8 +148,8 @@ export const DocumentReaderModal: React.FC<{
       onFreshnessUpdated?.(res.card)
       const tierName = tier === 'volatile' ? '30天' : tier === 'evolving' ? '90天' : '180天'
       toast.push(`已将保鲜档位调整为 ${tierName}`)
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '调整档位失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '调整档位失败') })
     } finally {
       setActionBusy(false)
     }

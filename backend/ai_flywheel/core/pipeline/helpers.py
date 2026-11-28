@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ai_flywheel.adapters.knowledge import KnowledgeSinkAdapter
-from ai_flywheel.adapters.wiki_gate import (
+from ai_flywheel.adapters.wiki import (
     CREATE_TARGET_EXISTS,
     UNROUTED_REASON_LABEL,
     RouteDecision,
@@ -179,7 +179,7 @@ def eligible_promotions(db: FlywheelDB, candidates: list[dict[str, Any]]) -> lis
     return eligible
 
 
-def promote_observation(db: FlywheelDB, rule_id: str, obs_id: Any, root_cause_key: Any) -> str | None:
+def link_rule_to_observation(db: FlywheelDB, rule_id: str, obs_id: Any, root_cause_key: Any) -> str | None:
     """Link a freshly registered rule to the mistake observation it came from.
 
     The rule carries either the observation id or the root cause key; both are

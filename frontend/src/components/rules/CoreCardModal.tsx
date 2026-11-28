@@ -1,6 +1,7 @@
 import React, { useState } from 'react'
 import { RefreshCw } from 'lucide-react'
 import { api } from '../../api'
+import { errorMessage } from '../../lib/errors'
 import { MarkdownView } from '../MarkdownView'
 import { Modal } from '../ui/Modal'
 import { useToast } from '../ui/Toast'
@@ -28,8 +29,8 @@ export const CoreCardModal: React.FC<{
       const updated = await api.refreshCoreCard()
       onRebuilt?.(updated)
       toast.push('已重建 AI 随身速查卡（FLYWHEEL-CORE.md）')
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '重建速查卡失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '重建速查卡失败') })
     } finally {
       setRefreshing(false)
     }

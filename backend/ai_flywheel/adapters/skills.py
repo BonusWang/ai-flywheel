@@ -8,13 +8,12 @@ from typing import Any
 import yaml
 
 from ai_flywheel.config import FlywheelConfig
+from ai_flywheel.core.markdown_utils import parse_frontmatter, split_frontmatter
 from ai_flywheel.core.privacy import sanitize_and_check_secrets
 from ai_flywheel.core.time_utils import shanghai_today_ymd
 
 _SKILL_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 
-# A YAML frontmatter block at the very beginning of a document.
-_FRONT_MATTER_RE = re.compile(r"\A---[ \t]*\r?\n(?P<meta>.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
 # A level-1 heading (a level-2 heading does not match: `##` is not followed by a space).
 _H1_RE = re.compile(r"^#[ \t]+(?P<title>.+?)[ \t]*#*[ \t]*$")
 # A level-2 heading.
@@ -27,27 +26,10 @@ class SkillWriteError(RuntimeError):
     """Raised when a proposed Skill write violates naming, path, or SKILL.md format gates."""
 
 
-def _parse_frontmatter(text: str) -> dict[str, Any]:
-    """The top-level YAML mapping of a markdown document, or an empty mapping when there is none."""
-    stripped = (text or "").strip()
-    if not stripped.startswith("---"):
-        return {}
-    parts = stripped.split("---", 2)
-    if len(parts) < 3:
-        return {}
-    try:
-        loaded = yaml.safe_load(parts[1])
-    except yaml.YAMLError:
-        return {}
-    return loaded if isinstance(loaded, dict) else {}
-
-
 def _strip_frontmatter(text: str) -> str:
     """Drop a leading YAML frontmatter block. Text without one is returned unchanged."""
-    match = _FRONT_MATTER_RE.match((text or "").strip())
-    if not match:
-        return text
-    return text.strip()[match.end():]
+    fm_text, body = split_frontmatter((text or "").lstrip())
+    return body if fm_text is not None else text
 
 
 def _strip_leading_h1(text: str) -> str:
@@ -136,7 +118,7 @@ def _resolve_skill_file(skills_root: Path, skill_name: str) -> Path | None:
             text = skill_md.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        if str(_parse_frontmatter(text).get("name") or "").strip() == skill_name:
+        if str(parse_frontmatter(text)[0].get("name") or "").strip() == skill_name:
             return skill_md
     return None
 
@@ -150,21 +132,22 @@ def validate_skill_markdown(skill_name: str, content: str) -> dict[str, str]:
         raise SkillWriteError(
             f"Invalid skill folder name '{skill_name}': must be lowercase alphanumeric + hyphens (2-63 chars)."
         )
-    text = content.strip()
-    if not text.startswith("---"):
+    text = (content or "").removeprefix("\ufeff").strip()
+    first_line = text.splitlines()[0].strip() if text else ""
+    if first_line != "---":
         raise SkillWriteError(f"Skill '{skill_name}' SKILL.md must start with YAML frontmatter (---).")
-    parts = text.split("---", 2)
-    if len(parts) < 3:
+    fm_text, raw_body = split_frontmatter(text)
+    if fm_text is None:
         raise SkillWriteError(f"Skill '{skill_name}' SKILL.md has unclosed YAML frontmatter.")
     try:
-        meta = yaml.safe_load(parts[1]) or {}
+        meta = yaml.safe_load(fm_text) or {}
     except yaml.YAMLError as exc:
         raise SkillWriteError(f"Skill '{skill_name}' frontmatter YAML parse error: {exc}") from exc
     if not isinstance(meta, dict):
         raise SkillWriteError(f"Skill '{skill_name}' frontmatter must be a YAML mapping.")
     name = str(meta.get("name") or "").strip()
     desc = str(meta.get("description") or "").strip()
-    body = parts[2].strip()
+    body = raw_body.strip()
     if not name:
         raise SkillWriteError(f"Skill '{skill_name}' frontmatter missing required 'name'.")
     if not desc:

@@ -102,7 +102,6 @@ class KnowledgeSinkAdapter:
         self.cfg = cfg
         self.db = db
         self.wiki_gate = WikiGate(cfg)
-        self._schema_loader: WikiSchemaLoader | None = None
 
     @property
     def root(self) -> Path:
@@ -116,12 +115,8 @@ class KnowledgeSinkAdapter:
 
     @property
     def schema_loader(self) -> WikiSchemaLoader:
-        """The contract reader for the current root; the root follows the configuration."""
-        loader = self._schema_loader
-        if loader is None or loader.root != self.root:
-            loader = WikiSchemaLoader(self.root)
-            self._schema_loader = loader
-        return loader
+        """The single contract reader shared with ``wiki_gate`` for the current root."""
+        return self.wiki_gate.schema_loader
 
     def _safe_resolve(self, relative_path: str) -> Path:
         norm = relative_path.replace("\\", "/").lstrip("/")

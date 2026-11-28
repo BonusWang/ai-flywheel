@@ -145,21 +145,189 @@ def _plan_write_caps(cfg: FlywheelConfig, routing_candidates: RoutingCandidates 
     return min(max(0, int(cfg.workflow.max_domain_writes_per_run)), total), total
 
 
-class CliSubprocessRunner(BaseWorkflowRunner):
-    """Configurable local CLI subprocess runner (e.g. codex / claude CLI) with receipt caching."""
+class _CachedModelRunner(BaseWorkflowRunner):
+    """Shared prompt/validate/cache orchestration for real runners (CLI subprocess & HTTP API).
+
+    Subclasses own only their transport (`_invoke_stage`), cache key (`_cache_file`),
+    source tags (`_review_source`, `_plan_source`), and stage metadata (`_stage_model`,
+    `_review_runner_label`). All validation, no-fallback failure handling, and
+    post-validation caching stay in one canonical place.
+    """
+
+    _review_source: str = ""
+    _plan_source: str = ""
+    _supports_repair: bool = False
 
     def __init__(self, cfg: FlywheelConfig, fs_store: ImmutableFileStore) -> None:
         self.cfg = cfg
         self.fs_store = fs_store
 
-    def _cache_file(self, stage: str, prompt: str) -> Path:
-        prompt_hash = canonical_hash({"stage": stage, "cmd": self.cfg.runner.cli.command, "prompt": prompt})
-        return self.fs_store.root / "cli_cache" / f"{stage}-{prompt_hash[:16]}.json"
-
     @staticmethod
     def _persist_cache(cache_file: Path, parsed: Any) -> bool:
         """Write a validated reply to the cache — unless it carries a credential, see `_write_reply_cache`."""
         return _write_reply_cache(cache_file, parsed)
+
+    def _cache_file(self, stage: str, prompt: str) -> Path:
+        raise NotImplementedError
+
+    def _invoke_stage(
+        self,
+        stage: str,
+        prompt: str,
+        *,
+        repair_schema_hint: str | None = None,
+        reply_trace: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    def _stage_model(self, stage: str) -> str | None:
+        return None
+
+    def _review_runner_label(self, model: str | None) -> str:
+        raise NotImplementedError
+
+    def review_sessions(
+        self,
+        sessions: list[tuple[SessionRecord, str]],
+        open_retros: list[RetroItem],
+        *,
+        existing_skills: list[dict[str, Any]] | None = None,
+        phase: str = "daily",
+    ) -> dict[str, Any]:
+        """P02 from the runner reply only: an unusable reply fails the node, it never falls back."""
+        model = self._stage_model(P02_STAGE)
+        prompt = _build_p02_prompt(
+            sessions,
+            open_retros,
+            existing_skills,
+            phase,
+            session_char_limit=self.cfg.runner.api.p02_session_char_limit,
+        )
+        cache_file = self._cache_file(P02_STAGE, prompt)
+        reply_trace: dict[str, Any] = {}
+        repair_hint = (
+            '{"findings":[...],"events":[...],"mistakes":[...],"dissents":[...],"repeated_workflows":[...]}'
+            if self._supports_repair
+            else None
+        )
+        parsed = self._invoke_stage(
+            P02_STAGE,
+            prompt,
+            repair_schema_hint=repair_hint,
+            reply_trace=reply_trace,
+        )
+        cache_hit = reply_trace.get("cache_hit", cache_file.exists())
+        review_kwargs: dict[str, Any] = {
+            "source": self._review_source,
+            "phase": phase,
+            "sessions_sent": min(len(sessions), P02_MAX_SESSIONS),
+            "output_chars": reply_trace.get("output_chars"),
+            "repair_attempted": bool(reply_trace.get("repair_attempted")) if self._supports_repair else False,
+            "parse_error": reply_trace.get("parse_error"),
+            "cache_file": cache_file.name,
+            "cache_hit": cache_hit,
+            "cache_file_present": cache_hit,
+        }
+        if self._supports_repair:
+            review_kwargs["repair_parse_error"] = reply_trace.get("repair_parse_error")
+            review_kwargs["repair_error"] = reply_trace.get("repair_error")
+            review_kwargs["call_telemetry"] = reply_trace.get("call_telemetry")
+        review = _review_from_runner_output(parsed, **review_kwargs)
+        _cache_review_reply(self._persist_cache, cache_file, parsed, cache_hit, review=review)
+        review["runner"] = self._review_runner_label(model)
+        review["sent_session_keys"] = [s.session_key for s, _ in sessions[:P02_MAX_SESSIONS]]
+        return review
+
+    def plan_writes_detailed(
+        self,
+        review_findings: dict[str, Any],
+        existing_rules: list[RuleRecord],
+        max_write_set: int,
+        default_doc_prefix: str = "lessons/",
+        *,
+        existing_skills: list[dict[str, Any]] | None = None,
+        phase: str = "daily",
+        routing_candidates: RoutingCandidates | None = None,
+    ) -> PlanOutcome:
+        """P03 from the runner reply only: an unusable reply fails the node, it never falls back."""
+        domain_page_types = deposit_page_types(routing_candidates)
+        max_domain_writes, total_write_set = _plan_write_caps(self.cfg, routing_candidates)
+        model = self._stage_model(P03_STAGE)
+        prompt = _build_p03_prompt(
+            review_findings,
+            existing_rules,
+            existing_skills,
+            max_write_set,
+            default_doc_prefix,
+            phase,
+            routing_candidates=routing_candidates,
+            existing_skill_sections=_existing_skill_sections(review_findings, self.cfg.primary_skills_dir),
+            max_domain_writes=max_domain_writes,
+            total_write_set=total_write_set,
+        )
+        cache_file = self._cache_file(P03_STAGE, prompt)
+        repair_hint: str | None = None
+        if self._supports_repair:
+            repair_hint = (
+                P03_REPAIR_SCHEMA_HINT_WITH_ROUTE
+                if routing_candidates is not None and routing_candidates.routable
+                else P03_REPAIR_SCHEMA_HINT
+            )
+        reply_trace: dict[str, Any] = {}
+        parsed = self._invoke_stage(
+            P03_STAGE,
+            prompt,
+            repair_schema_hint=repair_hint,
+            reply_trace=reply_trace,
+        )
+        cache_hit = reply_trace.get("cache_hit", cache_file.exists())
+        plan_kwargs: dict[str, Any] = {
+            "source": self._plan_source,
+            "max_write_set": max_write_set,
+            "default_doc_prefix": default_doc_prefix,
+            "skills_root": self.cfg.primary_skills_dir,
+            "cache_file": cache_file.name,
+            "cache_hit": cache_hit,
+            "cache_file_present": cache_hit,
+            "reply_trace": reply_trace,
+            "domain_page_types": domain_page_types,
+            "max_domain_writes": max_domain_writes,
+            "total_write_set": total_write_set,
+        }
+        if model is not None:
+            plan_kwargs["model"] = model
+        outcome = _plan_from_runner_output(parsed, **plan_kwargs)
+        _cache_plan_reply(self._persist_cache, cache_file, parsed, outcome)
+        return outcome
+
+    def plan_writes(self, *args: Any, **kwargs: Any) -> list[PlannedWrite]:
+        """The plan alone; same contract and failures as `plan_writes_detailed`."""
+        return self.plan_writes_detailed(*args, **kwargs).planned_writes
+
+
+class CliSubprocessRunner(_CachedModelRunner):
+    """Configurable local CLI subprocess runner (e.g. codex / claude CLI) with receipt caching."""
+
+    _review_source = REVIEW_SOURCE_CLI
+    _plan_source = PLAN_SOURCE_CLI
+    _supports_repair = False
+
+    def _cache_file(self, stage: str, prompt: str) -> Path:
+        prompt_hash = canonical_hash({"stage": stage, "cmd": self.cfg.runner.cli.command, "prompt": prompt})
+        return self.fs_store.root / "cli_cache" / f"{stage}-{prompt_hash[:16]}.json"
+
+    def _review_runner_label(self, model: str | None) -> str:
+        return f"cli:{self.cfg.runner.cli.command}"
+
+    def _invoke_stage(
+        self,
+        stage: str,
+        prompt: str,
+        *,
+        repair_schema_hint: str | None = None,
+        reply_trace: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        return self._invoke_cli(stage, prompt, reply_trace=reply_trace)
 
     def _invoke_cli(
         self, stage: str, prompt: str, reply_trace: dict[str, Any] | None = None
@@ -209,93 +377,6 @@ class CliSubprocessRunner(BaseWorkflowRunner):
             reply_trace["parse_error"] = _json_parse_error(proc.stdout)
         return parsed
 
-    def review_sessions(
-        self,
-        sessions: list[tuple[SessionRecord, str]],
-        open_retros: list[RetroItem],
-        *,
-        existing_skills: list[dict[str, Any]] | None = None,
-        phase: str = "daily",
-    ) -> dict[str, Any]:
-        """P02 from the CLI output only: an unusable reply fails the node, it never falls back."""
-        prompt = _build_p02_prompt(
-            sessions, open_retros, existing_skills, phase,
-            session_char_limit=self.cfg.runner.api.p02_session_char_limit,
-        )
-        cache_file = self._cache_file(P02_STAGE, prompt)
-        reply_trace: dict[str, Any] = {}
-        parsed = self._invoke_cli(P02_STAGE, prompt, reply_trace=reply_trace)
-        cache_hit = reply_trace.get("cache_hit", cache_file.exists())
-        review = _review_from_runner_output(
-            parsed,
-            source=REVIEW_SOURCE_CLI,
-            phase=phase,
-            sessions_sent=min(len(sessions), P02_MAX_SESSIONS),
-            output_chars=reply_trace.get("output_chars"),
-            repair_attempted=False,  # only the API runner repairs JSON
-            parse_error=reply_trace.get("parse_error"),
-            cache_file=cache_file.name,
-            cache_hit=cache_hit,
-            cache_file_present=cache_hit,
-        )
-        # The review is usable: now the reply may be cached for the next identical batch.
-        _cache_review_reply(self._persist_cache, cache_file, parsed, cache_hit, review=review)
-        review["runner"] = f"cli:{self.cfg.runner.cli.command}"
-        review["sent_session_keys"] = [s.session_key for s, _ in sessions[:P02_MAX_SESSIONS]]
-        return review
-
-    def plan_writes_detailed(
-        self,
-        review_findings: dict[str, Any],
-        existing_rules: list[RuleRecord],
-        max_write_set: int,
-        default_doc_prefix: str = "lessons/",
-        *,
-        existing_skills: list[dict[str, Any]] | None = None,
-        phase: str = "daily",
-        routing_candidates: RoutingCandidates | None = None,
-    ) -> PlanOutcome:
-        domain_page_types = deposit_page_types(routing_candidates)
-        max_domain_writes, total_write_set = _plan_write_caps(self.cfg, routing_candidates)
-        prompt = _build_p03_prompt(
-            review_findings,
-            existing_rules,
-            existing_skills,
-            max_write_set,
-            default_doc_prefix,
-            phase,
-            routing_candidates=routing_candidates,
-            existing_skill_sections=_existing_skill_sections(review_findings, self.cfg.primary_skills_dir),
-            max_domain_writes=max_domain_writes,
-            total_write_set=total_write_set,
-        )
-        cache_file = self._cache_file(P03_STAGE, prompt)
-        reply_trace: dict[str, Any] = {}
-        parsed = self._invoke_cli(P03_STAGE, prompt, reply_trace=reply_trace)
-        cache_hit = reply_trace.get("cache_hit", cache_file.exists())
-        outcome = _plan_from_runner_output(
-            parsed,
-            source=PLAN_SOURCE_CLI,
-            max_write_set=max_write_set,
-            default_doc_prefix=default_doc_prefix,
-            skills_root=self.cfg.primary_skills_dir,
-            cache_file=cache_file.name,
-            cache_hit=cache_hit,
-            cache_file_present=cache_hit,
-            reply_trace=reply_trace,
-            domain_page_types=domain_page_types,
-            max_domain_writes=max_domain_writes,
-            total_write_set=total_write_set,
-        )
-        # The plan is usable: now the reply may be cached for the next identical batch —
-        # unless the privacy gate refused part of it, or a kept draft carries a credential.
-        _cache_plan_reply(self._persist_cache, cache_file, parsed, outcome)
-        return outcome
-
-    def plan_writes(self, *args: Any, **kwargs: Any) -> list[PlannedWrite]:
-        """The plan alone; same contract and failures as `plan_writes_detailed`."""
-        return self.plan_writes_detailed(*args, **kwargs).planned_writes
-
 
 def _cache_plan_reply(
     persist: Any, cache_file: Path, parsed: Any, outcome: PlanOutcome
@@ -324,12 +405,15 @@ def _cache_plan_reply(
     return written
 
 
-class OpenAICompatibleRunner(BaseWorkflowRunner):
+class OpenAICompatibleRunner(_CachedModelRunner):
     """OpenAI-compatible HTTP API runner (works with local routing gateways, OpenAI, DeepSeek, Ollama)."""
 
+    _review_source = REVIEW_SOURCE_MODEL
+    _plan_source = PLAN_SOURCE_MODEL
+    _supports_repair = True
+
     def __init__(self, cfg: FlywheelConfig, fs_store: ImmutableFileStore) -> None:
-        self.cfg = cfg
-        self.fs_store = fs_store
+        super().__init__(cfg, fs_store)
         # What the last model call cost, for the thread that made it. Reset on every call; a
         # stubbed call leaves it empty.
         self._call_telemetry: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
@@ -515,10 +599,26 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
         )
         return self.fs_store.root / "api_cache" / f"{stage}-{prompt_hash[:16]}.json"
 
-    @staticmethod
-    def _persist_cache(cache_file: Path, parsed: Any) -> bool:
-        """Write a validated reply to the cache — unless it carries a credential, see `_write_reply_cache`."""
-        return _write_reply_cache(cache_file, parsed)
+    def _stage_model(self, stage: str) -> str | None:
+        return self._resolve_stage_api_params(stage)[0]
+
+    def _review_runner_label(self, model: str | None) -> str:
+        return f"api:{model or ''}"
+
+    def _invoke_stage(
+        self,
+        stage: str,
+        prompt: str,
+        *,
+        repair_schema_hint: str | None = None,
+        reply_trace: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        return self._invoke_api(
+            stage,
+            prompt,
+            repair_schema_hint=repair_schema_hint,
+            reply_trace=reply_trace,
+        )
 
     def _invoke_api(
         self,
@@ -593,112 +693,6 @@ class OpenAICompatibleRunner(BaseWorkflowRunner):
                     reply_trace["repair_call_telemetry"] = dict(self._last_call_telemetry)
 
         return parsed
-
-    def review_sessions(
-        self,
-        sessions: list[tuple[SessionRecord, str]],
-        open_retros: list[RetroItem],
-        *,
-        existing_skills: list[dict[str, Any]] | None = None,
-        phase: str = "daily",
-    ) -> dict[str, Any]:
-        """P02 from the model reply only: an unusable reply fails the node, it never falls back."""
-        # The model the review really asks: the review's own when one is configured.
-        model, _effort = self._resolve_stage_api_params(P02_STAGE)
-        prompt = _build_p02_prompt(
-            sessions, open_retros, existing_skills, phase,
-            session_char_limit=self.cfg.runner.api.p02_session_char_limit,
-        )
-        cache_file = self._cache_file(P02_STAGE, prompt)
-        reply_trace: dict[str, Any] = {}
-        parsed = self._invoke_api(
-            P02_STAGE,
-            prompt,
-            repair_schema_hint='{"findings":[...],"events":[...],"mistakes":[...],"dissents":[...],"repeated_workflows":[...]}',
-            reply_trace=reply_trace,
-        )
-        cache_hit = reply_trace.get("cache_hit", cache_file.exists())
-        review = _review_from_runner_output(
-            parsed,
-            source=REVIEW_SOURCE_MODEL,
-            phase=phase,
-            sessions_sent=min(len(sessions), P02_MAX_SESSIONS),
-            output_chars=reply_trace.get("output_chars"),
-            repair_attempted=bool(reply_trace.get("repair_attempted")),
-            parse_error=reply_trace.get("parse_error"),
-            repair_parse_error=reply_trace.get("repair_parse_error"),
-            repair_error=reply_trace.get("repair_error"),
-            call_telemetry=reply_trace.get("call_telemetry"),
-            cache_file=cache_file.name,
-            cache_hit=cache_hit,
-            cache_file_present=cache_hit,
-        )
-        # The review is usable: now the reply may be cached for the next identical batch.
-        _cache_review_reply(self._persist_cache, cache_file, parsed, cache_hit, review=review)
-        review["runner"] = f"api:{model}"
-        review["sent_session_keys"] = [s.session_key for s, _ in sessions[:P02_MAX_SESSIONS]]
-        return review
-
-    def plan_writes_detailed(
-        self,
-        review_findings: dict[str, Any],
-        existing_rules: list[RuleRecord],
-        max_write_set: int,
-        default_doc_prefix: str = "lessons/",
-        *,
-        existing_skills: list[dict[str, Any]] | None = None,
-        phase: str = "daily",
-        routing_candidates: RoutingCandidates | None = None,
-    ) -> PlanOutcome:
-        """P03 from the model output only: an unusable reply fails the node, it never falls back."""
-        domain_page_types = deposit_page_types(routing_candidates)
-        max_domain_writes, total_write_set = _plan_write_caps(self.cfg, routing_candidates)
-        model, _effort = self._resolve_stage_api_params(P03_STAGE)
-        prompt = _build_p03_prompt(
-            review_findings,
-            existing_rules,
-            existing_skills,
-            max_write_set,
-            default_doc_prefix,
-            phase,
-            routing_candidates=routing_candidates,
-            existing_skill_sections=_existing_skill_sections(review_findings, self.cfg.primary_skills_dir),
-            max_domain_writes=max_domain_writes,
-            total_write_set=total_write_set,
-        )
-        cache_file = self._cache_file(P03_STAGE, prompt)
-        cache_hit = cache_file.exists()
-        repair_hint = (
-            P03_REPAIR_SCHEMA_HINT_WITH_ROUTE
-            if routing_candidates is not None and routing_candidates.routable
-            else P03_REPAIR_SCHEMA_HINT
-        )
-        reply_trace: dict[str, Any] = {}
-        parsed = self._invoke_api(P03_STAGE, prompt, repair_schema_hint=repair_hint, reply_trace=reply_trace)
-        cache_hit = reply_trace.get("cache_hit", cache_file.exists())
-        outcome = _plan_from_runner_output(
-            parsed,
-            source=PLAN_SOURCE_MODEL,
-            max_write_set=max_write_set,
-            default_doc_prefix=default_doc_prefix,
-            skills_root=self.cfg.primary_skills_dir,
-            cache_file=cache_file.name,
-            cache_hit=cache_hit,
-            cache_file_present=cache_hit,
-            reply_trace=reply_trace,
-            domain_page_types=domain_page_types,
-            max_domain_writes=max_domain_writes,
-            total_write_set=total_write_set,
-            model=model,
-        )
-        # The plan is usable: now the reply may be cached for the next identical batch —
-        # unless the privacy gate refused part of it, or a kept draft carries a credential.
-        _cache_plan_reply(self._persist_cache, cache_file, parsed, outcome)
-        return outcome
-
-    def plan_writes(self, *args: Any, **kwargs: Any) -> list[PlannedWrite]:
-        """The plan alone; same contract and failures as `plan_writes_detailed`."""
-        return self.plan_writes_detailed(*args, **kwargs).planned_writes
 
 
 def _cache_review_reply(

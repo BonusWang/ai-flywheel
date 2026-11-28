@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { ChevronDown } from 'lucide-react'
 import { api } from '../../api'
+import { errorMessage } from '../../lib/errors'
 import { MarkdownView } from '../MarkdownView'
 import { Collapse } from '../ui/Collapse'
 import type { PlannedWrite, SkillPreview } from '../../types'
@@ -30,8 +31,8 @@ export const SkillUpdatePanel: React.FC<{ pw: PlannedWrite }> = ({ pw }) => {
       .then((data) => {
         if (!cancelled) setPreview(data)
       })
-      .catch((e: any) => {
-        if (!cancelled) setError(e.message)
+      .catch((e: unknown) => {
+        if (!cancelled) setError(errorMessage(e, '读取 Skill 预览失败'))
       })
       .finally(() => {
         if (!cancelled) setLoading(false)

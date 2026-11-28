@@ -40,6 +40,7 @@ from ai_flywheel.core.queue_service import (
     render_structured_brief,
 )
 from ai_flywheel.core.triage import is_controlled_write_dispatch, triage_session
+from ai_flywheel.mcp_server import build_mcp_server
 from ai_flywheel.models import (
     DistillQueueItem,
     IngressChannel,
@@ -401,7 +402,8 @@ async def test_mcp_session_intent_enqueue_opt_out_withdraw_and_session_key_align
     assert vetoed["reason_code"] == "TOO_SHORT"
 
     # ...but an explicit MCP enqueue bypasses the noise filter at P0.
-    enqueued = await rt.mcp.call_tool(
+    mcp = build_mcp_server(rt)
+    enqueued = await mcp.call_tool(
         "flywheel_session_intent",
         {
             "action": "enqueue",
@@ -420,7 +422,7 @@ async def test_mcp_session_intent_enqueue_opt_out_withdraw_and_session_key_align
     assert queued[0].ingress_channel is IngressChannel.MCP_EXPLICIT
 
     # `opt_out` vetoes every future ARCHIVE / SessionEnd as USER_OPT_OUT.
-    await rt.mcp.call_tool(
+    await mcp.call_tool(
         "flywheel_session_intent",
         {
             "action": "opt_out",
@@ -442,12 +444,12 @@ async def test_mcp_session_intent_enqueue_opt_out_withdraw_and_session_key_align
     # `withdraw` pauses a queued item without banning a later re-enqueue.
     _enqueue(rt, "w-1")
     assert _statuses(rt, "claude-code:w-1") == ["queued"]
-    await rt.mcp.call_tool(
+    await mcp.call_tool(
         "flywheel_session_intent",
         {"action": "withdraw", "session_key": "claude-code:w-1"},
     )
     assert _statuses(rt, "claude-code:w-1") == ["withdrawn"]
-    await rt.mcp.call_tool(
+    await mcp.call_tool(
         "flywheel_session_intent",
         {
             "action": "enqueue",
@@ -469,7 +471,7 @@ async def test_mcp_session_intent_enqueue_opt_out_withdraw_and_session_key_align
         token[len("session=") :] for token in header.split(" · ") if token.startswith("session=")
     )
     assert aligned_key == "claude-code:align-1"
-    await rt.mcp.call_tool(
+    await mcp.call_tool(
         "flywheel_session_intent",
         {"action": "opt_out", "session_key": aligned_key, "reason": "联调验证"},
     )
@@ -1745,7 +1747,7 @@ VERIFICATION_BRIEF = "\n".join(
 
 async def _mcp(rt: FlywheelRuntime, tool: str, arguments: dict) -> dict:
     """Call one MCP tool in-process and return its structured result."""
-    result = await rt.mcp.call_tool(tool, arguments)
+    result = await build_mcp_server(rt).call_tool(tool, arguments)
     assert result.is_error is False, result
     assert isinstance(result.structured_content, dict), result
     return result.structured_content
@@ -3036,7 +3038,7 @@ def test_re_triage_never_overrides_a_hand_distilled_declaration(tmp_path: Path):
 async def test_the_mcp_surface_and_the_dictionary_know_the_new_intents(tmp_path: Path):
     """工具总数不变，新参数全部可选；排除原因字典能给出新码的名称。"""
     rt = _runtime(tmp_path)
-    tools = {tool.name: tool for tool in await rt.mcp.list_tools()}
+    tools = {tool.name: tool for tool in await build_mcp_server(rt).list_tools()}
     assert len(tools) == 7
     intent = tools["flywheel_session_intent"].input_schema
     assert {"wiki_paths", "governance_only"} <= set(intent["properties"])

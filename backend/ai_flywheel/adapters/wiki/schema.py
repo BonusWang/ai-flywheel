@@ -11,6 +11,7 @@ from typing import Any
 
 import yaml
 
+from ai_flywheel.core.markdown_utils import split_frontmatter
 from ai_flywheel.models import SENSITIVE_CONFIG_PAGE_TYPE
 
 # The schema contract of a mounted Wiki: never read back through the document surface.
@@ -49,19 +50,6 @@ def normalize_relative_path(relative_path: str) -> str:
     while rel.startswith("./"):
         rel = rel[2:]
     return rel.lstrip("/")
-
-
-def split_frontmatter(content: str) -> tuple[str | None, str]:
-    """Return (frontmatter_yaml_text, body).  None means frontmatter is absent."""
-    if content.startswith("\ufeff"):
-        content = content[1:]
-    lines = content.splitlines(keepends=True)
-    if not lines or lines[0].strip() != "---":
-        return None, content
-    for index in range(1, len(lines)):
-        if lines[index].strip() == "---":
-            return "".join(lines[1:index]), "".join(lines[index + 1 :])
-    return None, content
 
 
 def _mapping(raw: Any) -> dict[str, Any]:
@@ -242,7 +230,11 @@ class WikiSchemaLoader:
         """
         stat = self.schema_path.stat()
         if self._cache and self._cache[0] == stat.st_mtime:
-            return self._cache[1]
+            data = self._cache[1]
+            for key in required_blocks:
+                if not isinstance(data.get(key), dict):
+                    raise WikiGateError(f"{self.schema_path} is missing machine block '{key}'")
+            return data
         text = self.schema_path.read_text(encoding="utf-8", errors="replace")
         fm_text, _ = split_frontmatter(text)
         if fm_text is None:

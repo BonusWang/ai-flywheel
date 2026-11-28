@@ -5,9 +5,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from ai_flywheel.config import FlywheelConfig
+from ai_flywheel.core.markdown_utils import parse_frontmatter_file
 from ai_flywheel.core.policies import PolicyEngine
 from ai_flywheel.core.privacy import sanitize_and_check_secrets
 from ai_flywheel.models import (
@@ -22,23 +21,6 @@ from ai_flywheel.models import (
 )
 from ai_flywheel.storage.db import FlywheelDB
 from ai_flywheel.storage.fs_store import ImmutableFileStore, canonical_hash
-
-
-def _parse_frontmatter(path: Path) -> dict[str, Any]:
-    try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return {}
-    if not text.startswith("---"):
-        return {}
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return {}
-    try:
-        data = yaml.safe_load(parts[1])
-        return data if isinstance(data, dict) else {}
-    except yaml.YAMLError:
-        return {}
 
 
 class ActivationEngine:
@@ -65,7 +47,7 @@ class ActivationEngine:
             if not root.exists() or not root.is_dir():
                 continue
             for skill_md in sorted(root.glob("*/SKILL.md")):
-                fm = _parse_frontmatter(skill_md)
+                fm = parse_frontmatter_file(skill_md)
                 name = str(fm.get("name") or skill_md.parent.name)
                 if name in seen:
                     continue

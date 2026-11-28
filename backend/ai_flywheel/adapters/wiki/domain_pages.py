@@ -29,6 +29,7 @@ import yaml
 
 from ai_flywheel.adapters.wiki.schema import split_frontmatter
 from ai_flywheel.adapters.wiki.validator import _section_name
+from ai_flywheel.core.markdown_utils import trim_blank_lines
 
 # The line the Wiki's templates prescribe for a section that has no content yet.
 PLACEHOLDER = "无"
@@ -267,15 +268,6 @@ def _scope(body: list[str], mask: list[bool], section: _Section | None, table: _
     return _Scope(rows, text_lines, _code_blocks(body[section.start + 1 : section.end], inside))
 
 
-def _trim_blank(lines: list[str]) -> list[str]:
-    start, end = 0, len(lines)
-    while start < end and not lines[start].strip():
-        start += 1
-    while end > start and not lines[end - 1].strip():
-        end -= 1
-    return lines[start:end]
-
-
 def _content_end(lines: list[str], start: int, end: int) -> int:
     """One past the last non-blank line of a range (``start`` when the range is blank)."""
     index = end - 1
@@ -294,7 +286,7 @@ def _draft_layout(lines: list[str], mask: list[bool]) -> tuple[list[str], dict[s
     sections: dict[str, list[str]] = {}
     for position, heading in enumerate(second_level):
         end = second_level[position + 1].index if position + 1 < len(second_level) else len(lines)
-        chunk = _trim_blank([line.rstrip() for line in lines[heading.index + 1 : end]])
+        chunk = trim_blank_lines([line.rstrip() for line in lines[heading.index + 1 : end]])
         sections.setdefault(_section_name(heading.text), []).extend(chunk)
     return preamble, sections
 
@@ -674,7 +666,7 @@ def build_domain_page(
             page_body += [f"## {name}", "", *(supplied.get(name) or [PLACEHOLDER]), ""]
     else:
         title_lines = {heading.index for heading in titles}
-        page_body += _trim_blank([line.rstrip() for index, line in enumerate(lines) if index not in title_lines])
+        page_body += trim_blank_lines([line.rstrip() for index, line in enumerate(lines) if index not in title_lines])
 
     load_policy = str(template.get("load_policy") or draft.get("load_policy") or "").strip()
     engine_set: dict[str, Any] = {

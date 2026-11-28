@@ -39,7 +39,7 @@ from ai_flywheel.adapters.runners import (
     _plan_from_runner_output,
     empty_domain_signals,
 )
-from ai_flywheel.adapters.wiki_gate import (
+from ai_flywheel.adapters.wiki import (
     CREATE_TARGET_EXISTS,
     DOMAIN_INVENTORY_LIMIT,
     ROUTE_DECLARED,

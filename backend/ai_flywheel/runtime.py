@@ -14,13 +14,14 @@ from ai_flywheel.core.activation import ActivationEngine
 from ai_flywheel.core.approval_channel import ApprovalChannel
 from ai_flywheel.core.automation import AutomationManager, validate_cron
 from ai_flywheel.core.core_card import read_core_card, rebuild_core_card
+from ai_flywheel.core.governance import GovernanceService
 from ai_flywheel.core.hooks import ThinHookProcessor
 from ai_flywheel.core.orchestrator import EventBroker, WorkflowOrchestrator
 from ai_flywheel.core.policies import PolicyEngine
 from ai_flywheel.core.publication import PublicationLayer
 from ai_flywheel.core.queue_service import DistillQueueService
 from ai_flywheel.core.receipts import ReceiptService
-from ai_flywheel.mcp_server import build_mcp_server
+from ai_flywheel.core.triage import triage_session
 from ai_flywheel.models import (
     IngressChannel,
     RegisterSessionRequest,
@@ -35,7 +36,7 @@ from ai_flywheel.storage.seed import seed_demo_data
 
 
 class FlywheelRuntime:
-    """Single dependency container wiring all decoupled engines, adapters, MCP, and APIs."""
+    """Single dependency container wiring all decoupled engines, adapters, and domain services."""
 
     def __init__(self, cfg: FlywheelConfig, *, skip_fts_sync: bool = False, clock: SystemClock | None = None, process_role: str = "cli") -> None:
         self.cfg = cfg
@@ -46,8 +47,16 @@ class FlywheelRuntime:
         self.policies = PolicyEngine(cfg, self.db)
         self.activation = ActivationEngine(cfg, self.db, self.fs_store, self.policies)
         self.receipts = ReceiptService(self.db, self.fs_store, self.policies, self.activation)
-        self.sessions = SessionAdapter(cfg, self.db)
+        self.sessions = SessionAdapter(cfg, self.db, triage_fn=triage_session)
         self.knowledge = KnowledgeSinkAdapter(cfg, self.db)
+        self.governance = GovernanceService(
+            cfg,
+            self.db,
+            self.policies,
+            self.activation,
+            self.knowledge,
+            on_state_change=lambda: self.refresh_core_card(),
+        )
         self.delivery = DeliveryAdapter(cfg)
         self.skill_writer = SkillWriterAdapter(cfg)
         self.broker = EventBroker()
@@ -70,7 +79,6 @@ class FlywheelRuntime:
         )
         self.hooks = ThinHookProcessor(self)
         self.publication = PublicationLayer(cfg, self.db, self.policies, self.activation)
-        self.mcp = build_mcp_server(self)
         self.outbox = None
         self.lark_runner = None
         self.feishu_listener = None

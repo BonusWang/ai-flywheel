@@ -21,7 +21,7 @@ from apscheduler.triggers.cron import CronTrigger
 from ai_flywheel.adapters.runners.clients import resolve_runner_mode
 from ai_flywheel.config import FlywheelConfig
 from ai_flywheel.core.orchestrator import EventBroker, WorkflowLockError, WorkflowOrchestrator
-from ai_flywheel.core.time_utils import SHANGHAI_TZ, shanghai_today_ymd
+from ai_flywheel.core.time_utils import SHANGHAI_TZ, shanghai_now_iso, shanghai_today_ymd
 from ai_flywheel.models import QueueStatus, RunStatus, SessionStatus, WorkflowRunRecord
 from ai_flywheel.storage.db import FlywheelDB
 
@@ -128,8 +128,11 @@ def next_fire_time_iso(expr: str, *, now: datetime | None = None) -> str | None:
     return nxt.astimezone(SHANGHAI_TZ).isoformat()
 
 
-def _shanghai_now_iso() -> str:
-    return datetime.now(timezone.utc).astimezone(SHANGHAI_TZ).isoformat()
+def recovery_watchdog_settings() -> tuple[float, int]:
+    """Single source of truth for the recovery watchdog interval & stale threshold."""
+    interval = float(os.environ.get("FLYWHEEL_RECOVERY_INTERVAL", "30"))
+    stale_after = int(os.environ.get("FLYWHEEL_RECOVERY_STALE_SECONDS", "300"))
+    return interval, stale_after
 
 
 def _as_shanghai(value: datetime | None) -> datetime:
@@ -235,8 +238,7 @@ class AutomationManager:
         self._fire_claims: dict[str, dict[str, Any]] | None = None
 
         # Recovery watchdog telemetry (updated by the serve recovery thread & manual trigger)
-        self._recovery_interval = float(os.environ.get("FLYWHEEL_RECOVERY_INTERVAL", "30"))
-        self._recovery_stale_after = int(os.environ.get("FLYWHEEL_RECOVERY_STALE_SECONDS", "300"))
+        self._recovery_interval, self._recovery_stale_after = recovery_watchdog_settings()
         self._recovery_last_pass_at: str | None = None
         self._recovery_last_reaped_count = 0
         self._recovery_total_reaped_count = 0
@@ -734,7 +736,7 @@ class AutomationManager:
 
     def record_recovery_pass(self, reaped_ids: list[str], error: str | None = None) -> None:
         with self._lock:
-            self._recovery_last_pass_at = _shanghai_now_iso()
+            self._recovery_last_pass_at = shanghai_now_iso()
             self._recovery_last_reaped_count = len(reaped_ids)
             self._recovery_total_reaped_count += len(reaped_ids)
             self._recovery_last_error = error

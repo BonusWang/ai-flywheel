@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 
 from ai_flywheel.config import FlywheelConfig
-from ai_flywheel.core.activation import ActivationEngine
-from ai_flywheel.core.receipts import ReceiptService
 from ai_flywheel.storage.db import build_knowledge_search_text
 from ai_flywheel.models import (
     CheckResult,
@@ -27,6 +26,10 @@ from ai_flywheel.models import (
     WorkflowRunRecord,
 )
 from ai_flywheel.storage.db import FlywheelDB
+
+if TYPE_CHECKING:
+    from ai_flywheel.core.activation import ActivationEngine
+    from ai_flywheel.core.receipts import ReceiptService
 
 
 def seed_demo_data(

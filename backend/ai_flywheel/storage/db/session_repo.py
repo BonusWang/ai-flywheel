@@ -359,16 +359,6 @@ class SessionRepoMixin:
                 row = conn.execute("SELECT COUNT(*) AS cnt FROM outcomes").fetchone()
             return int(row["cnt"]) if row else 0
 
-    def count_retro_items(self, status: str | None = None) -> int:
-        with self.connect() as conn:
-            if status:
-                row = conn.execute(
-                    "SELECT COUNT(*) AS cnt FROM retro_queue WHERE status = ?", (status,)
-                ).fetchone()
-            else:
-                row = conn.execute("SELECT COUNT(*) AS cnt FROM retro_queue").fetchone()
-            return int(row["cnt"]) if row else 0
-
     def count_real_verified_natural_outcomes(self) -> int:
         """Natural outcomes carrying at least one `real` check that passed.
 

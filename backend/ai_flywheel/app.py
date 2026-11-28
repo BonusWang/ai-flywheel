@@ -15,7 +15,8 @@ from fastapi.staticfiles import StaticFiles
 from mcp.server.transport_security import TransportSecuritySettings
 
 from ai_flywheel import __version__
-from ai_flywheel.core.automation import CATCHUP_CHECK_INTERVAL_SECONDS
+from ai_flywheel.core.automation import CATCHUP_CHECK_INTERVAL_SECONDS, recovery_watchdog_settings
+from ai_flywheel.mcp_server import build_mcp_server
 from ai_flywheel.routes import (
     build_automations_router,
     build_governance_router,
@@ -43,7 +44,8 @@ def create_app(
         auto_seed=auto_seed,
         process_role=effective_role,
     )
-    mcp_http_app = rt.mcp.streamable_http_app(
+    mcp_server = build_mcp_server(rt)
+    mcp_http_app = mcp_server.streamable_http_app(
         streamable_http_path="/",
         json_response=True,
         stateless_http=True,
@@ -73,8 +75,7 @@ def create_app(
             recovery_stop = threading.Event()
 
             def _recovery_loop() -> None:
-                interval = float(os.environ.get("FLYWHEEL_RECOVERY_INTERVAL", "30"))
-                stale_after = int(os.environ.get("FLYWHEEL_RECOVERY_STALE_SECONDS", "300"))
+                interval, stale_after = recovery_watchdog_settings()
                 # The lost-fire check runs on the first pass — a service started after the
                 # cron time finds out at once — and then a few times an hour: the window
                 # in which a fire may still be caught up is hours wide. It follows the
@@ -143,7 +144,7 @@ def create_app(
             )
             archive_thread.start()
             rt.start_feishu()
-        async with rt.mcp.session_manager.run():
+        async with mcp_server.session_manager.run():
             yield
         rt.stop_feishu()
         if recovery_stop is not None:
@@ -161,6 +162,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.runtime = rt
+    app.state.mcp = mcp_server
 
     app.add_middleware(
         CORSMiddleware,

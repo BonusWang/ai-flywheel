@@ -47,7 +47,7 @@ from ai_flywheel.adapters.runners import (
 )
 from ai_flywheel.adapters.runners.clients import _plan_write_caps
 from ai_flywheel.adapters.wiki.router import INCIDENT_SECTIONS, IncidentRouting, write_prefix_allows
-from ai_flywheel.adapters.wiki_gate import RoutingCandidates, WikiGate, page_section_sketch, preserves_existing
+from ai_flywheel.adapters.wiki import RoutingCandidates, WikiGate, page_section_sketch, preserves_existing
 from ai_flywheel.config import FlywheelConfig, WorkflowConfig
 from ai_flywheel.core.pipeline.helpers import domain_signal_names
 from ai_flywheel.models import (

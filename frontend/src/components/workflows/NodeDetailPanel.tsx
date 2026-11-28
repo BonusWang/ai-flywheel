@@ -83,72 +83,66 @@ export const NodeDetailPanel: React.FC<{
               </div>
             </div>
           )}
-          {activeNode.payload &&
-            typeof activeNode.payload === 'object' &&
-            (activeNode.payload as any).call_telemetry && (
-              <div className="mt-1 p-2.5 rounded-[var(--radius-control)] bg-bg-sunk/70 border border-line-soft space-y-1">
-                <div className="text-[11.5px] font-semibold text-ink">模型耗时与用量</div>
-                {(() => {
-                  const t = (activeNode.payload as any).call_telemetry as Record<string, any>
-                  return (
-                    <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11.5px] text-ink-3 num">
-                      {t.model && (
-                        <span>
-                          模型：<code className="mono text-ink-2">{t.model}</code>
-                        </span>
-                      )}
-                      {t.duration_ms != null && (
-                        <span>耗时：{(Number(t.duration_ms) / 1000).toFixed(1)}s</span>
-                      )}
-                      {t.attempts != null && <span>尝试：{t.attempts} 次</span>}
-                      {(t.prompt_tokens != null || t.completion_tokens != null) && (
-                        <span>
-                          Token：输入 {t.prompt_tokens ?? 0} / 输出 {t.completion_tokens ?? 0}
-                          {t.reasoning_tokens ? `（思考 ${t.reasoning_tokens}）` : ''}
-                        </span>
-                      )}
-                      {t.cache_hit === true && (
-                        <span className="text-ok-ink font-medium">命中缓存</span>
-                      )}
-                    </div>
-                  )
-                })()}
-              </div>
-            )}
-          {activeNode.node_id === 'P05_SETTLE' &&
-            activeNode.payload &&
-            typeof activeNode.payload === 'object' &&
-            (activeNode.payload as any).dream && (
-              <div className="mt-2 p-3 rounded-[var(--radius-control)] bg-bg-sunk/70 border border-line-soft space-y-1.5">
-                <div className="text-[12px] font-semibold text-ink">
-                  周五精简体检摘要（{(activeNode.payload as any).dream.period_key}）
-                </div>
-                <div className="flex flex-wrap gap-2 text-[11.5px] text-ink-3 num">
-                  <span>
-                    休眠零命中规则：
-                    {((activeNode.payload as any).dream.auto_dormant_rules || []).length} 条
-                  </span>
-                  <span>·</span>
-                  <span>
-                    待复核笔记：
-                    {((activeNode.payload as any).dream.expired_cards || []).length} 篇
-                  </span>
-                  <span>·</span>
-                  <span>
-                    待处理分歧：{(activeNode.payload as any).dream.open_dissents_count ?? 0} 条
-                  </span>
-                </div>
-                {((activeNode.payload as any).dream.proposals || []).length > 0 && (
-                  <ul className="list-disc pl-4 space-y-0.5 text-[12px] text-ink-2">
-                    {((activeNode.payload as any).dream.proposals as string[]).map(
-                      (p, pIdx) => (
-                        <li key={pIdx}>{p}</li>
-                      )
+          {activeNode.payload?.call_telemetry && (
+            <div className="mt-1 p-2.5 rounded-[var(--radius-control)] bg-bg-sunk/70 border border-line-soft space-y-1">
+              <div className="text-[11.5px] font-semibold text-ink">模型耗时与用量</div>
+              {(() => {
+                const t = activeNode.payload.call_telemetry
+                if (!t) return null
+                return (
+                  <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11.5px] text-ink-3 num">
+                    {t.model && (
+                      <span>
+                        模型：<code className="mono text-ink-2">{t.model}</code>
+                      </span>
                     )}
-                  </ul>
-                )}
+                    {t.duration_ms != null && (
+                      <span>耗时：{(Number(t.duration_ms) / 1000).toFixed(1)}s</span>
+                    )}
+                    {t.attempts != null && <span>尝试：{t.attempts} 次</span>}
+                    {(t.prompt_tokens != null || t.completion_tokens != null) && (
+                      <span>
+                        Token：输入 {t.prompt_tokens ?? 0} / 输出 {t.completion_tokens ?? 0}
+                        {t.reasoning_tokens ? `（思考 ${t.reasoning_tokens}）` : ''}
+                      </span>
+                    )}
+                    {t.cache_hit === true && (
+                      <span className="text-ok-ink font-medium">命中缓存</span>
+                    )}
+                  </div>
+                )
+              })()}
+            </div>
+          )}
+          {activeNode.node_id === 'P05_SETTLE' && activeNode.payload?.dream && (
+            <div className="mt-2 p-3 rounded-[var(--radius-control)] bg-bg-sunk/70 border border-line-soft space-y-1.5">
+              <div className="text-[12px] font-semibold text-ink">
+                周五精简体检摘要（{activeNode.payload.dream.period_key}）
               </div>
-            )}
+              <div className="flex flex-wrap gap-2 text-[11.5px] text-ink-3 num">
+                <span>
+                  休眠零命中规则：
+                  {(activeNode.payload.dream.auto_dormant_rules || []).length} 条
+                </span>
+                <span>·</span>
+                <span>
+                  待复核笔记：
+                  {(activeNode.payload.dream.expired_cards || []).length} 篇
+                </span>
+                <span>·</span>
+                <span>
+                  待处理分歧：{activeNode.payload.dream.open_dissents_count ?? 0} 条
+                </span>
+              </div>
+              {(activeNode.payload.dream.proposals || []).length > 0 && (
+                <ul className="list-disc pl-4 space-y-0.5 text-[12px] text-ink-2">
+                  {(activeNode.payload.dream.proposals || []).map((p, pIdx) => (
+                    <li key={pIdx}>{p}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
         </div>
       ) : null}
     </div>

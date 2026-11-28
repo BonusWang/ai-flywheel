@@ -290,6 +290,41 @@ export interface SkillPreview {
   content: string
 }
 
+export interface CallTelemetry {
+  model?: string
+  duration_ms?: number | null
+  attempts?: number | null
+  prompt_tokens?: number | null
+  completion_tokens?: number | null
+  reasoning_tokens?: number | null
+  cache_hit?: boolean
+}
+
+export interface DreamNodeSummary {
+  period_key?: string
+  auto_dormant_rules?: unknown[]
+  expired_cards?: unknown[]
+  open_dissents_count?: number
+  proposals?: string[]
+}
+
+export interface TriageReportSummary {
+  checked?: number
+  skipped?: number
+  admitted?: number
+}
+
+export interface ReviewFindingSummary {
+  worthy?: boolean
+}
+
+export interface NodeExecutionPayload extends Record<string, unknown> {
+  call_telemetry?: CallTelemetry | null
+  dream?: DreamNodeSummary | null
+  triage_report?: TriageReportSummary | null
+  findings?: ReviewFindingSummary[]
+}
+
 export interface NodeExecution {
   node_id: string
   name: string
@@ -303,7 +338,7 @@ export interface NodeExecution {
   summary: string
   receipt_hash: string | null
   error: string | null
-  payload: Record<string, unknown>
+  payload: NodeExecutionPayload
 }
 
 export interface WorkflowRunRecord {

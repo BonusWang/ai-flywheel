@@ -13,6 +13,7 @@ import {
 import { QueueInventoryPanel } from '../components/workflows/QueueInventoryPanel'
 import { RunPipelineRow } from '../components/workflows/RunPipelineRow'
 import type { WorkflowDetailTab } from '../components/workflows/RunDetailPanel'
+import { errorMessage } from '../lib/errors'
 import {
   CLIENT_LABELS,
   FEISHU_LISTENER_STATE_LABELS,
@@ -322,8 +323,8 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh, 
       toast.push({ tone: 'info', message: '已启动新一轮整理，进度将实时同步' })
       await loadData()
       onGlobalRefresh()
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '启动整理失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '启动整理失败') })
     } finally {
       setBusy(false)
     }
@@ -349,8 +350,8 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh, 
       toast.push({ tone: 'info', message: `已将 ${queueIds.length} 段对话插队送入整理` })
       await loadData()
       onGlobalRefresh()
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '插队整理失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '插队整理失败') })
     } finally {
       setBusy(false)
     }
@@ -374,8 +375,8 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh, 
       )
       await loadData()
       onGlobalRefresh()
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '同步归档失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '同步归档失败') })
     } finally {
       setSyncing(false)
     }
@@ -397,8 +398,8 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh, 
       toast.push(`已同意写入 ${indices.length} 项建议，正在落盘核验…`)
       await loadData()
       onGlobalRefresh()
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '审批提交失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '审批提交失败') })
     } finally {
       setBusy(false)
     }
@@ -412,8 +413,8 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh, 
       toast.push({ tone: 'info', message: '已放弃本批写入，相关对话已退回待整理队列' })
       await loadData()
       onGlobalRefresh()
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '取消写入失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '取消写入失败') })
     } finally {
       setBusy(false)
     }
@@ -466,8 +467,8 @@ export const WorkflowsPage: React.FC<Props> = ({ refreshToken, onGlobalRefresh, 
       toast.push(`已加入待整理队列：「${data.title}」`)
       await loadData()
       onGlobalRefresh()
-    } catch (e: any) {
-      toast.push({ tone: 'error', message: e?.message || '添加对话失败' })
+    } catch (e: unknown) {
+      toast.push({ tone: 'error', message: errorMessage(e, '添加对话失败') })
     } finally {
       setBusy(false)
     }

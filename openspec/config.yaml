@@ -15,12 +15,12 @@ context: |
   - 代码图谱：codegraph（.codegraph/ 为本机索引，不入库）
 
   ## 目录与分层
-  - backend/ai_flywheel/core/      领域引擎：orchestrator（薄兼容外观，转导出 core/pipeline/）、pipeline/（P00–P07 状态机：constants/events/helpers/recovery/git_commit/coordinator）、queue_service（沉淀队列状态机、三级闸门、超大上下文瘦身与分片、Codex 严格归档对账与重筛）、approval_channel（审批通道契约，编排器与运行时共同依赖）、automation（上海时区热重载调度与守护控制面）、activation（预检/规则）、triage（会话初筛与不沉淀/原因码映射）、dream（周五蒸馏与只读预览）、core_card（派生索引卡）、doctor（只读环境体检）、onboarding（init-client MCP 配置合并）、privacy、receipts、heartbeat、publication、hooks、policies、connect_templates、time_utils（上海时区日期）；feishu_* 仅为薄兼容壳，实现位于 adapters/channels/feishu/
-  - backend/ai_flywheel/adapters/  出站适配：channels/（feishu/ 卡片/通道/监听/自检 + webhook 通用脱敏 Webhook）、runners/（dry_run / cli / api 执行器与契约、提示词、归一化）、wiki/（挂载 Wiki 的 schema、routing、gate、validator、t5_adapter、postflight）、knowledge（知识落点 + 写入链路）、skills（Skill 追加式写入）、sessions、delivery、lark_cli
+  - backend/ai_flywheel/core/      领域引擎：orchestrator（薄兼容外观，转导出 core/pipeline/）、pipeline/（P00–P07 状态机：constants/events/helpers/recovery/git_commit/stage_pre_approval/stage_post_approval/coordinator）、queue_service（沉淀队列状态机，配合 queue_compaction、queue_reconcile 与 queue_hand_distilled）、governance（错题/线索/保鲜/技能治理服务）、approval_channel（审批通道契约，编排器与运行时共同依赖）、automation（上海时区热重载调度与守护控制面）、activation（预检/规则）、triage（会话初筛与不沉淀/原因码映射）、dream（周五蒸馏与只读预览）、core_card（派生索引卡）、doctor（只读环境体检）、onboarding（init-client MCP 配置合并）、privacy、markdown_utils、receipts、heartbeat、publication、hooks、policies、connect_templates、time_utils（上海时区日期）
+  - backend/ai_flywheel/adapters/  出站适配：channels/（feishu/ 卡片/通道/监听/自检 + webhook 通用脱敏 Webhook）、runners/（dry_run / cli / api 执行器与契约、提示词、归一化）、wiki/（挂载 Wiki 的 schema、routing_models、router、gate、validator、t5_adapter、postflight）、knowledge（知识落点 + 写入链路）、skills（Skill 追加式写入）、sessions、transcripts、delivery、lark_cli
   - backend/ai_flywheel/storage/   db/（SQLite 存储与 v4 幂等迁移，按仓储拆分：workflow/session/rule/knowledge/asset/audit/dict/queue）、fs_store.py（不可变回执）、outbox.py（受管投递外发箱）、clock.py（可注入时钟）、seed.py
   - backend/ai_flywheel/           app.py（装配：lifespan 含 recovery 与 archive-sync 守护、MCP 挂载、CORS、SSE、SPA 托管）、routes/（按域拆分的门户 API：overview/governance/runs/automations）、mcp_server.py（7 Tools + 4 Resources）、cli.py、config.py、models.py、runtime.py（依赖容器）
   - profile/                       与知识库解耦的方法论策略（policies/）与默认模板
-  - frontend/src/                  5+1 控制台：pages/（今日态势、沉淀与审批含沉淀队列库存双 Tab、自动化调度、规则与进化、接入与设置 + 关于）、components/、api.ts、types.ts、lib/labels.ts
+  - frontend/src/                  5+1 控制台：pages/（今日态势、沉淀与审批含沉淀队列库存双 Tab、自动化调度、规则与进化、接入与设置 + 关于）、components/、api.ts、types.ts、lib/labels.ts、lib/errors.ts
   - docs/                          architecture.svg（3+1 通用生态架构图）、schema.sql（权威 SQLite v4 DDL）、data-model.md（全库数据模型、ER 图与字典清册）
   - tests/                         pytest（asyncio auto 模式）；test_arch_invariants.py 固化跨层不变量
   - scripts/verify_repo.py         一次性验收闸门：卫生 → openspec 校验 → pytest → 前端构建

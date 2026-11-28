@@ -3,21 +3,22 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from ai_flywheel.config import FlywheelConfig
-from ai_flywheel.core.triage import (
+from ai_flywheel.adapters.transcripts import (
     antigravity_dialogue_text,
     derive_readable_title,
     extract_jsonl_metadata,
     extract_jsonl_workspace,
+    flatten_content,
     is_antigravity_client,
     is_antigravity_record,
+    is_boilerplate_user_text,
     is_subagent_filename,
     scan_quiet_window_seconds,
     transcript_is_active,
-    triage_session,
 )
+from ai_flywheel.config import FlywheelConfig
 from ai_flywheel.models import RegisterSessionRequest, SessionRecord, SessionStatus
 from ai_flywheel.storage.db import FlywheelDB
 from ai_flywheel.storage.fs_store import redact_text
@@ -60,22 +61,6 @@ def read_transcript_excerpt(path: Path, max_chars: int = 24000) -> str:
         return redact_text(path.read_text(encoding="utf-8", errors="ignore"))[:max_chars]
     except OSError:
         return ""
-
-
-_BOILERPLATE_PREFIXES = (
-    "<app-context>",
-    "<environment_context>",
-    "<permissions instructions>",
-    "<collaboration_mode>",
-    "<system-reminder>",
-    "# agents.md instructions",
-    "# claude.md",
-)
-
-
-def _is_system_boilerplate(text: str) -> bool:
-    stripped = text.strip().lower()
-    return any(stripped.startswith(p) for p in _BOILERPLATE_PREFIXES)
 
 
 _SKIPPED_RECORD_TYPES = frozenset(
@@ -136,13 +121,13 @@ def _extract_jsonl_text(obj: Any) -> str:
         if mrole in _SKIPPED_RECORD_TYPES:
             return ""
         content = msg.get("content")
-        extracted = _flatten_content(content)
-        if extracted and not _is_system_boilerplate(extracted):
+        extracted = flatten_content(content)
+        if extracted and not is_boilerplate_user_text(extracted):
             return f"[{mrole or 'message'}] {extracted}"
         return ""
     if "content" in obj:
-        extracted = _flatten_content(obj.get("content"))
-        if extracted and not _is_system_boilerplate(extracted):
+        extracted = flatten_content(obj.get("content"))
+        if extracted and not is_boilerplate_user_text(extracted):
             return f"[{role or 'message'}] {extracted}"
         return ""
     if isinstance(obj.get("payload"), dict):
@@ -153,28 +138,9 @@ def _extract_jsonl_text(obj: Any) -> str:
         prole = str(payload.get("role") or "").strip().lower()
         if prole in _SKIPPED_RECORD_TYPES:
             return ""
-        extracted = _flatten_content(payload.get("content") or payload.get("text"))
-        if extracted and not _is_system_boilerplate(extracted):
+        extracted = flatten_content(payload.get("content") or payload.get("text"))
+        if extracted and not is_boilerplate_user_text(extracted):
             return f"[{prole or role or 'message'}] {extracted}"
-    return ""
-
-
-def _flatten_content(content: Any) -> str:
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item.strip())
-            elif isinstance(item, dict):
-                btype = str(item.get("type") or "").strip().lower()
-                if btype in {"tool_result", "tool_use", "thinking", "reasoning", "image", "input_image"}:
-                    continue
-                txt = item.get("text") or item.get("content")
-                if isinstance(txt, str) and txt.strip():
-                    parts.append(txt.strip())
-        return " ".join(parts).strip()
     return ""
 
 
@@ -188,9 +154,16 @@ def _is_same_file(left: str | None, right: Path) -> bool:
 class SessionAdapter:
     """Dual-mode session ingestion: MCP-pushed content + local transcript file scan/read."""
 
-    def __init__(self, cfg: FlywheelConfig, db: FlywheelDB) -> None:
+    def __init__(
+        self,
+        cfg: FlywheelConfig,
+        db: FlywheelDB,
+        *,
+        triage_fn: Callable[..., dict[str, Any]] | None = None,
+    ) -> None:
         self.cfg = cfg
         self.db = db
+        self._triage_fn = triage_fn
         #: Sessions whose registered transcript changed since the scan last took it, each with
         #: the ``(modification time, size)`` that was seen. The queue takes them with
         #: ``take_grown_transcripts``; until it has archived one, the next scan offers it again.
@@ -361,6 +334,9 @@ class SessionAdapter:
         if not triage_cfg.enabled:
             return {"checked": 0, "admitted": 0, "skipped": 0, "reasons": {}}
 
+        if self._triage_fn is None:
+            raise RuntimeError("SessionAdapter.sweep_pending_triage requires a triage_fn dependency.")
+        triage_fn = self._triage_fn
         retro_keys = open_retro_session_keys or set()
         pending = self.db.list_sessions(status=SessionStatus.PENDING.value, limit=200)
         admitted = 0
@@ -369,7 +345,7 @@ class SessionAdapter:
 
         for sess in pending:
             text = self.load_session_text(sess, max_chars=_TRIAGE_EXCERPT_CHARS)
-            res = triage_session(
+            res = triage_fn(
                 sess,
                 text,
                 triage_cfg,
@@ -379,7 +355,7 @@ class SessionAdapter:
                 # The excerpt may end before a later question. Whether anything follows
                 # the instruction — what makes a session a bare write dispatch — is
                 # decided on the whole conversation.
-                res = triage_session(
+                res = triage_fn(
                     sess,
                     self.load_session_text(sess, max_chars=_FULL_TRANSCRIPT_CHARS),
                     triage_cfg,

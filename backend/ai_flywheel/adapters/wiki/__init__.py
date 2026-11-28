@@ -9,8 +9,6 @@ Six collaborators, one contract:
 - `t5_adapter` — the generic draft rewritten into the Wiki's own practice-card shape.
 - `postflight` — what the Wiki's own scripts say about the written document.
 - `gate` — `WikiGate`, the object the rest of the product talks to.
-
-`ai_flywheel.adapters.wiki_gate` re-exports everything here.
 """
 from __future__ import annotations
 
@@ -105,7 +103,6 @@ from ai_flywheel.adapters.wiki.t5_adapter import (
     _card_description,
     _dedupe,
     _draft_tags,
-    _load_draft_frontmatter,
     _practice_card_body,
     _split_draft_body,
     normalize_planned_document,
@@ -183,7 +180,6 @@ __all__ = [
     "_git_bash_candidates",
     "_index_aliases",
     "_last_json_line",
-    "_load_draft_frontmatter",
     "_practice_card_body",
     "_project_tokens",
     "_split_draft_body",

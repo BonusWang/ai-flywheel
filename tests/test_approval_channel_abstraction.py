@@ -1,9 +1,9 @@
-"""refactor-approval-channel-abstraction：通道契约、兼容导入与路由表。
+"""refactor-approval-channel-abstraction：通道契约、规范导入与路由表。
 
 四类断言，每一类都对应一条会失败的契约：
 
 1. 审批通道契约：飞书通道结构性满足 `ApprovalChannel`，不完整实现不满足；
-2. 兼容导入：`core.feishu_*` 与 `adapters.channels.feishu.*` 解析到同一对象；
+2. 规范导入：通道实现唯一位于 `adapters.channels.feishu.*`，历史 `core.feishu_*` 兼容壳已删除；
 3. 忙碌错误：`ApprovalLockBusy` 属于契约级 `ApprovalBusyError`；
 4. 路由表：拆分后 63 条应用路由逐条一致，HTTP 语义不变。
 """
@@ -28,13 +28,6 @@ from ai_flywheel.adapters.channels.feishu.listen import classify_failure as adap
 from ai_flywheel.app import create_app
 from ai_flywheel.config import FeishuCliConfig, FlywheelConfig
 from ai_flywheel.core.approval_channel import ApprovalBusyError, ApprovalChannel
-from ai_flywheel.core.feishu_card import render_ask_card as core_render_ask_card
-from ai_flywheel.core.feishu_card import render_state_card as core_render_state_card
-from ai_flywheel.core.feishu_channel import FeishuChannel as CoreFeishuChannel
-from ai_flywheel.core.feishu_check import FeishuCheckService as CoreFeishuCheckService
-from ai_flywheel.core.feishu_check import event_card_id as core_event_card_id
-from ai_flywheel.core.feishu_listen import FeishuClickListener as CoreFeishuClickListener
-from ai_flywheel.core.feishu_listen import classify_failure as core_classify_failure
 from ai_flywheel.core.orchestrator import ApprovalLockBusy, WorkflowOrchestrator
 from ai_flywheel.runtime import FlywheelRuntime
 from ai_flywheel.storage.db import FlywheelDB
@@ -186,17 +179,23 @@ def test_the_runtime_types_the_channel_as_the_contract():
     assert "self.feishu_channel: ApprovalChannel | None = None" in source
 
 
-# ---------------------------------------------------------------- 2. 兼容导入
+# ---------------------------------------------------------------- 2. 权威通道入口与旧壳清理
 
 
-def test_legacy_and_adapter_imports_resolve_to_the_same_objects():
-    assert CoreFeishuChannel is AdapterFeishuChannel
-    assert CoreFeishuCheckService is AdapterFeishuCheckService
-    assert CoreFeishuClickListener is AdapterFeishuClickListener
-    assert core_event_card_id is adapter_event_card_id
-    assert core_classify_failure is adapter_classify_failure
-    assert core_render_ask_card is adapter_render_ask_card
-    assert core_render_state_card is adapter_render_state_card
+def test_canonical_adapter_surface_exports_feishu_collaborators_and_legacy_shims_are_removed():
+    for obj in (
+        AdapterFeishuChannel,
+        AdapterFeishuCheckService,
+        AdapterFeishuClickListener,
+        adapter_event_card_id,
+        adapter_classify_failure,
+        adapter_render_ask_card,
+        adapter_render_state_card,
+    ):
+        assert obj is not None
+    core_dir = REPO_ROOT / "backend" / "ai_flywheel" / "core"
+    for shim in ("feishu_card.py", "feishu_channel.py", "feishu_check.py", "feishu_listen.py"):
+        assert not (core_dir / shim).exists(), f"Legacy shim should be removed: {shim}"
 
 
 # ---------------------------------------------------------------- 3. 忙碌错误

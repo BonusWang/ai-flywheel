@@ -26,6 +26,12 @@ FRESHNESS_DAYS: dict[str, int] = {
 DEFAULT_FRESHNESS_TIER = "evolving"
 
 
+def shanghai_now_iso(now_utc: datetime | None = None) -> str:
+    """Current instant in Shanghai time as ISO 8601."""
+    dt = now_utc or datetime.now(timezone.utc)
+    return dt.astimezone(SHANGHAI_TZ).isoformat()
+
+
 def shanghai_today_ymd(now_utc: datetime | None = None) -> str:
     """Today in Shanghai as ``YYYY-MM-DD``."""
     dt = now_utc or datetime.now(timezone.utc)

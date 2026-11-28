@@ -65,7 +65,7 @@ def _wait_for_status(rt: FlywheelRuntime, run_id: str, wanted: set[RunStatus], t
 
 
 def test_the_sensitivity_predicate_has_one_source():
-    from ai_flywheel.core.feishu_card import is_sensitive
+    from ai_flywheel.adapters.channels.feishu.card import is_sensitive
 
     skill = PlannedWrite(target_kind="skill_improvement", action="create", title="t", summary="s")
     note = PlannedWrite(target_kind="knowledge_doc", action="create", title="t", summary="s")

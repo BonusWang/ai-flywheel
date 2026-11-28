@@ -9,8 +9,10 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any
+
+from ai_flywheel.core.time_utils import SHANGHAI_TZ
 
 
 # Trigger source of the placeholder run rows that back internal decision cards
@@ -583,10 +585,10 @@ TERMINAL_RUN_STATUSES = {"PASS", "PARTIAL", "CANCELLED", "FAILED"}
 def to_shanghai_date(iso_str: str | None) -> str:
     """The Shanghai calendar date of an ISO timestamp (today when there is none)."""
     if not iso_str:
-        return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        return datetime.now(SHANGHAI_TZ).strftime("%Y-%m-%d")
     try:
         dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        return dt.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        return dt.astimezone(SHANGHAI_TZ).strftime("%Y-%m-%d")
     except Exception:
         return iso_str[:10]
 

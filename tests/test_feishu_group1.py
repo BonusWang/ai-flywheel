@@ -14,8 +14,8 @@ import pytest
 from ai_flywheel.adapters.delivery import DeliveryAdapter
 from ai_flywheel.adapters.lark_cli import LarkCliRunner, LarkCliUnavailableError
 from ai_flywheel.config import FeishuCliConfig, FlywheelConfig
-from ai_flywheel.core.feishu_check import CHECK_SETTING_KEY, FeishuCheckService, event_card_id, render_check_card
-from ai_flywheel.core.feishu_listen import classify_failure
+from ai_flywheel.adapters.channels.feishu.check import CHECK_SETTING_KEY, FeishuCheckService, event_card_id, render_check_card
+from ai_flywheel.adapters.channels.feishu.listen import classify_failure
 from ai_flywheel.storage.db import FlywheelDB
 
 
@@ -349,7 +349,7 @@ def test_classify_failure():
 
 
 def test_listener_dedups_duplicate_event_lines():
-    from ai_flywheel.core.feishu_listen import FeishuClickListener
+    from ai_flywheel.adapters.channels.feishu.listen import FeishuClickListener
 
     seen: list[dict] = []
     listener = FeishuClickListener.__new__(FeishuClickListener)
@@ -419,7 +419,7 @@ class _FakeListenerRunner:
 
 
 def test_listener_idle_when_interactive_off():
-    from ai_flywheel.core.feishu_listen import FeishuClickListener
+    from ai_flywheel.adapters.channels.feishu.listen import FeishuClickListener
 
     runner = _FakeListenerRunner()
     listener = FeishuClickListener(runner, on_click=lambda e: None, should_run=lambda: False)
@@ -431,7 +431,7 @@ def test_listener_idle_when_interactive_off():
 
 
 def test_listener_stops_consumer_when_interactive_turned_off():
-    from ai_flywheel.core.feishu_listen import FeishuClickListener
+    from ai_flywheel.adapters.channels.feishu.listen import FeishuClickListener
 
     flag = {"on": True}
     runner = _FakeListenerRunner()
@@ -523,7 +523,7 @@ class _AuthFailRunner:
 
 def test_listener_does_not_spin_after_the_permanent_failure_limit():
     """达到永久失败上限后不再空转重拉消费者，而是停下来等交互模式重新打开。"""
-    from ai_flywheel.core.feishu_listen import FeishuClickListener
+    from ai_flywheel.adapters.channels.feishu.listen import FeishuClickListener
 
     runner = _AuthFailRunner()
     listener = FeishuClickListener(
@@ -550,7 +550,7 @@ def test_listener_does_not_spin_after_the_permanent_failure_limit():
 
 def test_listener_resumes_after_interactive_mode_is_toggled():
     """交互模式关闭再打开后，监听器恢复并重置永久失败计数。"""
-    from ai_flywheel.core.feishu_listen import FeishuClickListener
+    from ai_flywheel.adapters.channels.feishu.listen import FeishuClickListener
 
     flag = {"on": True}
     runner = _AuthFailRunner()
