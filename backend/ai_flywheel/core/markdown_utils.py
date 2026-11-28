@@ -36,8 +36,9 @@ def parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
     """Parse leading YAML frontmatter into ``(mapping, body)``.
 
     Missing, malformed, or non-mapping frontmatter yields ``({}, body)`` without raising.
+    A leading UTF-8 BOM is always stripped so callers receive a clean body.
     """
-    text = content or ""
+    text = (content or "").removeprefix("\ufeff")
     fm_text, body = split_frontmatter(text.lstrip())
     if fm_text is None:
         return {}, text

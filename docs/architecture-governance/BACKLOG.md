@@ -12,8 +12,8 @@
 | B04 | Decompose `core/pipeline/coordinator.py` (2,487 LOC) into cohesive P00–P07 stage modules & disambiguate `promote_observation` | `core/pipeline/*`, `tests/` | `done` | `4e9b514` |
 | B05 | Modularize `core/queue_service.py` (2,403 LOC) into cohesive `core/queue_*` modules (compaction, reconcile, service) | `core/queue_*`, `core/queue_service.py`, `tests/` | `done` | `b08e8d9` |
 | B06 | Unify shared review/plan cache & execution scaffolding in `adapters/runners/clients.py` & unify `_frontmatter_field` in `adapters/wiki/router.py` | `adapters/runners/clients.py`, `adapters/wiki/router.py`, `tests/` | `done` | `ed55cf2` |
-| B07 | Decompose frontend monoliths (`QueueInventoryPanel`, `CluesObservationsTab`, `AutomationsPage`) & tighten `any` types | `frontend/src/components/workflows/*`, `frontend/src/components/rules/*`, `frontend/src/pages/AutomationsPage.tsx`, `frontend/src/lib/*` | `done` | *(this commit)* |
-| B08 | Final pass: add frontend static invariants, sync `AGENTS.md` package map, update architecture metrics, and run full `verify_repo.py --frontend` + independent review | Cross-repo | `in_progress` | — |
+| B07 | Decompose frontend monoliths (`QueueInventoryPanel`, `CluesObservationsTab`, `AutomationsPage`) & tighten `any` types | `frontend/src/components/workflows/*`, `frontend/src/components/rules/*`, `frontend/src/pages/AutomationsPage.tsx`, `frontend/src/lib/*` | `done` | `f255e7b` |
+| B08 | Final pass: add frontend/frontmatter invariants, sync `AGENTS.md` package map, update architecture metrics, and run full `verify_repo.py --frontend` + independent review | Cross-repo | `done` | *(this commit)* |
 
 ---
 

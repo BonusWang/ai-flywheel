@@ -56,7 +56,7 @@ class FlywheelRuntime:
             self.policies,
             self.activation,
             self.knowledge,
-            on_state_change=self.refresh_core_card,
+            on_state_change=lambda: self.refresh_core_card(),
         )
         self.delivery = DeliveryAdapter(cfg)
         self.skill_writer = SkillWriterAdapter(cfg)

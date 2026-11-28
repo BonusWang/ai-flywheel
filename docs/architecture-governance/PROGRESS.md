@@ -31,4 +31,22 @@
 | B04 | 2026-11-28 | `4e9b514` | Decomposed `core/pipeline/coordinator.py` (2,487→787 LOC; `start_run` 925→95 LOC, `_execute_post_approval` 771→18 LOC) into `stage_pre_approval.py` (P00–P03 + gate) and `stage_post_approval.py` (P04–P07) via `StageTracker` & `_enter_stage`; renamed `helpers.promote_observation` → `link_rule_to_observation` | Hygiene (383 files clean) + 223 pipeline/recovery/git-commit/invariant tests passed |
 | B05 | 2026-11-28 | `b08e8d9` | Modularized `core/queue_service.py` (2,399→1,542 LOC) into `core/queue_compaction.py` (369 LOC, unifying `read_full_transcript` onto `adapters.sessions.read_transcript_excerpt`) and `core/queue_reconcile.py` (`QueueReconcileMixin`, 546 LOC) | Hygiene (385 files clean) + 294 distill-queue/agy/invariant tests passed |
 | B06 | 2026-11-28 | `ed55cf2` | Unified `CliSubprocessRunner` & `OpenAICompatibleRunner` onto `_CachedModelRunner` in `adapters/runners/clients.py`; replaced both remaining ad-hoc frontmatter parses & duplicate `_mapping` in `adapters/wiki/router.py` | Hygiene (385 files clean) + 244 runner/reliability/P02/P03/invariant tests passed |
-| B07 | 2026-11-28 | *(current)* | Decomposed `CluesObservationsTab.tsx` (1,334→494 LOC) into 3 self-contained sub-views + `cluesUtils.ts`; decomposed `QueueInventoryPanel.tsx` (1,266→684 LOC) into `QueueRow.tsx` + `QueueGroupRow.tsx`; decomposed `AutomationsPage.tsx` (1,183→876 LOC) into `cronVisual.ts` + `AutomationsWatchdogsSection.tsx` + `AutomationsHistorySection.tsx`; added `CallTelemetry`/`DreamNodeSummary`/`NodeExecutionPayload` removing all 10 `as any` casts in `NodeDetailPanel.tsx` | `tsc -b && vite build` passed (3.57s) + hygiene (394 files clean) + `test_arch_invariants` (36 passed) |
+| B07 | 2026-11-28 | `f255e7b` | Decomposed `CluesObservationsTab.tsx` (1,334→494 LOC) into 3 self-contained sub-views + `cluesUtils.ts`; decomposed `QueueInventoryPanel.tsx` (1,266→684 LOC) into `QueueRow.tsx` + `QueueGroupRow.tsx`; decomposed `AutomationsPage.tsx` (1,183→876 LOC) into `cronVisual.ts` + `AutomationsWatchdogsSection.tsx` + `AutomationsHistorySection.tsx`; added `CallTelemetry`/`DreamNodeSummary`/`NodeExecutionPayload` removing all 10 `as any` casts in `NodeDetailPanel.tsx` | `tsc -b && vite build` passed (3.57s) + hygiene (394 files clean) + `test_arch_invariants` (36 passed) |
+| B08 | 2026-11-28 | *(current)* | Added frontmatter-split & frontend HTTP/SSE centralization invariants (`test_arch_invariants.py`); resolved all independent review findings (`skills.py` frontmatter validation, `markdown_utils` BOM stripping, Clues sub-view failure selection preservation, `from pkg import shim` AST check, `runtime.py` lazy core-card hook); synced `AGENTS.md` package map & metrics | `python scripts/verify_repo.py --frontend`: 4/4 PASS (hygiene 394 files clean, openspec strict, 1,117 pytest passed, frontend built) |
+
+---
+
+## Before vs After Architecture Metrics
+
+| Metric | Baseline (`620bba8`) | Post-Governance | Delta |
+|---|---:|---:|---|
+| Largest backend file | 2,487 LOC (`coordinator.py`) | 1,542 LOC (`queue_service.py`) | -38% (`coordinator.py`: 2,487 → 791 LOC, -68%) |
+| Largest backend function | 925 LOC (`start_run`) | 462 LOC (`_run_p04_write_verify`) | -50% (`start_run`: 925 → 95 LOC; `_execute_post_approval`: 771 → 18 LOC) |
+| Largest frontend component | 1,334 LOC (`CluesObservationsTab.tsx`) | 930 LOC (`ConnectPolicyPage.tsx`) | -30% (`CluesObservationsTab`: -63%, `QueueInventoryPanel`: -46%, `AutomationsPage`: -26%) |
+| Frontend `any` count | 65 | 54 | -11 (`NodeDetailPanel.tsx`: 10 → 0) |
+| Duplicate class / DB mixin methods | 2 | 0 | Eliminated + AST invariant |
+| Ad-hoc frontmatter parsers | 5 | 0 | Eliminated + static invariant |
+| Production imports of legacy shims | 2 | 0 | Eliminated + AST invariant |
+| Upward runtime layer violations | 4 | 1 (`runtime -> mcp_server`, PD-002) | -75% + AST invariant |
+| Runtime circular imports | 0 | 0 | Locked via AST Tarjan SCC invariant |
+| Enforceable architecture invariants (`test_arch_invariants.py`) | 31 | 38 | +7 new automated invariants |

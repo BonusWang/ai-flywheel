@@ -13,7 +13,7 @@ interface Props {
   expandedIds: Record<string, boolean>
   onToggleExpand: (id: string) => void
   onDissentStatus: (dissentId: string, status: 'merged' | 'dismissed') => void
-  onBulkDissents: (ids: string[], status: 'merged' | 'dismissed') => Promise<void> | void
+  onBulkDissents: (ids: string[], status: 'merged' | 'dismissed') => Promise<boolean>
 }
 
 export const CluesDissentsSubView: React.FC<Props> = ({
@@ -53,8 +53,8 @@ export const CluesDissentsSubView: React.FC<Props> = ({
   }
 
   const handleBulkDissents = async (ids: string[], status: 'merged' | 'dismissed') => {
-    await onBulkDissentsProp(ids, status)
-    setSelectedDissents([])
+    const ok = await onBulkDissentsProp(ids, status)
+    if (ok) setSelectedDissents([])
   }
 
   return (

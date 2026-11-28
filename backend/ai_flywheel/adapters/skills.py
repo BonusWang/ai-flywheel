@@ -132,21 +132,22 @@ def validate_skill_markdown(skill_name: str, content: str) -> dict[str, str]:
         raise SkillWriteError(
             f"Invalid skill folder name '{skill_name}': must be lowercase alphanumeric + hyphens (2-63 chars)."
         )
-    text = content.strip()
-    if not text.startswith("---"):
+    text = (content or "").removeprefix("\ufeff").strip()
+    first_line = text.splitlines()[0].strip() if text else ""
+    if first_line != "---":
         raise SkillWriteError(f"Skill '{skill_name}' SKILL.md must start with YAML frontmatter (---).")
-    parts = text.split("---", 2)
-    if len(parts) < 3:
+    fm_text, raw_body = split_frontmatter(text)
+    if fm_text is None:
         raise SkillWriteError(f"Skill '{skill_name}' SKILL.md has unclosed YAML frontmatter.")
     try:
-        meta = yaml.safe_load(parts[1]) or {}
+        meta = yaml.safe_load(fm_text) or {}
     except yaml.YAMLError as exc:
         raise SkillWriteError(f"Skill '{skill_name}' frontmatter YAML parse error: {exc}") from exc
     if not isinstance(meta, dict):
         raise SkillWriteError(f"Skill '{skill_name}' frontmatter must be a YAML mapping.")
     name = str(meta.get("name") or "").strip()
     desc = str(meta.get("description") or "").strip()
-    body = parts[2].strip()
+    body = raw_body.strip()
     if not name:
         raise SkillWriteError(f"Skill '{skill_name}' frontmatter missing required 'name'.")
     if not desc:

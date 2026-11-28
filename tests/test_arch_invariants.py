@@ -1022,15 +1022,32 @@ def test_no_runtime_circular_imports_in_backend():
 
 
 def test_no_production_code_imports_legacy_shims():
-    """生产代码必须直接引用权威模块，不得再依赖历史兼容壳。"""
-    edges = _backend_runtime_import_graph()
+    """生产代码必须直接引用权威模块，不得再依赖历史兼容壳（含 from pkg import shim 形式）。"""
+    import ast
+
+    backend_root = REPO_ROOT / "backend" / "ai_flywheel"
     offenders: list[str] = []
-    for src, targets in sorted(edges.items()):
+    for path in sorted(backend_root.rglob("*.py")):
+        rel = path.relative_to(backend_root).with_suffix("")
+        parts = list(rel.parts)
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        src = "ai_flywheel" + ("." + ".".join(parts) if parts else "")
         if src in _DEPRECATED_SHIM_MODULES:
             continue
-        for target in sorted(targets):
-            if target in _DEPRECATED_SHIM_MODULES:
-                offenders.append(f"{src} -> {target}")
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name in _DEPRECATED_SHIM_MODULES:
+                        offenders.append(f"{src} -> {alias.name}")
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                if node.module in _DEPRECATED_SHIM_MODULES:
+                    offenders.append(f"{src} -> {node.module}")
+                for alias in node.names:
+                    cand = f"{node.module}.{alias.name}"
+                    if cand in _DEPRECATED_SHIM_MODULES:
+                        offenders.append(f"{src} -> {cand}")
     assert offenders == [], f"Production code imports legacy shim(s): {offenders}"
 
 
@@ -1074,3 +1091,33 @@ def test_backend_respects_layered_dependency_direction():
             if rank[sl] < rank[tl] and (src, target) not in _KNOWN_LAYER_EXCEPTIONS:
                 violations.append(f"[{sl}->{tl}] {src} -> {target}")
     assert violations == [], f"New layer dependency violations: {violations}"
+
+
+def test_no_ad_hoc_frontmatter_splitting_outside_markdown_utils():
+    """Markdown frontmatter 解析必须走 core.markdown_utils，禁止再散落 .split('---', 2)。"""
+    backend_root = REPO_ROOT / "backend" / "ai_flywheel"
+    offenders: list[str] = []
+    pattern = re.compile(r'\.split\(\s*["\']---["\']\s*,\s*2\s*\)')
+    for path in sorted(backend_root.rglob("*.py")):
+        rel = path.relative_to(backend_root).as_posix()
+        if rel == "core/markdown_utils.py":
+            continue
+        text = path.read_text(encoding="utf-8")
+        if pattern.search(text):
+            offenders.append(rel)
+    assert offenders == [], f"Ad-hoc frontmatter split('---', 2) found in: {offenders}"
+
+
+def test_frontend_http_transport_is_centralized():
+    """前端 HTTP 请求必须统一收口在 api.ts，SSE 连接统一收口在 App.tsx。"""
+    fetch_offenders: list[str] = []
+    sse_offenders: list[str] = []
+    for path in sorted(FRONTEND_SRC.rglob("*.ts*")):
+        rel = path.relative_to(FRONTEND_SRC).as_posix()
+        text = path.read_text(encoding="utf-8")
+        if rel != "api.ts" and re.search(r"\bfetch\s*\(", text):
+            fetch_offenders.append(rel)
+        if rel != "App.tsx" and re.search(r"\bnew\s+EventSource\s*\(", text):
+            sse_offenders.append(rel)
+    assert fetch_offenders == [], f"Direct fetch() outside api.ts: {fetch_offenders}"
+    assert sse_offenders == [], f"Direct EventSource() outside App.tsx: {sse_offenders}"

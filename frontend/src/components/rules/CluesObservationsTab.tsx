@@ -123,13 +123,15 @@ export const CluesObservationsTab: React.FC<{
 
   const actionPager = usePagination(actionItems, 10)
 
-  const runAction = async (fn: () => Promise<void>) => {
+  const runAction = async (fn: () => Promise<void>): Promise<boolean> => {
     setBusy(true)
     try {
       await fn()
+      return true
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : '操作失败，请稍后重试'
       toast.push({ tone: 'error', message })
+      return false
     } finally {
       setBusy(false)
     }

@@ -15,7 +15,7 @@ interface Props {
   onToggleExpand: (id: string) => void
   onPromote: (obsId: string) => void
   onArchive: (obsId: string) => void
-  onBulkArchive: (ids: string[]) => Promise<void> | void
+  onBulkArchive: (ids: string[]) => Promise<boolean>
 }
 
 export const CluesObservationsSubView: React.FC<Props> = ({
@@ -58,8 +58,8 @@ export const CluesObservationsSubView: React.FC<Props> = ({
   }
 
   const handleBulkArchiveObs = async (ids: string[]) => {
-    await onBulkArchive(ids)
-    setSelectedObs([])
+    const ok = await onBulkArchive(ids)
+    if (ok) setSelectedObs([])
   }
 
   return (

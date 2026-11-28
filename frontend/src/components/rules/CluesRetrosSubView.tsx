@@ -13,9 +13,9 @@ interface Props {
   busy: boolean
   expandedIds: Record<string, boolean>
   onToggleExpand: (id: string) => void
-  onPromoteGroup: (ids: string[]) => Promise<void> | void
-  onBulkPromoteGroups: (groups: RetroGroup[]) => Promise<void> | void
-  onGroupStatus: (ids: string[], status: RetroItem['status']) => Promise<void> | void
+  onPromoteGroup: (ids: string[]) => Promise<boolean>
+  onBulkPromoteGroups: (groups: RetroGroup[]) => Promise<boolean>
+  onGroupStatus: (ids: string[], status: RetroItem['status']) => Promise<boolean>
 }
 
 export const CluesRetrosSubView: React.FC<Props> = ({
@@ -55,18 +55,18 @@ export const CluesRetrosSubView: React.FC<Props> = ({
   }
 
   const handleRetroGroupStatus = async (ids: string[], status: RetroItem['status']) => {
-    await onGroupStatus(ids, status)
-    setSelectedRetroKeys([])
+    const ok = await onGroupStatus(ids, status)
+    if (ok) setSelectedRetroKeys([])
   }
 
   const handlePromoteRetroGroup = async (ids: string[]) => {
-    await onPromoteGroup(ids)
-    setSelectedRetroKeys([])
+    const ok = await onPromoteGroup(ids)
+    if (ok) setSelectedRetroKeys([])
   }
 
   const handleBulkPromoteRetroGroups = async (groups: RetroGroup[]) => {
-    await onBulkPromoteGroups(groups)
-    setSelectedRetroKeys([])
+    const ok = await onBulkPromoteGroups(groups)
+    if (ok) setSelectedRetroKeys([])
   }
 
   return (
