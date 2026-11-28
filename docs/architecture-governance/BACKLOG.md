@@ -17,7 +17,8 @@
 | B09 | [PD-001] Delete 5 deprecated shims (`core/feishu_*`, `adapters/wiki_gate.py`), migrate all test imports, lock non-existence invariant | `core/feishu_*.py`, `adapters/wiki_gate.py`, `tests/*`, `AGENTS.md`, `openspec/config.yaml` | `done` | `00d3d70` |
 | B10 | [PD-002/003] Decouple `FlywheelRuntime` from `mcp_server` so backend has 0 upward layer exceptions; document PD-003 retention | `runtime.py`, `app.py`, `cli.py`, `tests/*` | `done` | `a59b8a5` |
 | B11 | Decompose `core/queue_service.py` hand-distilled ledger (`core/queue_hand_distilled.py`) and `adapters/wiki/router.py` models (`adapters/wiki/routing_models.py`) | `core/queue_*`, `adapters/wiki/*`, `AGENTS.md` | `done` | `4ce96af` |
-| B12 | Decompose `ConnectPolicyPage.tsx`, unify frontend `errorMessage()` replacing `catch (e: any)`, type `NoiseFunnelStrip`/`HomePage` node payloads, add frontend invariant, final independent review + full gate | `frontend/src/*`, `tests/test_arch_invariants.py` | `done` | *(current)* |
+| B12 | Decompose `ConnectPolicyPage.tsx`, unify frontend `errorMessage()` replacing `catch (e: any)`, type `NoiseFunnelStrip`/`HomePage` node payloads, add frontend invariant | `frontend/src/*`, `tests/test_arch_invariants.py` | `done` | `37555ca` |
+| B13 | Resolve Phase 2 independent review findings: preserve `ConnectPolicyPage` tab state across switches, sync OpenSpec `approval-card-channels` baseline & `config.yaml`, unify `CluesObservationsTab` / Feishu check `errorMessage()`, align docs & run final full gate | `frontend/src/*`, `openspec/*`, `adapters/channels/feishu/__init__.py`, `tests/*`, `docs/architecture-governance/*` | `done` | *(current)* |
 
 ---
 

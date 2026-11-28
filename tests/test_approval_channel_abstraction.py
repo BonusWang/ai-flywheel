@@ -1,9 +1,9 @@
-"""refactor-approval-channel-abstraction：通道契约、兼容导入与路由表。
+"""refactor-approval-channel-abstraction：通道契约、规范导入与路由表。
 
 四类断言，每一类都对应一条会失败的契约：
 
 1. 审批通道契约：飞书通道结构性满足 `ApprovalChannel`，不完整实现不满足；
-2. 兼容导入：`core.feishu_*` 与 `adapters.channels.feishu.*` 解析到同一对象；
+2. 规范导入：通道实现唯一位于 `adapters.channels.feishu.*`，历史 `core.feishu_*` 兼容壳已删除；
 3. 忙碌错误：`ApprovalLockBusy` 属于契约级 `ApprovalBusyError`；
 4. 路由表：拆分后 63 条应用路由逐条一致，HTTP 语义不变。
 """

@@ -362,16 +362,12 @@ Webhook 载荷中的全部字符串（摘要、标题、原因、写入项标题
 - **WHEN** 某个对象缺少契约要求的任一能力
 - **THEN** 契约检查不通过，该对象不会被装配为审批通道
 
-### Requirement: 通道实现的存放与兼容导入
-具体通道实现（卡片渲染、通道协调、点击监听、链路自检）MUST 位于适配器层，MUST NOT 位于领域引擎层。既有 `core.feishu_card`、`core.feishu_channel`、`core.feishu_check`、`core.feishu_listen` 导入路径 MUST 继续可用，且 MUST 解析到与适配器层完全相同的对象。
+### Requirement: 通道实现的唯一权威位置
+具体通道实现（卡片渲染、通道协调、点击监听、链路自检）MUST 唯一位于适配器层（`adapters.channels.feishu.*`），MUST NOT 位于领域引擎层。历史 `core.feishu_card`、`core.feishu_channel`、`core.feishu_check`、`core.feishu_listen` 兼容壳已按 PD-001 / ADR-009 删除，任何代码与测试 MUST NOT 再引用旧路径。
 
-#### Scenario: 旧导入路径仍可用
-- **WHEN** 既有代码从 `core.feishu_*` 导入卡片渲染器、通道类、自检服务或监听器
-- **THEN** 导入成功，且对象与从 `adapters.channels.feishu.*` 导入的是同一个
-
-#### Scenario: 实现只在适配器层
-- **WHEN** 维护者查找通道实现
-- **THEN** 卡片、通道、监听与自检的实现在适配器层，领域引擎层只保留再导出
+#### Scenario: 实现只在适配器层且旧路径已清理
+- **WHEN** 维护者或测试按规范查找或导入飞书通道实现
+- **THEN** 卡片、通道、监听与自检仅存在于 `adapters.channels.feishu.*`，`core/feishu_*.py` 历史兼容壳不再存在且架构不变量测试阻止其回流
 
 ### Requirement: 门户 API 契约不变
 将门户 API 拆分为按业务域组织的路由模块后，全部既有 URL、HTTP 方法、状态码与响应结构 MUST 保持不变；应用 MUST 继续在 `/mcp` 挂载 MCP Streamable HTTP，并 MUST 在未命中 API 时回落到 SPA。

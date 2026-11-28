@@ -336,7 +336,7 @@ export const ConnectPolicyPage: React.FC<Props> = ({
       setFeishuCheck({ ...st, running: true })
       toast.push({ tone: 'info', message: '已发出飞书测试卡片，请在飞书点击「我收到了」' })
     } catch (err: unknown) {
-      setFeishuCheckError(errorMessage(err, String(err)))
+      setFeishuCheckError(errorMessage(err, '飞书链路自检失败'))
     } finally {
       setFeishuCheckBusy(false)
     }
@@ -416,8 +416,10 @@ export const ConnectPolicyPage: React.FC<Props> = ({
         </div>
       </Collapse>
 
-      {/* Tab 1: Connect AI Clients */}
-      {tab === 'connect' && <ConnectClientsTab connectData={connectData} />}
+      {/* Tab 1: Connect AI Clients (kept mounted so selectedClient persists across tab switches) */}
+      <div hidden={tab !== 'connect'} className={tab === 'connect' ? undefined : 'hidden'}>
+        <ConnectClientsTab connectData={connectData} />
+      </div>
 
       {/* Tab 2: Safety Valves, Directories, Model & Channels */}
       {tab === 'storage' && (
@@ -739,8 +741,10 @@ export const ConnectPolicyPage: React.FC<Props> = ({
         </div>
       )}
 
-      {/* Tab 3: Self-Test Sandbox */}
-      {tab === 'test' && <ConnectSandboxTab onGlobalRefresh={onGlobalRefresh} />}
+      {/* Tab 3: Self-Test Sandbox (kept mounted so sandbox inputs & preview persist across tab switches) */}
+      <div hidden={tab !== 'test'} className={tab === 'test' ? undefined : 'hidden'}>
+        <ConnectSandboxTab onGlobalRefresh={onGlobalRefresh} />
+      </div>
     </div>
   )
 }

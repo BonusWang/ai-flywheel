@@ -11,7 +11,7 @@
   - Duplicate class/mixin methods: `2` (`SessionRepoMixin.count_retro_items`, `KnowledgeRepoMixin.get_preflight_knowledge_pointers`)
   - Ad-hoc frontmatter parsers: `5`
   - Production imports of legacy shims (`adapters.wiki_gate` / `core.feishu_*`): `2`
-  - Upward runtime layer violations (excluding leaf primitives): `3` (`adapters.sessions -> core.triage`, `storage.seed -> core.{activation,receipts}`, `runtime -> mcp_server`)
+  - Upward runtime layer violation edges (excluding leaf primitives): `4` across 3 modules (`adapters.sessions -> core.triage`, `storage.seed -> core.{activation,receipts}`, `runtime -> mcp_server`)
   - Runtime circular imports: `0`
 - **Frontend**: 42 files, 14,319 LOC
   - Largest component: `components/rules/CluesObservationsTab.tsx` (1,334 LOC)
@@ -36,7 +36,8 @@
 | B09 | 2026-11-28 | `00d3d70` | [PD-001] Deleted all 5 deprecated legacy shims (`core/feishu_{card,channel,listen,check}.py`, `adapters/wiki_gate.py`), migrated all test callers to canonical modules, and locked both file non-existence and zero imports across `backend/` + `tests/` | Hygiene (389 files clean) + 481 targeted tests passed |
 | B10 | 2026-11-28 | `a59b8a5` | [PD-002/003] Moved `build_mcp_server(rt)` from `runtime.py` to entry layer (`app.py`, `cli.py`), migrated all test callers, cleared `_KNOWN_LAYER_EXCEPTIONS` to **0** upward layer violations, and documented PD-003 retention | Hygiene (389 files clean) + 190 MCP/core/distill-queue/invariant tests passed |
 | B11 | 2026-11-28 | `4ce96af` | Extracted `core/queue_hand_distilled.py` (shrinking `queue_service.py` 1,542→1,278 LOC) and `adapters/wiki/routing_models.py` (shrinking `wiki/router.py` 1,297→878 LOC); synced `AGENTS.md` package map | AST import check + hygiene (391 files clean) + 362 queue/wiki/invariant tests passed |
-| B12 | 2026-11-28 | *(current)* | Created `frontend/src/lib/errors.ts` (`errorMessage`), replaced all `catch (e: any)` across 10 frontend files with `unknown`, typed `TriageReportSummary`/`ReviewFindingSummary` removing all remaining `as any` casts, extracted `ConnectClientsTab.tsx` & `ConnectSandboxTab.tsx` from `ConnectPolicyPage.tsx` (930→736 LOC), added `test_frontend_has_no_catch_any_or_as_any` invariant | `tsc -b && vite build` passed (2.54s) + hygiene (394 files clean) + 39/39 `test_arch_invariants` passed |
+| B12 | 2026-11-28 | `37555ca` | Created `frontend/src/lib/errors.ts` (`errorMessage`), replaced all `catch (e: any)` across 10 frontend files with `unknown`, typed `TriageReportSummary`/`ReviewFindingSummary` removing all remaining `as any` casts, extracted `ConnectClientsTab.tsx` & `ConnectSandboxTab.tsx` from `ConnectPolicyPage.tsx` (930→746 LOC), added `test_frontend_has_no_catch_any_or_as_any` invariant | `tsc -b && vite build` passed (2.54s) + hygiene (394 files clean) + 39/39 `test_arch_invariants` passed |
+| B13 | 2026-11-28 | *(current)* | Resolved all Phase 2 independent review findings (P1-1: keep `ConnectClientsTab`/`ConnectSandboxTab` mounted across tab switches; P1-2: sync `openspec/specs/approval-card-channels/spec.md` baseline to PD-001; P2-1/2/3: sync `openspec/config.yaml`, remove stale shim docstrings, unify `CluesObservationsTab`/Feishu check `errorMessage()`, align ADR/PROGRESS metrics) | `python scripts/verify_repo.py --frontend`: 4/4 PASS (hygiene 394 files clean, openspec strict, 1,118 pytest passed, frontend built) |
 
 ---
 
@@ -46,7 +47,7 @@
 |---|---:|---:|---|
 | Largest backend file | 2,487 LOC (`coordinator.py`) | 1,278 LOC (`queue_service.py`) | -49% (`coordinator.py`: -68%, `queue_service.py`: -47%, `wiki/router.py`: -32%) |
 | Largest backend function | 925 LOC (`start_run`) | 462 LOC (`_run_p04_write_verify`) | -50% (`start_run`: 925 → 95 LOC; `_execute_post_approval`: 771 → 18 LOC) |
-| Largest frontend component | 1,334 LOC (`CluesObservationsTab.tsx`) | 923 LOC (`WorkflowsPage.tsx`) | -31% (`CluesObservationsTab`: -63%, `QueueInventoryPanel`: -46%, `AutomationsPage`: -26%, `ConnectPolicyPage`: -21%) |
+| Largest frontend component | 1,334 LOC (`CluesObservationsTab.tsx`) | 923 LOC (`WorkflowsPage.tsx`) | -31% (`CluesObservationsTab`: -63%, `QueueInventoryPanel`: -46%, `AutomationsPage`: -26%, `ConnectPolicyPage`: -20%) |
 | Frontend `any` count | 65 | 16 (`0` `as any`, `0` `catch (e: any)`) | -75% + static invariant |
 | Duplicate class / DB mixin methods | 2 | 0 | Eliminated + AST invariant |
 | Ad-hoc frontmatter parsers | 5 | 0 | Eliminated + static invariant |

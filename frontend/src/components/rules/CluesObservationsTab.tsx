@@ -13,6 +13,7 @@ import { StatusBadge } from '../StatusBadge'
 import { Collapse } from '../ui/Collapse'
 import { ConfirmButton } from '../ui/ConfirmButton'
 import { useToast } from '../ui/Toast'
+import { errorMessage } from '../../lib/errors'
 import { formatDateYMD, labelOf } from '../../lib/labels'
 import type { DissentRecord, MistakeObservation, RetroItem } from '../../types'
 import { CluesDissentsSubView } from './CluesDissentsSubView'
@@ -129,8 +130,7 @@ export const CluesObservationsTab: React.FC<{
       await fn()
       return true
     } catch (e: unknown) {
-      const message = e instanceof Error ? e.message : '操作失败，请稍后重试'
-      toast.push({ tone: 'error', message })
+      toast.push({ tone: 'error', message: errorMessage(e, '操作失败，请稍后重试') })
       return false
     } finally {
       setBusy(false)

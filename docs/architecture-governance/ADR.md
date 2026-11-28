@@ -142,8 +142,8 @@
 - **Status**: Accepted
 - **Context**: `core/queue_service.py` (1,542 LOC) and `adapters/wiki/router.py` (1,297 LOC) remained the two largest backend files, each combining a cohesive sub-domain/model block with its core state-machine/evaluation logic.
 - **Decision**:
-  1. Extract `core/queue_hand_distilled.py` (`QueueHandDistilledMixin`, `_declaration_meta`, ~275 LOC) from `core/queue_service.py` (shrinking it to ~1,275 LOC), preserving `DistillQueueService`'s public API intact.
-  2. Extract `adapters/wiki/routing_models.py` (`IncidentRouting`, `DepositRouting`, `RoutingCandidates`, `RouteDecision`, `RouteContext`, reason maps, ~455 LOC) from `adapters/wiki/router.py` (shrinking it to ~855 LOC), re-exporting all symbols from `router.py`.
+  1. Extract `core/queue_hand_distilled.py` (`QueueHandDistilledMixin`, `_declaration_meta`, 300 LOC) from `core/queue_service.py` (shrinking it to 1,278 LOC), preserving `DistillQueueService`'s public API intact.
+  2. Extract `adapters/wiki/routing_models.py` (`IncidentRouting`, `DepositRouting`, `RoutingCandidates`, `RouteDecision`, `RouteContext`, reason maps, 468 LOC) from `adapters/wiki/router.py` (shrinking it to 878 LOC), re-exporting all symbols from `router.py`.
 - **Consequences**: Largest backend file drops below 1,300 LOC; routing models and hand-distilled policy can evolve independently.
 
 ---
@@ -155,6 +155,6 @@
 - **Decision**:
   1. Introduce `frontend/src/lib/errors.ts` (`errorMessage(err: unknown, fallback: string)`) and migrate all `catch (e: any)` / `.catch((e: any)` sites across `frontend/src/` to `unknown`.
   2. Extend `NodeExecutionPayload` in `frontend/src/types.ts` with `TriageReportSummary` and `ReviewFindingSummary`, removing the final `as any` casts in `NoiseFunnelStrip.tsx` and `HomePage.tsx`.
-  3. Extract `ConnectClientsTab.tsx` (Tab 1) and `ConnectSandboxTab.tsx` (Tab 3) out of `ConnectPolicyPage.tsx` (shrinking it below 750 LOC).
+  3. Extract `ConnectClientsTab.tsx` (Tab 1) and `ConnectSandboxTab.tsx` (Tab 3) out of `ConnectPolicyPage.tsx` (shrinking it to 746 LOC, kept mounted with `hidden` so client selection and sandbox inputs/results persist across tab switches).
   4. Lock the rule in `tests/test_arch_invariants.py:test_frontend_has_no_catch_any_or_as_any()`.
 - **Consequences**: Zero `catch (e: any)` and zero `as any` casts across the entire frontend; `any` occurrences reduced by 75% (65 -> 16, only generic JSON map boundaries).
