@@ -48,7 +48,7 @@ from ai_flywheel.adapters.wiki import _workspace_segments
 from ai_flywheel.adapters.wiki.router import RouteDecision
 from ai_flywheel.app import create_app
 from ai_flywheel.config import ApiRunnerConfig, FlywheelConfig
-from ai_flywheel.core.feishu_card import is_sensitive
+from ai_flywheel.adapters.channels.feishu.card import is_sensitive
 from ai_flywheel.core.orchestrator import NODE_TEMPLATES, WorkflowOrchestrator
 from ai_flywheel.core.pipeline.helpers import apply_route_decision
 from ai_flywheel.models import (
@@ -1022,33 +1022,38 @@ def test_no_runtime_circular_imports_in_backend():
 
 
 def test_no_production_code_imports_legacy_shims():
-    """生产代码必须直接引用权威模块，不得再依赖历史兼容壳（含 from pkg import shim 形式）。"""
+    """已清理的 5 个历史兼容壳不得回流到代码库，且任何后端或测试代码不得再引用它们。"""
     import ast
 
     backend_root = REPO_ROOT / "backend" / "ai_flywheel"
+    expected_gone = (
+        backend_root / "adapters" / "wiki_gate.py",
+        backend_root / "core" / "feishu_card.py",
+        backend_root / "core" / "feishu_channel.py",
+        backend_root / "core" / "feishu_listen.py",
+        backend_root / "core" / "feishu_check.py",
+    )
+    surviving = [p.relative_to(REPO_ROOT).as_posix() for p in expected_gone if p.exists()]
+    assert surviving == [], f"Deleted legacy shim file(s) reappeared: {surviving}"
+
     offenders: list[str] = []
-    for path in sorted(backend_root.rglob("*.py")):
-        rel = path.relative_to(backend_root).with_suffix("")
-        parts = list(rel.parts)
-        if parts[-1] == "__init__":
-            parts = parts[:-1]
-        src = "ai_flywheel" + ("." + ".".join(parts) if parts else "")
-        if src in _DEPRECATED_SHIM_MODULES:
-            continue
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    if alias.name in _DEPRECATED_SHIM_MODULES:
-                        offenders.append(f"{src} -> {alias.name}")
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                if node.module in _DEPRECATED_SHIM_MODULES:
-                    offenders.append(f"{src} -> {node.module}")
-                for alias in node.names:
-                    cand = f"{node.module}.{alias.name}"
-                    if cand in _DEPRECATED_SHIM_MODULES:
-                        offenders.append(f"{src} -> {cand}")
-    assert offenders == [], f"Production code imports legacy shim(s): {offenders}"
+    for root_dir in (backend_root, REPO_ROOT / "tests"):
+        for path in sorted(root_dir.rglob("*.py")):
+            rel = path.relative_to(REPO_ROOT).as_posix()
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.name in _DEPRECATED_SHIM_MODULES:
+                            offenders.append(f"{rel} -> {alias.name}")
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    if node.module in _DEPRECATED_SHIM_MODULES:
+                        offenders.append(f"{rel} -> {node.module}")
+                    for alias in node.names:
+                        cand = f"{node.module}.{alias.name}"
+                        if cand in _DEPRECATED_SHIM_MODULES:
+                            offenders.append(f"{rel} -> {cand}")
+    assert offenders == [], f"Legacy shim import(s) found: {offenders}"
 
 
 def test_shared_leaf_primitives_have_no_upward_dependencies():

@@ -561,7 +561,7 @@ content_contract:
     cfg.knowledge_sink.wiki_gate_enabled = True
     cfg.knowledge_sink.wiki_gate_require_scripts = False
 
-    from ai_flywheel.adapters.wiki_gate import WikiGate
+    from ai_flywheel.adapters.wiki import WikiGate
 
     gate = WikiGate(cfg)
     raw_content = "---\ntitle: 网关超时排查\ntags: [gateway, timeout]\n---\n\n# 网关超时排查\n- 修复连接池超时。\n"

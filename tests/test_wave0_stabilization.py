@@ -19,7 +19,7 @@ import pytest
 
 from ai_flywheel.adapters.knowledge import KnowledgeWriteError
 from ai_flywheel.adapters.runners import OpenAICompatibleRunner
-from ai_flywheel.adapters.wiki_gate import (
+from ai_flywheel.adapters.wiki import (
     WikiGate,
     resolve_bash_executable,
     split_frontmatter,

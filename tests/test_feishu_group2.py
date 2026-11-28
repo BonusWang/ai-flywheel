@@ -9,14 +9,14 @@ import pytest
 
 from ai_flywheel.adapters.lark_cli import LarkResult
 from ai_flywheel.config import FeishuCliConfig, FlywheelConfig
-from ai_flywheel.core.feishu_card import (
+from ai_flywheel.adapters.channels.feishu.card import (
     is_sensitive,
     render_ask_card,
     render_state_card,
     sanitize,
     with_notice,
 )
-from ai_flywheel.core.feishu_channel import FeishuChannel
+from ai_flywheel.adapters.channels.feishu.channel import FeishuChannel
 from ai_flywheel.core.orchestrator import ApprovalLockBusy
 from ai_flywheel.models import NodeExecution, NodeStatus, PlannedWrite, RunStatus, WorkflowRunRecord
 from ai_flywheel.storage.db import FlywheelDB
@@ -517,7 +517,7 @@ def test_with_notice_keeps_buttons_and_places_notice_above_actions():
 
 
 def test_check_card_uses_the_same_action_style():
-    from ai_flywheel.core.feishu_check import render_check_card
+    from ai_flywheel.adapters.channels.feishu.check import render_check_card
 
     waiting = json.loads(render_check_card("fcheck-x", state="waiting"))
     btn = waiting["body"]["elements"][-1]
@@ -880,7 +880,7 @@ def test_normalizer_append_reason_avoids_double_punctuation():
 def test_feishu_check_fails_fast_when_interactive_off(tmp_path: Path):
     import time as _t
 
-    from ai_flywheel.core.feishu_check import FeishuCheckService
+    from ai_flywheel.adapters.channels.feishu.check import FeishuCheckService
 
     cfg = FlywheelConfig(base_dir=tmp_path)
     cfg.delivery.feishu_cli = FeishuCliConfig(enabled=True, interactive=False, user_id="ou_me")
@@ -946,7 +946,7 @@ def test_feishu_check_api_metadata_and_400_when_interactive_off(tmp_path: Path):
 def test_feishu_listener_wake_responds_immediately_on_config_enable():
     import time as _t
 
-    from ai_flywheel.core.feishu_listen import FeishuClickListener
+    from ai_flywheel.adapters.channels.feishu.listen import FeishuClickListener
 
     enabled = [False]
     started = []

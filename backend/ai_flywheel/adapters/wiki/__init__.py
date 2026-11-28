@@ -9,8 +9,6 @@ Six collaborators, one contract:
 - `t5_adapter` — the generic draft rewritten into the Wiki's own practice-card shape.
 - `postflight` — what the Wiki's own scripts say about the written document.
 - `gate` — `WikiGate`, the object the rest of the product talks to.
-
-`ai_flywheel.adapters.wiki_gate` re-exports everything here.
 """
 from __future__ import annotations
 

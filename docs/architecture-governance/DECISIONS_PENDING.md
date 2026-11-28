@@ -7,19 +7,7 @@
 
 ## PD-001: Deprecation & Removal of Legacy Import Shims (`core/feishu_*`, `adapters/wiki_gate.py`)
 
-- **Current state**:
-  - `backend/ai_flywheel/core/feishu_card.py` (51 LOC)
-  - `backend/ai_flywheel/core/feishu_channel.py` (13 LOC)
-  - `backend/ai_flywheel/core/feishu_listen.py` (13 LOC)
-  - `backend/ai_flywheel/core/feishu_check.py` (21 LOC)
-  - `backend/ai_flywheel/adapters/wiki_gate.py` (11 LOC)
-- **Why pending**:
-  - After Batch B02, **zero** production files in `backend/` import any of these 5 shims.
-  - However, `tests/test_approval_channel_abstraction.py` explicitly pins `core.feishu_*` identity with `adapters.channels.feishu.*` as a documented backward-compatibility contract, and multiple tests import `adapters.wiki_gate`.
-  - Removing them is a breaking Python import change for any external script or plugin importing those historical paths.
-- **Options**:
-  - **Option A (Recommended for v1.0)**: Delete all 5 shim files, update the remaining test imports to canonical paths (`adapters.channels.feishu.*` and `adapters.wiki`), and record the breaking change in `CHANGELOG.md`.
-  - **Option B (Conservative)**: Keep the shims with `DeprecationWarning` until the next major release; maintain the AST invariant banning production code from importing them.
+- **Status**: **Resolved (Executed in B09)** — Option A approved by maintainer. All 5 shims deleted, all test callers migrated to canonical modules (`adapters.channels.feishu.*` and `adapters.wiki`), and enforced by `tests/test_arch_invariants.py` (see ADR-009).
 
 ---
 

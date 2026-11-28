@@ -132,7 +132,8 @@ def test_removed_backend_symbols_are_gone():
     assert not hasattr(PolicyEngine, "load_taxonomy")
     assert not hasattr(FlywheelDB, "update_decision_card_state")
 
-    from ai_flywheel.core import feishu_card, feishu_listen, triage
+    from ai_flywheel.adapters.channels.feishu import card as feishu_card, listen as feishu_listen
+    from ai_flywheel.core import triage
     from ai_flywheel.storage import clock
 
     assert not hasattr(feishu_card, "FIELD_LIMITS")

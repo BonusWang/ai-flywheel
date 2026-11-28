@@ -108,3 +108,15 @@
   3. Decompose `AutomationsPage.tsx` by extracting `lib/cronVisual.ts`, `AutomationsWatchdogsSection.tsx`, and `AutomationsHistorySection.tsx` (`1,183 -> 875 LOC`).
   4. Add `CallTelemetry`, `DreamNodeSummary`, and `NodeExecutionPayload` to `types.ts`, eliminating all 10 `as any` casts in `NodeDetailPanel.tsx` and tightening `api.ts` observation return types.
 - **Consequences**: Smaller, independently editable UI modules with local state ownership and stronger TypeScript coverage.
+
+---
+
+## ADR-009: Remove Deprecated `core/feishu_*` and `adapters/wiki_gate.py` Shims (PD-001)
+
+- **Status**: Accepted (Maintainer Approved)
+- **Context**: After B02 migrated all internal production callers, the 5 forwarding shim modules (`core/feishu_{card,channel,listen,check}.py` and `adapters/wiki_gate.py`) served only historical test imports and added parallel import paths for the same symbols.
+- **Decision**:
+  1. Delete all 5 deprecated shim modules.
+  2. Migrate all remaining test imports directly to `ai_flywheel.adapters.channels.feishu.*` and `ai_flywheel.adapters.wiki`.
+  3. Strengthen `test_no_production_code_imports_legacy_shims` in `tests/test_arch_invariants.py` to assert both non-existence of the 5 shim files and zero imports across `backend/` and `tests/`.
+- **Consequences**: Canonical import paths everywhere (`Deletion over Accumulation`), zero dead forwarding shells.
