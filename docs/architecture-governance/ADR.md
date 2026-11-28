@@ -84,3 +84,14 @@
   2. Extract batch reconciliation (`reconcile_codex_archives`), `re_triage_queue`, and pending-session/grown-transcript bridging into `core/queue_reconcile.py` (`QueueReconcileMixin`, ~540 LOC).
   3. Keep `core/queue_service.py` (~1,530 LOC) as the canonical ingress state machine and public import surface re-exporting all queue helpers.
 - **Consequences**: Compaction is pure and DB-free; one canonical JSONL transcript reader serves both session scanning and queue ingestion; maintenance sweeps evolve independently of real-time ingress.
+
+---
+
+## ADR-007: Unify Real Runner Orchestration via `_CachedModelRunner`
+
+- **Status**: Accepted
+- **Context**: `CliSubprocessRunner` and `OpenAICompatibleRunner` in `adapters/runners/clients.py` duplicated `review_sessions`, `plan_writes_detailed`, `plan_writes`, and `_persist_cache` across ~200 lines (including a redundant `cache_hit` computation). Separately, `adapters/wiki/router.py` still had two ad-hoc `yaml.safe_load` frontmatter blocks and a duplicate `_mapping` helper.
+- **Decision**:
+  1. Introduce `_CachedModelRunner(BaseWorkflowRunner)` owning canonical prompt building, validation, no-fallback failure handling, and post-validation caching for both real runners, while keeping `_invoke_cli`, `_invoke_api`, `_call_chat_completion`, and `_persist_cache` seams intact.
+  2. Replace both remaining ad-hoc frontmatter parses in `adapters/wiki/router.py` with `core.markdown_utils.parse_frontmatter` / `parse_frontmatter_file` and reuse `adapters.wiki.schema._mapping`.
+- **Consequences**: Single implementation of real-runner validation/cache lifecycle; zero remaining ad-hoc `yaml.safe_load` frontmatter parsers in `router.py`.

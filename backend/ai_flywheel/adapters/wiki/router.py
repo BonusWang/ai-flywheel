@@ -13,8 +13,6 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Callable
 
-import yaml
-
 from ai_flywheel.adapters.wiki.domain_pages import (
     build_domain_page,
     is_single_table_name,
@@ -23,12 +21,13 @@ from ai_flywheel.adapters.wiki.domain_pages import (
 from ai_flywheel.adapters.wiki.schema import (
     DEPOSIT_ROUTING_KEY,
     FORBIDDEN_PATH_SEGMENTS,
+    _mapping,
     deposit_routing_rules,
     normalize_relative_path,
-    split_frontmatter,
 )
 from ai_flywheel.adapters.wiki.t5_adapter import INCIDENT_SECTIONS, build_incident_card
 from ai_flywheel.config import KnowledgeSinkConfig
+from ai_flywheel.core.markdown_utils import parse_frontmatter, parse_frontmatter_file
 from ai_flywheel.core.privacy import find_secret_shape
 from ai_flywheel.core.time_utils import shanghai_today_ymd
 from ai_flywheel.models import (
@@ -138,10 +137,6 @@ _LEADING_ASCII_RE = re.compile(r"[A-Za-z0-9]+")
 INCIDENT_FILE_NAME_RE = re.compile(r"^(?:(\d{1,4})-)?(\d{4}-\d{2}-\d{2})-([^/\\]+)\.md$")
 # The first character of a `path_pattern` that stops a run of plain letters.
 _PATTERN_METACHARS_RE = re.compile(r"[\\.()\[\]{}*+?|^$]")
-
-
-def _mapping(raw: Any) -> dict[str, Any]:
-    return raw if isinstance(raw, dict) else {}
 
 
 def _plain_directory(name: str) -> bool:
@@ -635,17 +630,12 @@ def discover_practice_projects(projects_root: Path, *, domain_subdirs: Any = ())
         }
         index_file = practice_dir / "笔记索引.md"
         if index_file.is_file():
-            fm_text, _ = split_frontmatter(index_file.read_text(encoding="utf-8", errors="ignore"))
-            if fm_text:
-                try:
-                    fm = yaml.safe_load(fm_text) or {}
-                except yaml.YAMLError:
-                    fm = {}
-                if isinstance(fm, dict):
-                    if fm.get("project_id"):
-                        candidate["project_id"] = str(fm["project_id"]).strip()
-                    candidate["aliases"] = _index_aliases(fm.get("aliases"))
-                    candidate["description"] = " ".join(str(fm.get("description") or "").split())
+            fm = parse_frontmatter_file(index_file)
+            if fm:
+                if fm.get("project_id"):
+                    candidate["project_id"] = str(fm["project_id"]).strip()
+                candidate["aliases"] = _index_aliases(fm.get("aliases"))
+                candidate["description"] = " ".join(str(fm.get("description") or "").split())
         if domain_subdirs:
             candidate["domain_inventory"] = {subdir: discover_domain_pages(child / subdir) for subdir in domain_subdirs}
         found.append(candidate)
@@ -942,14 +932,8 @@ def _domain_path_parts(rel: str, projects_root_rel: str) -> tuple[str, str, str]
 
 def _frontmatter_field(content: str, key: str) -> str:
     """One frontmatter value of a page or a draft, or '' when it does not carry it."""
-    fm_text, _ = split_frontmatter(content or "")
-    if not fm_text:
-        return ""
-    try:
-        fm = yaml.safe_load(fm_text)
-    except yaml.YAMLError:
-        return ""
-    return str(fm.get(key) or "").strip() if isinstance(fm, dict) else ""
+    fm, _ = parse_frontmatter(content or "")
+    return str(fm.get(key) or "").strip()
 
 
 def _issue_text(issues: list[Any]) -> str:
