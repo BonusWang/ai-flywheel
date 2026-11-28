@@ -179,7 +179,7 @@ def eligible_promotions(db: FlywheelDB, candidates: list[dict[str, Any]]) -> lis
     return eligible
 
 
-def promote_observation(db: FlywheelDB, rule_id: str, obs_id: Any, root_cause_key: Any) -> str | None:
+def link_rule_to_observation(db: FlywheelDB, rule_id: str, obs_id: Any, root_cause_key: Any) -> str | None:
     """Link a freshly registered rule to the mistake observation it came from.
 
     The rule carries either the observation id or the root cause key; both are

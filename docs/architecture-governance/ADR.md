@@ -57,3 +57,18 @@
   3. Extract `GovernanceService` (`core/governance.py`, wired as `rt.governance`), shrinking `routes/governance.py` to thin HTTP mapping (~310 LOC).
   4. Shrink `_KNOWN_LAYER_EXCEPTIONS` in `tests/test_arch_invariants.py` from 4 entries to 1 (`runtime -> mcp_server`).
 - **Consequences**: `storage/*` and `adapters/*` now have zero upward runtime dependencies; governance operations are directly testable without HTTP transport.
+
+---
+
+## ADR-005: Decompose Pipeline Coordinator into P00–P03 and P04–P07 Stage Modules
+
+- **Status**: Accepted
+- **Context**: `core/pipeline/coordinator.py` had grown to 2,487 LOC with two monolithic methods (`start_run` at 925 LOC and `_execute_post_approval` at 771 LOC), forcing every pipeline stage change to contend on the same file. Meanwhile, `core/pipeline/helpers.py:promote_observation` collided in name with `ActivationEngine.promote_observation` despite having distinct semantics (linking an already-created P04 rule vs creating a new trial rule).
+- **Decision**:
+  1. Split stage implementations cleanly along the P00–P07 approval boundary:
+     - `core/pipeline/stage_pre_approval.py` (`PreApprovalStagesMixin`: P00–P03 + approval gate)
+     - `core/pipeline/stage_post_approval.py` (`PostApprovalStagesMixin`: P04–P07 + `P04Outcome` / `P05Outcome`)
+     - `core/pipeline/coordinator.py` (~670 LOC): coordinator shell, approval lifecycle, and linear stage dispatch via `StageTracker` and `_enter_stage`.
+  2. Rename `core/pipeline/helpers.py:promote_observation` to `link_rule_to_observation`.
+  3. Preserve `core/orchestrator.py` and `WorkflowOrchestrator`'s public interface and runtime monkeypatch seam untouched.
+- **Consequences**: `start_run` drops from 925 LOC to ~95 LOC and `_execute_post_approval` from 771 LOC to ~18 LOC, making the P00–P07 state machine scannable at a glance and isolating pre- vs post-approval edits.
